@@ -205,8 +205,21 @@ function badRequest(error: string): NextResponse {
  * 这个函数只保留"别让用户传进来的怪字符炸掉 PDF"这一层职责。
  */
 function sanitizeText(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+  /*
+   * 用 code point 过滤而不是正则字符类：`\`[ -]\`` 这种写法
+   * 每次都要挂一条 `no-control-regex` 的 eslint-disable，而"控制字符"这条
+   * 规则本意是防不可见字符，不是防所有转义 —— 逐字符判断更直白，也不用
+   * 关规则。顺便把孤立代理项（0xD800–0xDFFF）一起清掉：它们进 PDF 的
+   * UTF-16BE 编码会变成非法序列。
+   */
+  let out = '';
+  for (const ch of value) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp < 0x20 || cp === 0x7f) continue;
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    out += ch;
+  }
+  return out;
 }
 
 /** 解析并校验请求体；返回 NextResponse 表示校验失败 */
@@ -1820,7 +1833,7 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
     drawPageHeader(
       doc,
       chunkIndex === 0 ? '用料清单' : '用料清单（续）',
-      `Brand ${brandLabel}  |  Grid ${cols} x ${rows}  |  ${usedColors.length} colors  |  ${totalBeads} beads`,
+      `品牌 ${brandLabel}   |   网格 ${cols} × ${rows}   |   ${usedColors.length} 色   |   ${totalBeads} 颗`,
     );
 
     // 表头
@@ -1927,9 +1940,9 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
 
   const cards: Array<[string, string, string]> = [
     ['总包数', `${used.length}`, '需要购买的颜色种数'],
-    ['总颗数', `${totalBuy}`, `covers ${totalBeads} beads + 10%`],
-    ['成品尺寸', `${((cols * 5) / 10).toFixed(1)} x ${((rows * 5) / 10).toFixed(1)} cm`, '5mm 中豆'],
-    ['豆板数', `${Math.ceil(cols / 29)} x ${Math.ceil(rows / 29)}`, '按 29×29 大板计算'],
+    ['总颗数', `${totalBuy}`, `覆盖 ${totalBeads} 颗 + 10% 余量`],
+    ['成品尺寸', `${((cols * 5) / 10).toFixed(1)} × ${((rows * 5) / 10).toFixed(1)} cm`, '5mm 中豆'],
+    ['豆板数', `${Math.ceil(cols / 29)} × ${Math.ceil(rows / 29)}`, '按 29×29 大板计算'],
   ];
 
   const gap = 3;
@@ -2085,7 +2098,7 @@ function drawLegendPages(doc: Doc, req: CleanRequest): void {
     drawPageHeader(
       doc,
       chunkIndex === 0 ? '色号图例' : '色号图例（续）',
-      `Brand ${brandLabel}  |  Grid ${cols} x ${rows}  |  ${usedColors.length} colors  |  ${totalBeads} beads`,
+      `品牌 ${brandLabel}   |   网格 ${cols} × ${rows}   |   ${usedColors.length} 色   |   ${totalBeads} 颗`,
     );
 
     if (chunkIndex === 0) {
@@ -2231,11 +2244,11 @@ function stampFooters(doc: Doc, req: CleanRequest): void {
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.8);
     doc.text(
-      `Perler Bead Pattern  |  ${req.cols} x ${req.rows}  |  Brand ${req.brandLabel}`,
+      `拼豆图纸  |  ${req.cols} × ${req.rows}  |  品牌 ${req.brandLabel}`,
       M,
       PAGE_H - 6.5,
     );
-    doc.text(`Page ${page} / ${total}`, PAGE_W - M, PAGE_H - 6.5, { align: 'right' });
+    doc.text(`第 ${page} 页 / 共 ${total} 页`, PAGE_W - M, PAGE_H - 6.5, { align: 'right' });
   }
 }
 
@@ -2300,13 +2313,34 @@ export async function POST(request: NextRequest) {
     stampFooters(doc, req);
 
     const buffer = Buffer.from(doc.output('arraybuffer'));
-    const filename = `perler-pattern-${req.brandLabel.toLowerCase()}-${req.cols}x${req.rows}.pdf`;
+    /*
+     * 文件名**必须**是纯 ASCII。
+     *
+     * `Content-Disposition` 的 header 值在 HTTP 里是 ByteString —— 每个字符
+     * 必须 ≤ 0xFF。品牌名改成中文（漫漫/盼盼/咪小窝）之后，直接用
+     * `perler-pattern-漫漫-52x64.pdf` 会让 NextResponse 抛
+     * `Cannot convert argument to a ByteString because the character at
+     * index 37 has a value of 28459`，整个请求 500，用户什么也拿不到。
+     *
+     * 两步处理：
+     *   1. `filename=` 放一个降级成 ASCII 的版本给老浏览器（"manman"）；
+     *   2. `filename*=UTF-8''…` 放 RFC 5987 编码的真名，现代浏览器优先用
+     *      它 —— 用户下载下来看到的就是中文品牌名。
+     * 这样两头都正确，而不是像以前那样干脆把品牌印成拼音。
+     */
+    const asciiBrand = req.brandLabel
+      .replace(/[^\x20-\x7E]/g, '')
+      .trim()
+      .toLowerCase();
+    const asciiName = `perler-pattern-${asciiBrand || 'pattern'}-${req.cols}x${req.rows}.pdf`;
+    const utf8Name = `perler-pattern-${req.brandLabel}-${req.cols}x${req.rows}.pdf`;
+    const encodedName = encodeURIComponent(utf8Name);
 
     return new NextResponse(new Uint8Array(buffer), {
       status: 200,
       headers: {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`,
         'Content-Length': String(buffer.byteLength),
         'Cache-Control': 'no-store',
       },
