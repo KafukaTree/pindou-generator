@@ -8,10 +8,21 @@ import { FileUpload } from '@/components/image-upload/FileUpload';
 import { PatternSettings } from '@/components/settings/PatternSettings';
 import { PatternCanvas } from '@/components/pattern-rendering/PatternCanvas';
 import type { DetailBrush } from '@/lib/pattern/regions';
+import {
+  applyEdits,
+  editCount,
+  EMPTY_EDITS,
+  type EditMap,
+} from '@/lib/pattern/edits';
 import { ColorLegend } from '@/components/palette/ColorLegend';
 import { PDFExport } from '@/components/pdf-export/PDFExport';
 import { HistoryList } from '@/components/history/HistoryList';
-import { PixelGarden, PixelMascot, PixelEmpty } from '@/components/scenery';
+import {
+  PixelGarden,
+  PixelMascot,
+  PixelMascotPeek,
+  PixelEmpty,
+} from '@/components/scenery';
 
 import {
   compressSourceDataUrl,
@@ -126,6 +137,20 @@ export default function Home() {
   const [brushes, setBrushes] = useState<DetailBrush[]>([]);
   const [regionFeather, setRegionFeather] = useState(DEFAULT_FEATHER);
 
+  /*
+   * ---- 人工编辑覆盖层 ----------------------------------------------------
+   *
+   * 这一层**只在渲染层叠加**：`pattern` 永远是引擎原始结果，`edits` 记录
+   * 用户手工改过的格子。两者合成出的 `displayPattern` 才是"用户眼里的
+   * 图纸"—— 画布、色号、图例、统计、PDF、历史全部必须读它，否则会出现
+   * "屏幕上改了但导出没改"这种最让人怀疑工具坏了的不一致。
+   *
+   * 踩过的坑：画布内部也自己算一份 applyEdits，但父组件（图例/导出/历史）
+   * 读的是原始 pattern —— 手绘的豆子画得出来，用料清单却不涨。所以这里
+   * 在父层算一次，往下只传最终结果。
+   */
+  const [edits, setEdits] = useState<EditMap>(EMPTY_EDITS);
+
   // ---- 参数 --------------------------------------------------------------
   const [options, setOptions] = useState<GenerateOptions>(() => {
     if (typeof window === 'undefined') return DEFAULT_OPTIONS;
@@ -178,6 +203,9 @@ export default function Home() {
       setImageInfo(info);
       // 换图就清空笔刷：归一化坐标在新图上毫无意义
       setBrushes([]);
+      // 同理，手工覆盖层是按"格子下标"存的，换一张图后同一套下标
+      // 指向的完全是别的位置 —— 不清就会把上一张图的改动套到新图上
+      setEdits(EMPTY_EDITS);
     },
     [],
   );
@@ -387,6 +415,9 @@ export default function Home() {
             : { width: 0, height: 0, name: '历史图案' }),
       );
       setBrushes([]);
+      // 历史里不存手工覆盖层（它是按格子下标存的，跨图无意义），
+      // 恢复历史即恢复"引擎原始结果"，覆盖层必须清掉
+      setEdits(EMPTY_EDITS);
       // 恢复时不要被"签名相同"挡住
       lastRecordedRef.current = '';
       toast.success(`已恢复 ${v.cols} × ${v.rows} 的图纸`);
@@ -400,9 +431,31 @@ export default function Home() {
     setPattern(null);
     setError(null);
     setBrushes([]);
+    setEdits(EMPTY_EDITS);
   }, []);
 
   const hasImage = Boolean(sourceDataUrl);
+
+  /*
+   * 用户眼里的图纸 = 引擎结果 + 手工覆盖层。
+   *
+   * 单点真相：页面上**所有**展示与导出都读这个，绝不读裸 pattern。
+   * 手改的格子会连带影响颗数、色数、用料清单、PDF 图例 —— 那些数字
+   * 必须跟着变，否则"我明明加了两颗红"的账对不上。画布内部虽然也
+   * 自己算过一份叠加结果，但父层（图例/统计/导出/历史）读的是裸
+   * pattern，于是会出现"画得出来、清单不涨"的不一致。
+   *
+   * 没有手工改动时（最常见）直接返回原对象，不做无谓的克隆：
+   * applyEdits 会整份复制 cells，而 320 格图是 8.7 万个格，
+   * 每次渲染复制一遍纯属浪费。
+   */
+  const editedCount = useMemo(() => editCount(edits), [edits]);
+  const displayPattern = useMemo(() => {
+    if (!pattern) return null;
+    if (editedCount === 0) return pattern;
+    return applyEdits(pattern, edits, options.brand);
+  }, [pattern, edits, editedCount, options.brand]);
+
   const sizeCm = pattern?.meta.sizeCm ?? null;
 
   return (
@@ -431,17 +484,29 @@ export default function Home() {
           </div>
 
           <div className="flex items-center gap-2">
-            {pattern && (
+            {displayPattern && (
               <span className="hidden items-center gap-1.5 lg:flex">
-                <span className="px-tag px-tag-leaf">{pattern.totalBeads} 颗</span>
-                <span className="px-tag px-tag-ink">{pattern.palette.length} 色</span>
-                <span className="px-tag px-tag-ink">
-                  {pattern.cols} × {pattern.rows}
+                <span className="px-tag px-tag-leaf">
+                  {displayPattern.totalBeads} 颗
                 </span>
+                <span className="px-tag px-tag-ink">
+                  {displayPattern.palette.length} 色
+                </span>
+                <span className="px-tag px-tag-ink">
+                  {displayPattern.cols} × {displayPattern.rows}
+                </span>
+                {editedCount > 0 && (
+                  <span
+                    className="px-tag px-tag-gold"
+                    title="手工改过的格子数（已计入颗数与用料）"
+                  >
+                    手改 {editedCount}
+                  </span>
+                )}
               </span>
             )}
             {isLoaded && <HistoryList onRestore={handleRestore} />}
-            <PDFExport pattern={pattern} brand={options.brand} compact />
+            <PDFExport pattern={displayPattern} brand={options.brand} compact />
             <button
               type="button"
               onClick={toggleTheme}
@@ -537,18 +602,18 @@ export default function Home() {
             )}
 
             {/* 用料清单在窄屏（没有右栏时）留在左栏底部 */}
-            {pattern && pattern.palette.length > 0 && (
+            {displayPattern && displayPattern.palette.length > 0 && (
               <Section
                 index="03"
                 title="用料清单"
-                hint={`${pattern.palette.length} 色`}
+                hint={`${displayPattern.palette.length} 色`}
                 hideHeader
                 className="wb-left-legend order-4"
               >
                 <ColorLegend
-                  palette={pattern.palette}
+                  palette={displayPattern.palette}
                   brand={options.brand}
-                  totalBeads={pattern.totalBeads}
+                  totalBeads={displayPattern.totalBeads}
                 />
               </Section>
             )}
@@ -567,9 +632,9 @@ export default function Home() {
                   <h2 className="font-display text-[15px] font-bold tracking-tight">
                     图纸
                   </h2>
-                  {pattern && (
+                  {displayPattern && (
                     <span className="font-px text-[10px] tracking-wide text-[var(--ink-3)]">
-                      {pattern.cols} × {pattern.rows}
+                      {displayPattern.cols} × {displayPattern.rows}
                       {sizeCm ? ` · 约 ${sizeCm.w} × ${sizeCm.h} cm` : ''}
                     </span>
                   )}
@@ -579,7 +644,7 @@ export default function Home() {
                 </p>
               </div>
 
-              <div className="flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
+              <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
                 {error ? (
                   <ErrorBlock message={error} onRetry={handleClear} />
                 ) : !hasImage ? (
@@ -593,29 +658,56 @@ export default function Home() {
                     onBrushesChange={setBrushes}
                     regionFeather={regionFeather}
                     onRegionFeatherChange={setRegionFeather}
+                    /* 编辑层：传的是引擎原始 pattern，画布内部自己叠加
+                       edits 得到显示结果。传给父层的 onEditsChange 再把
+                       改动同步上来，父层算 displayPattern 给图例/导出用。 */
+                    edits={edits}
+                    onEditsChange={setEdits}
                     isWorking={isWorking}
                   />
                 )}
+
+                {/*
+                 * 吉祥物从画布下沿探出头来看图。
+                 *
+                 * 「看」需要位置关系才成立 —— 它得贴着画布边缘，否则
+                 * 只是页面上多了一张贴纸。PixelMascotPeek 用
+                 * `bottom: 100%` 把身体挂在最近的定位祖先的**上边缘**，
+                 * 于是这里塞一个高度 0 的定位壳放在画布底部：
+                 * 壳的顶边 = 画布下沿，吉祥物的爪子正好压在那条线上，
+                 * 身体探进画布内部。
+                 *
+                 * 放左下角而不是右上角：画布居中显示，四角本来就是空
+                 * 棋盘格，左下角不会压住"拖动画布可平移…"那行提示，
+                 * 也不会挡到图纸本身。尺寸 64 是原生网格 40 格的整数倍
+                 * （64/40 = 1.6 个 CSS 像素/格），轮廓仍是整格。
+                 *
+                 * 只在 lg 以上出现：手机上画布只有 54dvh，再塞一个
+                 * 吉祥物进去就真的挡住要看的格子了。
+                 */}
+                <div className="pointer-events-none absolute inset-x-3 bottom-8 z-20 hidden h-0 lg:block">
+                  <PixelMascotPeek size={64} side="left" />
+                </div>
               </div>
             </div>
 
             {/* 图纸下方的读数条：把"这张图到底要多少豆"讲清楚 */}
-            {pattern && (
+            {displayPattern && (
               <div className="shrink-0">
-                <StatsBar pattern={pattern} brand={options.brand} />
+                <StatsBar pattern={displayPattern} brand={options.brand} />
               </div>
             )}
           </div>
 
           {/* ---------------------- 右栏：用料清单（内部滚动） ---------------------- */}
-          {pattern && pattern.palette.length > 0 && (
+          {displayPattern && displayPattern.palette.length > 0 && (
             <div className="wb-right order-5">
               <div className="px-panel min-h-0 flex-1 overflow-hidden px-4 py-3.5">
                 <ColorLegend
                   fill
-                  palette={pattern.palette}
+                  palette={displayPattern.palette}
                   brand={options.brand}
-                  totalBeads={pattern.totalBeads}
+                  totalBeads={displayPattern.totalBeads}
                 />
               </div>
             </div>
