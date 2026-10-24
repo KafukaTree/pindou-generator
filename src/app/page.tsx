@@ -32,9 +32,9 @@ import { PDFExport } from '@/components/pdf-export/PDFExport';
 import { HistoryList } from '@/components/history/HistoryList';
 import {
   PixelGarden,
-  PixelMascot,
   PixelMascotPeek,
   PixelEmpty,
+  MascotPromptButton,
   MascotRoamer,
   WORKBENCH_ANCHORS,
   type MascotAwareness,
@@ -257,8 +257,6 @@ export default function Home() {
   const [leftCollapsed, setLeftCollapsed] = useState<boolean>(
     () => readStorage<boolean>(FOCUS_KEY, false) === true,
   );
-  /** 画布宿主（中栏内容区）。CanvasBottomPeek 靠它换算画布盒的实际位置。 */
-  const canvasHostRef = useRef<HTMLDivElement | null>(null);
 
   const toggleFocus = useCallback(() => {
     setLeftCollapsed((prev) => {
@@ -784,7 +782,7 @@ export default function Home() {
       <header className="relative z-20 shrink-0 border-b-2 border-[var(--line-strong)] bg-[var(--paper-raised)]/92 backdrop-blur-[2px]">
         <div className="flex items-center justify-between gap-4 px-4 py-2.5">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
-            <MascotMark />
+            <MascotMark brand={options.brand} />
             <div className="min-w-0 leading-none">
               <h1 className="font-display truncate text-[17px] font-bold tracking-tight text-[var(--ink)] sm:text-[18px]">
                 拼豆图纸工坊
@@ -1072,7 +1070,7 @@ export default function Home() {
               62dvh 既能露出画布，又给下面的参数区留出可见的"往下还有东西"，
               用户知道要往下滑。 */}
           <div className="wb-mid order-2 flex min-h-0 min-w-0 flex-col gap-3 lg:order-none">
-            <div className="px-panel flex min-h-0 flex-1 flex-col overflow-hidden">
+            <div className="px-panel relative flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b-2 border-[var(--line)] px-3.5 py-2">
                 <div className="flex items-baseline gap-2.5">
                   <span className="px-section-no">04</span>
@@ -1111,10 +1109,7 @@ export default function Home() {
                 </p>
               </div>
 
-              <div
-                ref={canvasHostRef}
-                className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3"
-              >
+              <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
                 {error ? (
                   <ErrorBlock message={error} onRetry={handleClear} />
                 ) : !hasImage ? (
@@ -1153,24 +1148,33 @@ export default function Home() {
                 )}
 
                 {/*
-                 * 吉祥物趴在**画布下沿**，不是面板下沿。
+                 * 吉祥物趴在 **04「图纸」这个框的左下角**。
                  *
-                 * 改之前这里是一个 `absolute inset-x-3 bottom-8 h-0` 的壳，
-                 * 挂在面板的 padding 盒上 —— 实测吉祥物 x=358，而画布左
-                 * 边缘在 x=692：画布在 1216px 宽的容器里居中，左右各空出
-                 * 322px，吉祥物其实悬在**空白处**，底下根本没有线可趴。
-                 * 纵向也差 9px。
+                 * 两条弯路记在这里，免得再走：
                  *
-                 * 现在改成跟随画布元素本身：CanvasBottomPeek 用
-                 * MutationObserver 盯 canvas 的 width/height 属性（缩放、
-                 * 换图、换网格密度都会改它们），配合滚动与窗口 resize
-                 * 实测出画布盒相对面板的偏移，把吉祥物钉在画布左下角
-                 * 那条边上。它现在真的趴在格子尽头。
+                 * 第一版挂在 `inset-x-3 bottom-8` 的壳上（画布宿主 div 内），
+                 * 但那个 div 有 padding，壳又被 bottom-8 顶上去 32px，于是
+                 * 吉祥物浮在框中间偏上的位置，底下什么线都没有 —— 用户
+                 * 反馈"没趴在线上"。
                  *
-                 * 只在 lg 以上出现：手机上画布只有 54dvh，再塞一个吉祥物
-                 * 进去就真的挡住要看的格子了。
+                 * 第二版改成实测 canvas 的 getBoundingClientRect 去贴画布
+                 * 下沿。数学没错，但画布在容器里是居中的：52×64 的图在
+                 * 1216px 宽的容器里只占 572px，左右各空 322px，所以它变成
+                 * 趴在"图纸格子中间偏左"，而不是框的角上 —— 用户再次指出
+                 * 应该是**框**的左下角，不是编辑区的左下角。
+                 *
+                 * 现在就是最朴素的做法：面板加 `relative`，这里一个
+                 * `absolute left-0 bottom-0 h-0` 的壳，壳的这条线 = 面板
+                 * 内沿的下边框。PixelMascotPeek 自己用 `bottom:100%` 把
+                 * 身体挂到线上、爪子压住线，不需要任何测量。画布平移缩放
+                 * 换图它都不用动 —— 它认的是「框」，不是「图」。
+                 *
+                 * 只在 lg 以上出现：手机上画布只有 62dvh，再塞一只进去
+                 * 就真的挡住要看的格子了。
                  */}
-                <CanvasBottomPeek hostRef={canvasHostRef} />
+                <div className="pointer-events-none absolute bottom-0 left-0 z-20 hidden h-0 lg:block">
+                  <PixelMascotPeek size={64} side="left" />
+                </div>
               </div>
             </div>
           </div>
@@ -1216,103 +1220,27 @@ export default function Home() {
  * ================================================================ */
 
 /** 顶栏左边的小标记：一个趴着的豆子 */
+
 /**
- * 趴在画布下沿的吉祥物。
+ * 品牌标（页头左上角那只吉祥物）。
  *
- * 为什么不能只用 CSS 定位：`PixelMascotPeek` 的语义是"扒在最近的定位
- * 祖先的上边缘"，但画布的定位祖先是**滚动容器**（`px-inset`，`overflow:auto`），
- * 而画布在容器里是居中的 —— 52×64 的图在 1216px 宽的容器里只占 572px，
- * 左右各空 322px。于是挂容器左边缘的吉祥物落在了空白里。
+ * 它会自己换造型（戴耳机、跳绳、走动、听歌、画画……每 3–6 秒一换），
+ * 点一下会弹出一组「拼豆生图提示词」——用户可以直接复制去豆包 / Qwen
+ * 这类免费生图工具，生成更适合转成拼豆图纸的图。
  *
- * 竖向同理：画布底部与容器底部之间还有一段滚动余量，也不是同一条线。
+ * 轮播节拍、reduced-motion 降级、后台标签页暂停、弹窗开关，全在
+ * `MascotPromptButton` 内部。这里只负责外框：**外框是页面布局的一部分**
+ * （尺寸、边框、硬投影、配色），塞进组件里它就没法复用到别处了。
  *
- * 所以这里实测：拿 canvas 元素的 `getBoundingClientRect()` 减去面板的，
- * 得到画布左下角相对面板的偏移，再把吉祥物放到那个点上。canvas 的
- * width/height 属性在缩放、换图、换网格密度时都会变，用
- * MutationObserver 盯这两个属性；滚动和窗口尺寸变化各自挂监听。
- * 全程只读 DOM、只写一个 style，不触发 React 重渲染。
+ * 尺寸 40 而不是 26：吉祥物的原生网格是 40×34 个 4px 格，缩到 26px
+ * 时每个像素格只剩 0.65 个 CSS 像素，手绘的轮廓会被采样成糊团
+ * （scenery 交付时专门提醒过这一点）。40px 刚好 1:1，像素一颗不歪。
+ * 外框 size-11 = 44px border-box，减去 2px 边框正好容纳 40px 内容盒。
  */
-function CanvasBottomPeek({ hostRef }: { hostRef: React.RefObject<HTMLDivElement | null> }) {
-  const boxRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const host = hostRef.current;
-    const box = boxRef.current;
-    if (!host || !box) return;
-
-    let raf = 0;
-    const measure = () => {
-      raf = 0;
-      const canvas = host.querySelector('canvas');
-      if (!canvas) {
-        box.style.opacity = '0';
-        return;
-      }
-      const cr = canvas.getBoundingClientRect();
-      const hr = host.getBoundingClientRect();
-      // 画布可能被滚出视口，或还没布局出尺寸 —— 两种都不该乱跳
-      if (cr.width < 8 || cr.height < 8) {
-        box.style.opacity = '0';
-        return;
-      }
-      box.style.opacity = '1';
-      box.style.left = `${Math.round(cr.left - hr.left)}px`;
-      // 吉祥物自身的下沿对齐画布下沿：PixelMascotPeek 会再把它往下探
-      // 一格（爪子压在线上），所以这里给的是"线"的位置。
-      box.style.top = `${Math.round(cr.bottom - hr.top)}px`;
-    };
-    const schedule = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(measure);
-    };
-
-    measure();
-
-    /* 缩放/换图/换网格都会改 canvas 的 width/height 属性 */
-    const mo = new MutationObserver(schedule);
-    mo.observe(host, {
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['width', 'height'],
-    });
-
-    const scroller = host.querySelector('.px-inset');
-    scroller?.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule);
-    /* 左栏折叠、历史/图例出现都会改变中栏宽度，画布跟着重新居中 */
-    const ro = new ResizeObserver(schedule);
-    ro.observe(host);
-
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-      mo.disconnect();
-      scroller?.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', schedule);
-      ro.disconnect();
-    };
-  }, [hostRef]);
-
-  return (
-    <div
-      ref={boxRef}
-      className="pointer-events-none absolute z-20 hidden transition-opacity duration-200 lg:block"
-      style={{ left: 0, top: 0, opacity: 0 }}
-      aria-hidden
-    >
-      <PixelMascotPeek size={64} side="left" />
-    </div>
-  );
-}
-
-function MascotMark() {
-  /*
-   * 尺寸 40 而不是 26：吉祥物的原生网格是 40×34 个 4px 格，缩到 26px
-   * 时每个像素格只剩 0.65 个 CSS 像素，手绘的轮廓会被采样成糊团
-   * （scenery 交付时专门提醒过这一点）。40px 刚好 1:1，像素一颗不歪。
-   */
+function MascotMark({ brand }: { brand: string }) {
   return (
     <div className="relative flex size-11 items-center justify-center border-2 border-[var(--line-strong)] bg-[var(--clay)] shadow-[var(--shadow-px-btn)]">
-      <PixelMascot size={40} mood="happy" />
+      <MascotPromptButton size={40} brand={brand} />
     </div>
   );
 }
