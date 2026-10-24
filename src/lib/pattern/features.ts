@@ -62,6 +62,8 @@ export interface StructuralFeature {
   confidence: number;
   /** 配对的反极性特征下标，-1 = 无 */
   partner: number;
+  /** 连续窄线的实际源像素中心，交错存放 x/y；不用 bbox 填满内部。 */
+  strokePixels?: Float32Array;
 }
 
 export interface DetectOptions {
@@ -164,9 +166,10 @@ interface RawComp {
   y0: number;
   x1: number;
   y1: number;
+  pixels?: number[];
 }
 
-/** 4 邻域连通域；test 决定某像素是否属于该极性 */
+/** 默认 4 邻域；窄线可选 8 邻域并保留像素支持集。 */
 function components(
   lab: Float32Array,
   alpha: Float32Array,
@@ -174,6 +177,8 @@ function components(
   h: number,
   test: (L: number, C: number) => boolean,
   minArea: number,
+  retainPixels = false,
+  diagonal = false,
 ): RawComp[] {
   const n = w * h;
   const seen = new Uint8Array(n);
@@ -226,6 +231,12 @@ function components(
       if (x + 1 < w) push(k + 1);
       if (y > 0) push(k - w);
       if (y + 1 < h) push(k + w);
+      if (diagonal) {
+        if (x > 0 && y > 0) push(k - w - 1);
+        if (x + 1 < w && y > 0) push(k - w + 1);
+        if (x > 0 && y + 1 < h) push(k + w - 1);
+        if (x + 1 < w && y + 1 < h) push(k + w + 1);
+      }
     }
     if (member.length < minArea) continue;
     const m = member.length;
@@ -238,6 +249,7 @@ function components(
       y0,
       x1,
       y1,
+      ...(retainPixels ? { pixels: member.slice() } : {}),
     });
   }
   return out;
@@ -420,7 +432,85 @@ export function detectStructuralFeatures(
     }
   }
 
+  // 单独的细线没有亮暗配对，模糊后也可能消失；改用连续性和双侧对比验证。
+  features.push(...detectThinDarkStrokes(lab, alpha, dw, dh, f, maxAreaFrac, minContrast, features));
   return features;
+}
+
+/**
+ * 只接纳有端点、局部约一像素宽、两侧均有不透明高对比前景的暗线。
+ * 闭合轮廓、粗色块、透明剪影边和孤立噪点均不获得这条配额。
+ * 检测仍在 ≤512 的副本上运行；8 邻域让一像素斜线保持同一身份。
+ */
+function detectThinDarkStrokes(
+  lab: Float32Array,
+  alpha: Float32Array,
+  w: number,
+  h: number,
+  sourceScale: number,
+  maxAreaFrac: number,
+  minContrast: number,
+  paired: StructuralFeature[],
+): StructuralFeature[] {
+  const out: StructuralFeature[] = [];
+  const dark = new Uint8Array(w * h);
+  for (let i = 0; i < dark.length; i++) {
+    if (alpha[i] >= 0.9 && NEAR_DARK(lab[i * 3], Math.hypot(lab[i * 3 + 1], lab[i * 3 + 2]))) dark[i] = 1;
+  }
+  const comps = components(lab, alpha, w, h, NEAR_DARK, 16, true, true);
+  const across = [[2, 0], [0, 2], [2, 2], [2, -2]];
+  for (const c of comps) {
+    if (Math.max(c.x1 - c.x0 + 1, c.y1 - c.y0 + 1) < 24 || c.area > w * h * maxAreaFrac) continue;
+    // 已配对的瞳孔继续由原有面积预算负责，避免同一结构被重复增宽。
+    if (paired.some((p) => p.partner >= 0 && p.role === 'dark' &&
+      p.x0 <= c.x1 * sourceScale && p.x1 >= c.x0 * sourceScale &&
+      p.y0 <= c.y1 * sourceScale && p.y1 >= c.y0 * sourceScale)) continue;
+    const pixels = c.pixels!;
+    let endpoints = 0;
+    let degreeSum = 0;
+    let supported = 0;
+    let contrastSum = 0;
+    for (const i of pixels) {
+      const x = i % w;
+      const y = (i / w) | 0;
+      let degree = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if ((!dx && !dy) || x + dx < 0 || x + dx >= w || y + dy < 0 || y + dy >= h) continue;
+        degree += dark[(y + dy) * w + x + dx];
+      }
+      if (degree === 1) endpoints++;
+      degreeSum += degree;
+      let contrast = 0;
+      for (const [dx, dy] of across) {
+        const ax = x - dx, ay = y - dy, bx = x + dx, by = y + dy;
+        if (ax < 0 || ax >= w || ay < 0 || ay >= h || bx < 0 || bx >= w || by < 0 || by >= h) continue;
+        const a = ay * w + ax, b = by * w + bx;
+        if (alpha[a] < 0.9 || alpha[b] < 0.9 || dark[a] || dark[b]) continue;
+        const distance = (j: number) => oklabDist(c.lab, { L: lab[j * 3], a: lab[j * 3 + 1], b: lab[j * 3 + 2] });
+        contrast = Math.max(contrast, Math.min(distance(a), distance(b)));
+      }
+      if (contrast >= minContrast) {
+        supported++;
+        contrastSum += contrast;
+      }
+    }
+    const support = supported / c.area;
+    if (endpoints < 2 || endpoints > 8 || degreeSum / c.area > 2.6 || support < 0.85) continue;
+    const contrast = contrastSum / supported;
+    const strokePixels = new Float32Array(c.area * 2);
+    for (let i = 0; i < pixels.length; i++) {
+      strokePixels[i * 2] = (pixels[i] % w + 0.5) * sourceScale;
+      strokePixels[i * 2 + 1] = (((pixels[i] / w) | 0) + 0.5) * sourceScale;
+    }
+    out.push({
+      role: 'dark', lab: c.lab, x0: c.x0 * sourceScale, y0: c.y0 * sourceScale,
+      x1: (c.x1 + 1) * sourceScale - 1, y1: (c.y1 + 1) * sourceScale - 1,
+      cx: c.cx * sourceScale, cy: c.cy * sourceScale, area: c.area * sourceScale * sourceScale,
+      contrast, stability: support, confidence: support * clamp01((contrast - minContrast) / 0.25),
+      partner: -1, strokePixels,
+    });
+  }
+  return out;
 }
 
 function ringContrastBBox(
@@ -613,7 +703,7 @@ export function planFeaturePlacement(
      * 那么这个算法也能过关」。实测鸭吉吉两只眼各是 (白,黑) 复合对，
      * 猫有 2 对，叶/龟 0 对 —— 判据自动把"不该救的"排除掉了。
      */
-    if (f.partner < 0) continue;
+    if (f.partner < 0 && !f.strokePixels) continue;
     const isLight = f.role === 'light';
     const cands = isLight ? lightCandidates : darkCandidates;
     if (!cands.length) continue;
@@ -643,14 +733,24 @@ export function planFeaturePlacement(
     const x1 = Math.min(srcW - 1, f.x1 + 1);
     const y1 = Math.min(srcH - 1, f.y1 + 1);
     const tally = new Map<number, number>();
-    for (let sy = y0; sy <= y1; sy++) {
-      const cy = Math.floor(offY + sy * scale);
-      if (cy < 0 || cy >= rows) continue;
-      for (let sx = x0; sx <= x1; sx++) {
-        const cx = Math.floor(offX + sx * scale);
-        if (cx < 0 || cx >= cols) continue;
+    if (f.strokePixels) {
+      for (let i = 0; i < f.strokePixels.length; i += 2) {
+        const cx = Math.floor(offX + f.strokePixels[i] * scale);
+        const cy = Math.floor(offY + f.strokePixels[i + 1] * scale);
+        if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
         const key = cy * cols + cx;
         tally.set(key, (tally.get(key) ?? 0) + 1);
+      }
+    } else {
+      for (let sy = y0; sy <= y1; sy++) {
+        const cy = Math.floor(offY + sy * scale);
+        if (cy < 0 || cy >= rows) continue;
+        for (let sx = x0; sx <= x1; sx++) {
+          const cx = Math.floor(offX + sx * scale);
+          if (cx < 0 || cx >= cols) continue;
+          const key = cy * cols + cx;
+          tally.set(key, (tally.get(key) ?? 0) + 1);
+        }
       }
     }
     /*
@@ -664,7 +764,7 @@ export function planFeaturePlacement(
     const cells: number[] = [];
     const needPix = cellSrcArea * 0.12;
     for (const [key, cnt] of tally) {
-      if (cnt >= needPix) cells.push(key);
+      if (f.strokePixels || cnt >= needPix) cells.push(key);
     }
     /*
      * 按"被该特征覆盖的源像素数"降序排。落位时从前往后取，于是豆子
@@ -672,6 +772,9 @@ export function planFeaturePlacement(
      * 就应该落在亮带的正中，而不是 bbox 边缘的过渡格。
      */
     cells.sort((a, b) => (tally.get(b) ?? 0) - (tally.get(a) ?? 0));
+    // 一像素线缩小后面积预算往往不足一整条线；以投影路径的一格宽覆盖作为
+    // 几何下限。只落真实支持格，绝不把交叉线的整个 bbox 涂成黑块。
+    if (f.strokePixels) minBeads = cells.length;
 
     const plan: FeaturePlan = {
       role: f.role,

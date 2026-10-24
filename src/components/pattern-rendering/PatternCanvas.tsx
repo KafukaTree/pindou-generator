@@ -78,7 +78,24 @@ export interface PatternCanvasProps {
   onCurrentCodeChange?: (code: string) => void;
   /** 初始工具，默认 'pencil' */
   initialTool?: EditTool;
+  /**
+   * 画布当前占用状态变化回调。
+   *
+   * 刷区域和编辑模式都会把用户的注意力锁在画布上，此时画布周边不该有东西
+   * 在晃（巡游的桌宠尤其不该）。这两个开关都活在画布内部 —— `brushMode`
+   * 在 hook 里、`editActive` 在组件 state 里 —— 父组件看不见，所以把结果
+   * 上报出去。只在值真正变化时触发。
+   */
+  onActivityChange?: (activity: CanvasActivity) => void;
 }
+
+/**
+ * 画布的三种占用状态。
+ *
+ * 用枚举而不是两个 bool：父组件要做的判断是"现在是不是该让开"，
+ * 这个判断三种状态互斥，合并成一个值可以少两次 && 逻辑，也便于以后加档位。
+ */
+export type CanvasActivity = 'idle' | 'brushing' | 'editing';
 
 export function PatternCanvas({
   pattern,
@@ -94,6 +111,7 @@ export function PatternCanvas({
   onEditsChange,
   onCurrentCodeChange,
   initialTool,
+  onActivityChange,
 }: PatternCanvasProps) {
   const c = usePatternCanvas(pattern, {
     brushes,
@@ -222,6 +240,29 @@ export function PatternCanvas({
   const [editActive, setEditActive] = useState(false);
   /** 色卡浮层默认收起：320 色铺开会把画布挤走半屏 */
   const [trayOpen, setTrayOpen] = useState(false);
+
+  /*
+   * 把"画布现在被占着"这件事上报给父组件。
+   *
+   * 刷区域/编辑都让用户盯着画布，此时画布周边不该有东西在动。父组件拿这个
+   * 值决定要不要让巡游桌宠避开 —— 它看不见画布内部的 brushMode / editActive。
+   *
+   * 用 ref 记住上一次上报的值，只在**真正变化**时回调：这个 effect 的依赖
+   * 里有 brushMode 和 editActive，但它们任一变化都必然导致这个值变化，
+   * 不做去重就会在父组件里反复触发渲染。
+   */
+  const lastActivityRef = useRef<CanvasActivity>('idle');
+  useEffect(() => {
+    const next: CanvasActivity = brushMode
+      ? 'brushing'
+      : editActive && editEnabled
+        ? 'editing'
+        : 'idle';
+    if (next === lastActivityRef.current) return;
+    lastActivityRef.current = next;
+    onActivityChange?.(next);
+  }, [brushMode, editActive, editEnabled, onActivityChange]);
+
   const currentBead = useMemo(
     () => brandColors.find((c) => c.code === currentCode) ?? null,
     [brandColors, currentCode],

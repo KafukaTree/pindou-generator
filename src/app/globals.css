@@ -707,6 +707,31 @@
     align-items: stretch;
     overflow: hidden;
   }
+
+  /*
+   * 专注模式：左栏收起，图纸吃满整行。
+   *
+   * 用 0fr + overflow:hidden 而不是 display:none —— 后者会让左栏里的
+   * 上传控件被卸载再挂载，滚动位置和输入焦点都会丢；0fr 保留 DOM，
+   * 只是不给它宽度。列宽过渡走 grid-template-columns（可动画），
+   * 观感是"面板滑出去"而不是"啪一下消失"。
+   *
+   * padding 也要一起归零：.wb-left 有自己的 padding-right: 2px，
+   * 0 宽度下它仍会占 2px，是一条擦不掉的黑缝。
+   */
+  .wb-focus {
+    grid-template-columns: 0 minmax(0, 1fr);
+    transition: grid-template-columns 220ms ease;
+  }
+  .wb-focus > .wb-left {
+    padding-right: 0;
+    overflow: hidden;
+    opacity: 0;
+    /* 收起来之后不该还能 Tab 进去 —— visibility 在过渡结束后才彻底关掉输入 */
+    visibility: hidden;
+    transition: opacity 160ms ease, visibility 0s linear 220ms;
+  }
+
   .wb-left {
     display: flex;
     flex-direction: column;
@@ -715,6 +740,7 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     padding-right: 2px;
+    transition: opacity 220ms ease;
   }
   .wb-mid {
     min-width: 0;
@@ -725,6 +751,23 @@
 @media (min-width: 112.5rem) {
   .wb {
     grid-template-columns: 320px minmax(0, 1fr) 320px;
+  }
+  /*
+   * 宽屏三栏下的专注模式。
+   *
+   * 这里必须**单独再写一遍**：上面 .wb-focus 的两列规则在 112.5rem 处的
+   * .wb 三列规则之前，同优先级下后出现的声明赢 —— 所以宽屏点专注时左栏
+   * 纹丝不动（实测 1920 宽：leftW 仍是 320）。三栏收左栏后剩「图纸 +
+   * 用料」两列，用料清单保持 320px 不动，中间 1fr 吃掉腾出的宽度。
+   */
+  .wb-focus {
+    grid-template-columns: 0 minmax(0, 1fr) 320px;
+  }
+  .wb-focus > .wb-left {
+    padding-right: 0;
+    overflow: hidden;
+    opacity: 0;
+    visibility: hidden;
   }
   .wb-right {
     display: flex;

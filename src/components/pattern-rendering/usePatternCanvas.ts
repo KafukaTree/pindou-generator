@@ -40,7 +40,7 @@ import {
 } from 'react';
 import type { PatternResult } from '@/lib/pattern/generate';
 import { parseHex, readableInkFor } from '@/lib/color/oklab';
-import type { Brand } from '@/lib/color/palette';
+import { getBrandPalette, type Brand } from '@/lib/color/palette';
 import {
   EMPTY_EDITS,
   applyDelta,
@@ -1118,6 +1118,120 @@ function drawHover(
   }
 
   ctx.globalAlpha = 1;
+}
+
+/**
+ * 拖动中的编辑预览：把这一笔已经划过的格子按目标色直接画出来。
+ *
+ * 只画这一笔涉及的格子（用户一次拖动通常几十格，极端也就几百格），
+ * 不碰主画布、不重建 surface —— 这是能和 320 格画布并存的唯一代价合理做法。
+ *
+ * 擦除（`after === ''`）要画成**棋盘格**而不是"什么都不画"：透明格在画布上
+ * 透出的是 .px-checker 背景，如果这里直接 clear 掉，看到的会是上一帧的图案
+ * 残影；而如果把格子填成纸色，又会被误读成"变成纸色豆子"。棋盘格才是
+ * "这里将不存在豆子"的正确表达，和擦除后的最终结果一致。
+ */
+function drawEditPreview(
+  canvas: HTMLCanvasElement,
+  metrics: CanvasMetrics,
+  cells: readonly number[],
+  after: string,
+  hex: string | null,
+  tokens: CanvasTokens,
+  skipClear = false,
+) {
+  const { cols, rows, cellDev, eff } = metrics;
+  const devW = cols * cellDev;
+  const devH = rows * cellDev;
+
+  if (canvas.width !== devW || canvas.height !== devH) {
+    canvas.width = devW;
+    canvas.height = devH;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  /*
+   * skipClear：调用方（overlay 绘制 effect）刚被 drawHover 清过整层，
+   * 再清一次会把 hover 环一起擦掉。独立使用时（默认 false）自己负责清。
+   */
+  if (!skipClear) ctx.clearRect(0, 0, devW, devH);
+  if (cells.length === 0) return;
+  ctx.scale(eff, eff);
+  const d = (dev: number) => dev / eff;
+  const size = d(cellDev);
+
+  if (after === '') {
+    // 擦除预览：两色棋盘，格内 2×2 交替，小格子时退化成单色块
+    const half = size / 2;
+    const a = tokens.checkerA;
+    const b = tokens.checkerB;
+    for (const index of cells) {
+      const col = index % cols;
+      const row = Math.floor(index / cols);
+      const x = d(col * cellDev);
+      const y = d(row * cellDev);
+      if (cellDev < 8) {
+        ctx.fillStyle = a;
+        ctx.fillRect(x, y, size, size);
+        continue;
+      }
+      ctx.fillStyle = a;
+      ctx.fillRect(x, y, size, size);
+      ctx.fillStyle = b;
+      ctx.fillRect(x, y, half, half);
+      ctx.fillRect(x + half, y + half, half, half);
+    }
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  if (!hex) return;
+  ctx.fillStyle = hex;
+  for (const index of cells) {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    ctx.fillRect(d(col * cellDev), d(row * cellDev), size, size);
+  }
+
+  /*
+   * 高亮轮廓：预览色可能和底下那一格几乎同色（例如在橙块上画橙豆），
+   * 一旦重合用户就看不出"我到底涂到了没有"。给这一笔的外沿补一圈金色细边，
+   * 让"已覆盖范围"永远可读。
+   *
+   * 但门槛必须够高：7px 的格子上 1px 描边就占掉 14%，两侧加起来 28%，
+   * 整条笔迹会读成"黄黑相间的虚线"（实测截图里就是这样，比不加还难看）。
+   * 小格子下色块本身已经换色，足以判断，所以只在格子足够大时才描边。
+   */
+  if (cellDev >= 11) {
+    /*
+     * 用 Set 查邻格：stroke.cells 在快速拖动下可能有几百格，`includes`
+     * 逐格线性扫会让这一步退化成 O(n²)（几百格 = 十几万次比较，
+     * 每帧跑一次就开始掉帧）。
+     */
+    const set = new Set(cells);
+    ctx.globalAlpha = 0.72;
+    ctx.fillStyle = tokens.gold;
+    const edge = Math.max(1, Math.round(cellDev * 0.08));
+    for (const index of cells) {
+      const col = index % cols;
+      const row = Math.floor(index / cols);
+      const x = d(col * cellDev);
+      const y = d(row * cellDev);
+      // 只在没有相邻预览格的那条边画，内部不画（否则一片格子全是金线）
+      const up = row > 0 && set.has(index - cols);
+      const down = row < rows - 1 && set.has(index + cols);
+      const left = col > 0 && set.has(index - 1);
+      const right = col < cols - 1 && set.has(index + 1);
+      const t = d(edge);
+      if (!up) ctx.fillRect(x, y, size, t);
+      if (!down) ctx.fillRect(x, y + size - t, size, t);
+      if (!left) ctx.fillRect(x, y, t, size);
+      if (!right) ctx.fillRect(x + size - t, y, t, size);
+    }
+    ctx.globalAlpha = 1;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,6 +2430,46 @@ export function usePatternCanvas(
   const [editCursor, setEditCursor] = useState<{ col: number; row: number } | null>(null);
 
   /**
+   * 拖动中的**实时预览**（用户反馈「画笔画过去橡皮擦过去，不能实时的去预览」）。
+   *
+   * 为什么必须有这一层：`paintCell` 只把笔迹记进 `editStrokeRef`（ref 不触发
+   * 渲染），真正的落图要等抬手时 `commitEditStroke` → `onEditsChange` →
+   * 父组件 `setEdits` → `displayPattern` 换新引用 → 主画布重绘。所以整条拖动
+   * 过程中画面**一格都不会变**，用户看到的是"笔划过去了但什么都没发生"，
+   * 松手才一次性刷出来。
+   *
+   * 实测（Playwright，H07 黑色画 10 个点）：拖动中画布近黑像素 648 → 648
+   * （零变化），松手后 648 → 1022。这就是这个 bug 的量化形态。
+   *
+   * 设计取舍：
+   *   · **不改主画布 / surface 缓存**。走主画布就得每帧重建整张离屏位图
+   *     （320 格 = 8.7 万格 putImageData），拖动会掉帧。预览画在 overlay 层
+   *     （和 hover 环同一层），只画这一笔涉及的那几十个格子。
+   *   · **不改 edits / 不写撤销栈**。预览是"将要发生"，不是"已经发生"；
+   *     写进 edits 会让撤销栈里出现半条笔，且父组件的统计/图例会在拖动中途
+   *     抖动。抬手后走的还是原来那条 commitDeltas 路径。
+   *   · 用一个自增 tick 推重绘（和刷区域的 `liveTick` 同一套办法）——
+   *     stroke 存在 ref 里，ref 变化不触发渲染。
+   */
+  const [editLiveTick, setEditLiveTick] = useState(0);
+
+  /** 色号 → #RRGGBB。色卡每次最多 291 项，用 Map 缓存避免拖动时反复线性查找。 */
+  const codeHexRef = useRef<{ brand: Brand | undefined; map: Map<string, string> }>({
+    brand: undefined,
+    map: new Map(),
+  });
+  const codeHex = useCallback((code: string): string | null => {
+    if (!brand) return null;
+    const cache = codeHexRef.current;
+    if (cache.brand !== brand) {
+      const map = new Map<string, string>();
+      for (const bead of getBrandPalette(brand)) map.set(bead.code, bead.hex);
+      codeHexRef.current = { brand, map };
+    }
+    return codeHexRef.current.map.get(code) ?? null;
+  }, [brand]);
+
+  /**
    * 视口坐标 → 格子下标（越界返回 null）。
    *
    * 必须用**画布的** getBoundingClientRect 反算，不能用整张图或滚动容器：
@@ -2360,6 +2514,13 @@ export function usePatternCanvas(
        */
       if (pickCodeAt(pattern, editsRef.current, index) === after) return;
       stroke.cells.push(index);
+      /*
+       * 推一次重绘让预览跟上（用户反馈的"画过去看不到"就在这里）。
+       *
+       * 必须放在 push 之后：预览读的是 stroke.cells，先推 tick 再 push 会
+       * 永远慢一格（尤其单点点击时这一格根本不会出现）。
+       */
+      setEditLiveTick((t) => t + 1);
     },
     [pattern],
   );
@@ -2408,6 +2569,15 @@ export function usePatternCanvas(
   const commitEditStroke = useCallback(() => {
     const stroke = editStrokeRef.current;
     editStrokeRef.current = null;
+    /*
+     * 清掉预览层。
+     *
+     * 抬手后主画布会通过 displayPattern 重绘成真实结果，但那是**下一个
+     * 渲染周期**；这期间 overlay 上还留着预览色块。若不清 tick，那些块
+     * 会一直挂着（用户会看到"松手后颜色更亮一点、过一会儿又变暗"的闪烁）。
+     * 推一次 tick 让 overlay 立刻重画成"只有 hover/方框"的干净状态。
+     */
+    setEditLiveTick((t) => t + 1);
     if (!stroke || stroke.cells.length === 0) return;
     commitDeltas([makeDelta(editsRef.current, stroke.cells, stroke.after)]);
   }, [commitDeltas]);
@@ -2593,6 +2763,26 @@ export function usePatternCanvas(
     } else {
       drawHover(canvas, metrics, hover, tokens);
       /*
+       * 拖动中的编辑预览（用户反馈「画笔画过去橡皮擦过去，不能实时的去预览」）。
+       *
+       * 顺序有讲究：
+       *   · 必须在 drawHover 之后 —— 它会 clearRect 整层，先画就被擦掉；
+       *   · 必须在"当前格方框"之前 —— 方框是"我这一下落在哪"，该在最上层。
+       * 所以这里传 skipClear=true：本层已被 drawHover 清空，预览只叠加填充。
+       */
+      const stroke = editStrokeRef.current;
+      if (editEnabled && stroke && stroke.cells.length > 0) {
+        drawEditPreview(
+          canvas,
+          metrics,
+          stroke.cells,
+          stroke.after,
+          stroke.after ? codeHex(stroke.after) : null,
+          tokens,
+          true,
+        );
+      }
+      /*
        * 编辑模式下再加一个"当前格"方框。
        *
        * hover 的三层环是给"看色号"用的，颜色是陶土；编辑时用户关心的是
@@ -2621,7 +2811,24 @@ export function usePatternCanvas(
         }
       }
     }
-  }, [metrics, hover, themeTick, brushMode, brushCursor, editEnabled, editCursor]);
+  }, [
+    metrics,
+    hover,
+    themeTick,
+    brushMode,
+    brushCursor,
+    editEnabled,
+    editCursor,
+    /*
+     * editLiveTick 是拖动预览的"推重绘"计数器。
+     *
+     * 笔迹存在 editStrokeRef 里（ref 变化不触发渲染），所以必须靠这个
+     * 自增值进依赖数组才能让 overlay 每落一格重画一次。少了它，预览只会在
+     * hover 恰好变化时偶尔刷新 —— 表现为"画快了才看得到，慢慢画反而没有"。
+     */
+    editLiveTick,
+    codeHex,
+  ]);
 
   // ---- 标尺 ----
   /*

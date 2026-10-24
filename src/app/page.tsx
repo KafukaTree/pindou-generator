@@ -2,11 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Toaster, toast } from 'sonner';
-import { Moon, Sun, Sparkles } from 'lucide-react';
+import { Moon, Sun, Sparkles, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 
 import { FileUpload } from '@/components/image-upload/FileUpload';
 import { PatternSettings } from '@/components/settings/PatternSettings';
-import { PatternCanvas } from '@/components/pattern-rendering/PatternCanvas';
+import {
+  PatternCanvas,
+  type CanvasActivity,
+} from '@/components/pattern-rendering/PatternCanvas';
 import type { DetailBrush } from '@/lib/pattern/regions';
 import {
   applyEdits,
@@ -22,6 +25,9 @@ import {
   PixelMascot,
   PixelMascotPeek,
   PixelEmpty,
+  MascotRoamer,
+  WORKBENCH_ANCHORS,
+  type MascotAwareness,
 } from '@/components/scenery';
 
 import {
@@ -165,6 +171,73 @@ export default function Home() {
   const [pattern, setPattern] = useState<PatternResult | null>(null);
   const [isWorking, setIsWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /*
+   * 画布当前占用状态（空闲 / 刷区域 / 编辑）。
+   *
+   * 巡游桌宠要躲开这个状态：用户开始刷区域或编辑时，它应该主动离开画布附近
+   * 的锚点，别在人家正盯着的格子上晃。状态源头在 PatternCanvas 内部，通过
+   * onActivityChange 上报。
+   */
+  const [canvasActivity, setCanvasActivity] = useState<CanvasActivity>('idle');
+  const hasCanvasImage = sourceDataUrl !== null;
+
+  /*
+   * 专注模式：把左栏（图 + 参数）收起来，让图纸吃满整行。
+   *
+   * 用户原话：「这个侧边栏在绘图的时候要是能收起来就好了，要不然有点不方便」。
+   * 320px 的左栏在 1440 宽的屏上占掉 22%，而绘图时左栏是纯干扰 ——
+   * 参数早就调好了，视线全在画布上。
+   *
+   * 两个入口缺一不可：
+   *   · 手动 —— 画布面板标题栏的图标按钮；
+   *   · 自动 —— 进入编辑/刷区域时收起，退出时还原。
+   *
+   * 自动那半要避免跟用户抢控制权：进入时先记住"进来之前是展开还是收着"，
+   * 退出时照原样还原；但如果用户在里面**手动点过**开关，就以他点的为准，
+   * 不再还原（否则用户刚展开、一松手又收回去，等于白点）。
+   */
+  const [focusMode, setFocusMode] = useState(false);
+  const preActiveFocusRef = useRef(false);
+  const userToggledFocusRef = useRef(false);
+
+  useEffect(() => {
+    const active = canvasActivity !== 'idle';
+    if (active) {
+      preActiveFocusRef.current = focusMode;
+      userToggledFocusRef.current = false;
+      setFocusMode(true);
+      return;
+    }
+    if (!userToggledFocusRef.current) setFocusMode(preActiveFocusRef.current);
+    // focusMode 故意不进依赖：它只用来读"进入前的值"，进了依赖会自己触发自己
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasActivity]);
+
+  const toggleFocus = useCallback(() => {
+    userToggledFocusRef.current = true;
+    setFocusMode((v) => !v);
+  }, []);
+
+  /**
+   * 桌宠的"现在的处境"。
+   *
+   * 顺序即优先级：出错最要紧 → 重算中 → 编辑/刷区域 → 无图 → 出图完成。
+   * 它只影响表情，不影响别的任何逻辑 —— 所以这里即使判歪了也只是表情不对，
+   * 不会把功能弄坏。
+   */
+  const awareness: MascotAwareness = error
+    ? 'error'
+    : isWorking
+      ? 'working'
+      : canvasActivity === 'editing'
+        ? 'editing'
+        : canvasActivity === 'brushing'
+          ? 'brushing'
+          : !hasCanvasImage
+            ? 'empty'
+            : 'done';
+
 
   // ---- 主题 --------------------------------------------------------------
   const [theme, setTheme] = useState<Theme>('light');
@@ -582,7 +655,31 @@ export default function Home() {
          *   section 直接进入父级 flex，再用 order 重排；大屏时左栏
          *   恢复成 flex 列，order 不再起作用（grid 只按 DOM 顺序放）。
          */}
-        <div className="wb">
+        {/*
+         * 巡游桌宠。
+         *
+         * 挂成 .wb 的**兄弟**而不是子元素：.wb 在大屏上是 grid，多一个
+         * 子元素会占掉一个网格单元（把左栏挤到第二行）。放在外面用
+         * absolute 覆盖整块工作区，锚点是相对这块区域的百分比，
+         * 与 .wb 的 grid 结构完全解耦。
+         *
+         * awareness 负责表情：出错 / 重算 / 编辑 / 刷区域 / 无图 / 出图完成
+         * 各有一个对应的形态。刷区域和编辑时它还会**主动让开** ——
+         * MascotRoamer 的 desk-left-* 锚点带 excludeIn: ['editing','brushing']。
+         *
+         * 手机（<lg）不显示：54dvh 的画布上再飘一只豆子就真的挡格子了。
+         */}
+        {hasImage && (
+          <div className="pointer-events-none absolute inset-0 z-20 hidden lg:block">
+            <MascotRoamer
+              anchors={WORKBENCH_ANCHORS}
+              awareness={awareness}
+              baseSize={44}
+            />
+          </div>
+        )}
+
+        <div className={cn('wb', focusMode && 'wb-focus')}>
           {/* ---------------------- 左栏：输入与参数（内部滚动） ---------------------- */}
           <div className="wb-left">
             <Section
@@ -669,6 +766,34 @@ export default function Home() {
                     </span>
                   )}
                 </div>
+                {/*
+                 * 专注模式开关。
+                 *
+                 * 只在有图时出现 —— 没图的时候左栏的「放一张图」是唯一入口，
+                 * 收起来用户就不知道下一步做什么了。
+                 * 文案随状态变（"收起左栏"/"展开左栏"），不要只给图标：
+                 * 一个面板图标在"收"和"展"两种状态下的方向解读因人而异。
+                 */}
+                {hasImage && (
+                  <button
+                    type="button"
+                    onClick={toggleFocus}
+                    className="px-btn px-btn-ghost px-btn-sm ml-auto hidden shrink-0 lg:inline-flex"
+                    aria-pressed={focusMode}
+                    title={
+                      focusMode
+                        ? '展开左侧的图片与参数面板'
+                        : '收起左侧面板，让图纸占满整行'
+                    }
+                  >
+                    {focusMode ? (
+                      <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
+                    ) : (
+                      <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
+                    )}
+                    {focusMode ? '展开左栏' : '专注'}
+                  </button>
+                )}
                 <p className="hidden text-[11px] text-[var(--ink-3)] md:block">
                   拖动画布可平移，滚轮缩放，悬停看色号
                 </p>
@@ -694,6 +819,7 @@ export default function Home() {
                     edits={edits}
                     onEditsChange={setEdits}
                     isWorking={isWorking}
+                    onActivityChange={setCanvasActivity}
                   />
                 )}
 
