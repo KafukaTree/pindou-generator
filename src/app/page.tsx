@@ -43,7 +43,6 @@ import {
   type GenerateOptions,
   type PatternResult,
 } from '@/lib/pattern/generate';
-import type { Brand } from '@/lib/color/palette';
 import { readStorage, writeStorage } from '@/hooks/useLocalStorage';
 import { cn } from '@/lib/utils';
 
@@ -107,6 +106,7 @@ const DEFAULT_FEATHER = 0.55;
 
 const OPTIONS_KEY = 'pindou.options.v1';
 const THEME_KEY = 'pindou.theme';
+const FOCUS_KEY = 'pindou.leftCollapsed';
 
 type Theme = 'light' | 'dark';
 
@@ -183,40 +183,41 @@ export default function Home() {
   const hasCanvasImage = sourceDataUrl !== null;
 
   /*
-   * 专注模式：把左栏（图 + 参数）收起来，让图纸吃满整行。
+   * 左栏折叠：把左栏（图 + 参数）收起来，让图纸吃满整行。
    *
-   * 用户原话：「这个侧边栏在绘图的时候要是能收起来就好了，要不然有点不方便」。
-   * 320px 的左栏在 1440 宽的屏上占掉 22%，而绘图时左栏是纯干扰 ——
-   * 参数早就调好了，视线全在画布上。
+   * 用户原话：「这个侧边栏在绘图的时候要是能收起来就好了，要不然有点不方便」，
+   * 随后又明确：「我要用户主动折叠的那种，还能还原折出来，不然不好用」。
    *
-   * 两个入口缺一不可：
-   *   · 手动 —— 画布面板标题栏的图标按钮；
-   *   · 自动 —— 进入编辑/刷区域时收起，退出时还原。
+   * 所以这里**只有手动**，不做任何自动收起。之前那版会在进编辑/刷区域时
+   * 自动收、退出时自动还原，看起来贴心，实际上是跟用户抢控制权：他刚展开
+   * 左栏想改个参数，一碰画布又被收走 —— 用户说的"不好用"就是这个。
    *
-   * 自动那半要避免跟用户抢控制权：进入时先记住"进来之前是展开还是收着"，
-   * 退出时照原样还原；但如果用户在里面**手动点过**开关，就以他点的为准，
-   * 不再还原（否则用户刚展开、一松手又收回去，等于白点）。
+   * 还原路径有两条，都要在：
+   *   · 标题栏的按钮（展开时显示「收起左栏」，收起后显示「展开左栏」）；
+   *   · 收起后在原位留一条 24px 的竖边条 —— 整块面板消失后按钮也跟着
+   *     消失，用户就找不到回去的路了，这是折叠 UI 最经典的坑。
+   *
+   * 状态持久化到 localStorage：折叠是个"工作姿态"，关掉页面再回来应该
+   * 还是那个姿势，不该每都会话都重新点一次。
    */
-  const [focusMode, setFocusMode] = useState(false);
-  const preActiveFocusRef = useRef(false);
-  const userToggledFocusRef = useRef(false);
-
-  useEffect(() => {
-    const active = canvasActivity !== 'idle';
-    if (active) {
-      preActiveFocusRef.current = focusMode;
-      userToggledFocusRef.current = false;
-      setFocusMode(true);
-      return;
-    }
-    if (!userToggledFocusRef.current) setFocusMode(preActiveFocusRef.current);
-    // focusMode 故意不进依赖：它只用来读"进入前的值"，进了依赖会自己触发自己
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvasActivity]);
+    /*
+   * 初始值直接同步读 localStorage，不要放进 useEffect。
+   *
+   * 放 effect 里的话首帧渲染的是"展开"，第二帧才收起来 —— 用户会看到
+   * 左栏闪一下再消失。readStorage 内部已处理 SSR（window 不存在时返回
+   * 默认值），所以这里可以同步读。useState 的惰性初始化函数只跑一次，
+   * 也不会每次渲染都碰 localStorage。
+   */
+  const [leftCollapsed, setLeftCollapsed] = useState<boolean>(
+    () => readStorage<boolean>(FOCUS_KEY, false) === true,
+  );
 
   const toggleFocus = useCallback(() => {
-    userToggledFocusRef.current = true;
-    setFocusMode((v) => !v);
+    setLeftCollapsed((prev) => {
+      const next = !prev;
+      writeStorage(FOCUS_KEY, next);
+      return next;
+    });
   }, []);
 
   /**
@@ -237,7 +238,6 @@ export default function Home() {
           : !hasCanvasImage
             ? 'empty'
             : 'done';
-
 
   // ---- 主题 --------------------------------------------------------------
   const [theme, setTheme] = useState<Theme>('light');
@@ -668,8 +668,15 @@ export default function Home() {
          * MascotRoamer 的 desk-left-* 锚点带 excludeIn: ['editing','brushing']。
          *
          * 手机（<lg）不显示：54dvh 的画布上再飘一只豆子就真的挡格子了。
+         *
+         * 左栏收起时也不显示。锚点是照着"左栏在"的布局扫出来的百分比；
+         * 左栏一收，画布往左顶、宽出 320px，右侧缝也一起吃紧 —— 实测折叠
+         * 状态下 1920 宽 30 秒里压了 2 次画布。硬按包围盒筛会把候选筛到
+         * 只剩一两个点（画布几乎占满整行，本来就没留白可站），桌宠就变成
+         * 在同一个角落反复闪。折叠是一种"专注看图纸"的姿态，此时它消失
+         * 是最干净的解法；展开左栏它自己就回来了。
          */}
-        {hasImage && (
+        {hasImage && !leftCollapsed && (
           <div className="pointer-events-none absolute inset-0 z-20 hidden lg:block">
             <MascotRoamer
               anchors={WORKBENCH_ANCHORS}
@@ -679,7 +686,28 @@ export default function Home() {
           </div>
         )}
 
-        <div className={cn('wb', focusMode && 'wb-focus')}>
+        {/*
+         * 折叠后的还原把手。
+         *
+         * 左栏收成 0 宽之后，那一侧就是一片空白 —— 用户在画布上画了半天，
+         * 想改参数时会先往左看，看到的只有纸面。只靠图纸标题栏里那个按钮
+         * 不够：它离左边太远，而且和「刷区域 / 编辑 / 色号」混在一排，
+         * 视线扫过去不会注意到。所以原地留一条竖边条，鼠标一靠近就浮出
+         * 「展开左栏」。24px 是能舒服点中的最小宽度（WCAG 2.5.8 要求 24）。
+         */}
+        {hasImage && leftCollapsed && (
+          <button
+            type="button"
+            onClick={toggleFocus}
+            className="absolute top-3 bottom-3 left-0 z-30 hidden w-6 items-center justify-center border-r-2 border-[var(--line)] bg-[var(--paper-raised)]/70 text-[var(--ink-3)] transition-colors hover:bg-[var(--paper-hi)] hover:text-[var(--clay)] lg:flex"
+            aria-label="展开左侧的图片与参数面板"
+            title="展开左栏"
+          >
+            <PanelLeftOpen className="h-4 w-4" aria-hidden />
+          </button>
+        )}
+
+        <div className={cn('wb', leftCollapsed && 'wb-focus')}>
           {/* ---------------------- 左栏：输入与参数（内部滚动） ---------------------- */}
           <div className="wb-left">
             <Section
@@ -779,19 +807,19 @@ export default function Home() {
                     type="button"
                     onClick={toggleFocus}
                     className="px-btn px-btn-ghost px-btn-sm ml-auto hidden shrink-0 lg:inline-flex"
-                    aria-pressed={focusMode}
+                    aria-pressed={leftCollapsed}
                     title={
-                      focusMode
+                      leftCollapsed
                         ? '展开左侧的图片与参数面板'
                         : '收起左侧面板，让图纸占满整行'
                     }
                   >
-                    {focusMode ? (
+                    {leftCollapsed ? (
                       <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
                     ) : (
                       <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
                     )}
-                    {focusMode ? '展开左栏' : '专注'}
+                    {leftCollapsed ? '展开左栏' : '收起左栏'}
                   </button>
                 )}
                 <p className="hidden text-[11px] text-[var(--ink-3)] md:block">
@@ -846,13 +874,6 @@ export default function Home() {
                 </div>
               </div>
             </div>
-
-            {/* 图纸下方的读数条：把"这张图到底要多少豆"讲清楚 */}
-            {displayPattern && (
-              <div className="shrink-0">
-                <StatsBar pattern={displayPattern} brand={options.brand} />
-              </div>
-            )}
           </div>
 
           {/* ---------------------- 右栏：用料清单（内部滚动） ---------------------- */}
@@ -1107,54 +1128,3 @@ function ErrorBlock({
 }
 
 /** 图纸下方的一排读数：颗数 / 色数 / 尺寸 / 平均色差 */
-function StatsBar({
-  pattern,
-  brand,
-}: {
-  pattern: PatternResult;
-  brand: Brand;
-}) {
-  /*
-   * 五个读数在手机上排成三行会吃掉 170px 可视高度（相当于半个图纸），
-   * 而"平均色差"和"品牌色卡"是给进阶用户看的核对信息 —— 手机上藏起来，
-   * 图纸标题条里已经写着品牌，色差也早有定论。sm 以上全部展开。
-   */
-  const stats = [
-    { label: '总颗数', value: pattern.totalBeads.toLocaleString('zh-CN'), key: true },
-    { label: '色号数', value: String(pattern.palette.length), key: true },
-    {
-      label: '成品尺寸',
-      // 窄格子里 "约 32 × 27 CM" 会折成三行，去掉"约"用 cm 小写更紧凑
-      value: `${pattern.meta.sizeCm.w}×${pattern.meta.sizeCm.h}cm`,
-      key: true,
-    },
-    {
-      label: '平均色差',
-      // ΔE 越小越忠实；0.04 以下人眼基本分辨不出偏差
-      value: pattern.meanDeltaE.toFixed(3),
-      key: false,
-    },
-    { label: '品牌色卡', value: brand, key: false },
-  ];
-
-  return (
-    <div className="px-panel-flat grid grid-cols-3 gap-px bg-[var(--line)] sm:grid-cols-5 lg:flex lg:flex-wrap lg:items-stretch lg:gap-0 lg:divide-x-2 lg:divide-[var(--line)] lg:bg-transparent">
-      {stats.map((s) => (
-        <div
-          key={s.label}
-          className={cn(
-            'bg-[var(--paper-raised)] px-3 py-2 lg:flex-1 lg:px-4 lg:py-3',
-            !s.key && 'max-sm:hidden',
-          )}
-        >
-          <p className="font-px text-[9px] uppercase tracking-[0.16em] text-[var(--ink-3)]">
-            {s.label}
-          </p>
-          <p className="mt-1 font-px text-[13px] font-bold tabular-nums whitespace-nowrap text-[var(--ink)]">
-            {s.value}
-          </p>
-        </div>
-      ))}
-    </div>
-  );
-}

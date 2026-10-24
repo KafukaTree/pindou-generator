@@ -24,7 +24,7 @@ import {
   type KeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { estimateSizeCm, type PatternResult } from '@/lib/pattern/generate';
+import type { PatternResult } from '@/lib/pattern/generate';
 import { getBrandPalette, type Brand } from '@/lib/color/palette';
 import { Slider } from '@/components/ui/slider';
 import { DETAIL_ALGORITHMS, DETAIL_META, type DetailAlgorithm } from '@/lib/pattern/detail';
@@ -148,7 +148,6 @@ export function PatternCanvas({
     onPointerLeave,
     ruler,
     hasPattern,
-    hud,
     brushMode,
     setBrushMode,
     brushAlgorithm,
@@ -315,14 +314,11 @@ export function PatternCanvas({
 
   const zoomPct = Math.round(zoom * 100);
   const cellCss = metrics?.cellCss ?? 12;
-  // 成品尺寸一律取自引擎（5mm 豆），不在渲染层重算，避免 UI/PDF 口径不一致
-  const sizeCm = pattern ? estimateSizeCm(pattern.cols, pattern.rows) : { w: 0, h: 0 };
   /*
-   * 统计条读**叠加编辑后**的数字：手绘加一颗豆，颗数就该 +1；
-   * 用引擎值会让人以为"我改了个假的图纸"。
+   * 颗数读**叠加编辑后**的数字：手绘加一颗豆，颗数就该 +1；
+   * 用引擎值会让人以为"我改了个假的图纸"。这个值还给画布的 aria-label 用。
    */
   const shownTotal = displayPattern?.totalBeads ?? 0;
-  const shownColors = displayPattern?.palette.length ?? 0;
 
   // ---- 标尺刻度（HTML，1-based，每 5 格标数字，10 的倍数加粗） ----
   /*
@@ -1438,35 +1434,18 @@ export function PatternCanvas({
         </div>
       </div>
 
-      {/* ---------------- 统计条 ---------------- */}
-      <div
-        className="flex flex-wrap items-center gap-x-3 gap-y-1.5 font-px text-[10px]"
-        style={{ color: 'var(--ink-2)' }}
-      >
-        <span className="px-tag px-tag-ink" style={{ fontSize: 10 }}>
-          {cols} × {rows}
-        </span>
-        <span className="px-tag px-tag-ink" style={{ fontSize: 10 }}>
-          {shownTotal} 颗
-        </span>
-        <span className="px-tag px-tag-ink" style={{ fontSize: 10 }}>
-          {shownColors} 色
-        </span>
-        <span className="px-tag px-tag-ink" style={{ fontSize: 10 }}>
-          {brand}
-        </span>
-        <span style={{ color: 'var(--ink-3)' }}>
-          约 {sizeCm.w} × {sizeCm.h} cm
-        </span>
-        <span style={{ color: 'var(--ink-3)' }}>
-          平均色差 ΔE {pattern.meanDeltaE.toFixed(3)}
-        </span>
-        {hud && (
-          <span className="ml-auto" style={{ color: 'var(--ink-3)' }}>
-            每格 {cellCss.toFixed(1)}px · {metrics?.eff.toFixed(2)}× DPR
-          </span>
-        )}
-      </div>
+      {/*
+        这里原来有一条统计条：格数 / 颗数 / 色数 / 品牌 / 成品尺寸 / 平均色差 /
+        每格像素与 DPR。全删了。
+
+        理由：这些数字在别处都能看到 —— 页头有「颗数 / 色数 / 格数」三个 tag，
+        用料清单里有逐色颗数与建议备货量，尺寸在图纸标题里写着。画布下方再铺
+        一整排，等于把同一组数字在同一屏里印两遍，还占掉 40px 宽度给画布。
+        用户原话：「右侧主要是画板就行，下面那个不需要有」。
+
+        只保留 DPR 那一项的信息量没有替代品，但它是给开发核对渲染质量的，
+        不是用户要看的东西 —— 真要查，devtools 里量一下更准。
+      */}
 
       {/* 刷子模式的反向命中提示：告诉用户"这一笔会把这处变成什么" */}
       {brushMode &&

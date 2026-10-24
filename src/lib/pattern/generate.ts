@@ -1130,6 +1130,13 @@ export function generatePattern(
     cells, pooled, ssIdx, lab, alpha, palette, cols, rows, gw,
     SS, AA_MIN, profile.accentVoteMax, profile.accentMinD, regionField,
   );
+  // 窄线已按真实路径落位；同一源线跨格的混色残影继续由 ICM/碎片清理判断，
+  // 不再被少数票强调色重复钉住。其他已确认的结构格仍保留保护。
+  for (const plan of placement.plans) {
+    for (const key of plan.strokeFringe ?? []) {
+      if (!protectedCellsEarly[key]) protectedCells[key] = 0;
+    }
+  }
 
   // --- 7. 边缘感知 ICM ---------------------------------------------------
   /*

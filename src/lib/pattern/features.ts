@@ -56,7 +56,7 @@ export interface StructuralFeature {
   area: number;
   /** 与外围 2px 环的平均感知对比（OKLab 距离） */
   contrast: number;
-  /** 多尺度稳定度 0..1 */
+  /** 多尺度稳定度；连续窄线改用双侧前景支持率，范围 0..1。 */
   stability: number;
   /** 采信度：面积、对比、稳定的合成，用于配额取舍 */
   confidence: number;
@@ -64,6 +64,8 @@ export interface StructuralFeature {
   partner: number;
   /** 连续窄线的实际源像素中心，交错存放 x/y；不用 bbox 填满内部。 */
   strokePixels?: Float32Array;
+  /** 检测副本一个像素在源图上的边长。 */
+  strokePixelSize?: number;
 }
 
 export interface DetectOptions {
@@ -507,7 +509,7 @@ function detectThinDarkStrokes(
       x1: (c.x1 + 1) * sourceScale - 1, y1: (c.y1 + 1) * sourceScale - 1,
       cx: c.cx * sourceScale, cy: c.cy * sourceScale, area: c.area * sourceScale * sourceScale,
       contrast, stability: support, confidence: support * clamp01((contrast - minContrast) / 0.25),
-      partner: -1, strokePixels,
+      partner: -1, strokePixels, strokePixelSize: sourceScale,
     });
   }
   return out;
@@ -607,6 +609,8 @@ export interface FeaturePlan {
   allowed: BeadColor[];
   /** 覆盖到的格子（长边顺序扁平下标，去重） */
   cells: number[];
+  /** 同一条窄线的边界覆盖格；路径已表达后，不再把混色残影当独立强调色。 */
+  strokeFringe?: number[];
   /** 配额：至少要有几颗豆 */
   minBeads: number;
   /** 已实际落下的豆数 */
@@ -691,7 +695,7 @@ export function planFeaturePlacement(
   for (let fi = 0; fi < features.length; fi++) {
     const f = features[fi];
     /*
-     * **只给"成对"的特征分配配额。**
+     * **亮暗小块只给"成对"特征分配面积配额；连续窄线使用路径配额。**
      *
      * 这是整套方案能否不伤回归门禁的关键。单个孤立的高光不是眼睛 ——
      * 龟壳上的反光（实测 17 个亮特征、面积 142-257px、对比 0.41-0.52）
@@ -733,13 +737,22 @@ export function planFeaturePlacement(
     const x1 = Math.min(srcW - 1, f.x1 + 1);
     const y1 = Math.min(srcH - 1, f.y1 + 1);
     const tally = new Map<number, number>();
+    const strokeTouched = new Set<number>();
     if (f.strokePixels) {
       for (let i = 0; i < f.strokePixels.length; i += 2) {
-        const cx = Math.floor(offX + f.strokePixels[i] * scale);
-        const cy = Math.floor(offY + f.strokePixels[i + 1] * scale);
+        const gx = offX + f.strokePixels[i] * scale;
+        const gy = offY + f.strokePixels[i + 1] * scale;
+        const cx = Math.floor(gx);
+        const cy = Math.floor(gy);
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
         const key = cy * cols + cx;
         tally.set(key, (tally.get(key) ?? 0) + 1);
+        const half = (f.strokePixelSize ?? 1) * scale / 2;
+        for (let r = Math.max(0, Math.floor(gy - half)); r <= Math.min(rows - 1, Math.ceil(gy + half) - 1); r++) {
+          for (let c = Math.max(0, Math.floor(gx - half)); c <= Math.min(cols - 1, Math.ceil(gx + half) - 1); c++) {
+            strokeTouched.add(r * cols + c);
+          }
+        }
       }
     } else {
       for (let sy = y0; sy <= y1; sy++) {
@@ -781,6 +794,7 @@ export function planFeaturePlacement(
       bead,
       allowed: cands,
       cells,
+      ...(f.strokePixels ? { strokeFringe: [...strokeTouched].filter((key) => !tally.has(key)) } : {}),
       minBeads,
       placed: 0,
       confidence: f.confidence,
