@@ -246,7 +246,7 @@ export default function Home() {
    * 状态持久化到 localStorage：折叠是个"工作姿态"，关掉页面再回来应该
    * 还是那个姿势，不该每都会话都重新点一次。
    */
-    /*
+  /*
    * 初始值直接同步读 localStorage，不要放进 useEffect。
    *
    * 放 effect 里的话首帧渲染的是"展开"，第二帧才收起来 —— 用户会看到
@@ -257,6 +257,8 @@ export default function Home() {
   const [leftCollapsed, setLeftCollapsed] = useState<boolean>(
     () => readStorage<boolean>(FOCUS_KEY, false) === true,
   );
+  /** 画布宿主（中栏内容区）。CanvasBottomPeek 靠它换算画布盒的实际位置。 */
+  const canvasHostRef = useRef<HTMLDivElement | null>(null);
 
   const toggleFocus = useCallback(() => {
     setLeftCollapsed((prev) => {
@@ -1109,7 +1111,10 @@ export default function Home() {
                 </p>
               </div>
 
-              <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
+              <div
+                ref={canvasHostRef}
+                className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3"
+              >
                 {error ? (
                   <ErrorBlock message={error} onRetry={handleClear} />
                 ) : !hasImage ? (
@@ -1148,26 +1153,24 @@ export default function Home() {
                 )}
 
                 {/*
-                 * 吉祥物从画布下沿探出头来看图。
+                 * 吉祥物趴在**画布下沿**，不是面板下沿。
                  *
-                 * 「看」需要位置关系才成立 —— 它得贴着画布边缘，否则
-                 * 只是页面上多了一张贴纸。PixelMascotPeek 用
-                 * `bottom: 100%` 把身体挂在最近的定位祖先的**上边缘**，
-                 * 于是这里塞一个高度 0 的定位壳放在画布底部：
-                 * 壳的顶边 = 画布下沿，吉祥物的爪子正好压在那条线上，
-                 * 身体探进画布内部。
+                 * 改之前这里是一个 `absolute inset-x-3 bottom-8 h-0` 的壳，
+                 * 挂在面板的 padding 盒上 —— 实测吉祥物 x=358，而画布左
+                 * 边缘在 x=692：画布在 1216px 宽的容器里居中，左右各空出
+                 * 322px，吉祥物其实悬在**空白处**，底下根本没有线可趴。
+                 * 纵向也差 9px。
                  *
-                 * 放左下角而不是右上角：画布居中显示，四角本来就是空
-                 * 棋盘格，左下角不会压住"拖动画布可平移…"那行提示，
-                 * 也不会挡到图纸本身。尺寸 64 是原生网格 40 格的整数倍
-                 * （64/40 = 1.6 个 CSS 像素/格），轮廓仍是整格。
+                 * 现在改成跟随画布元素本身：CanvasBottomPeek 用
+                 * MutationObserver 盯 canvas 的 width/height 属性（缩放、
+                 * 换图、换网格密度都会改它们），配合滚动与窗口 resize
+                 * 实测出画布盒相对面板的偏移，把吉祥物钉在画布左下角
+                 * 那条边上。它现在真的趴在格子尽头。
                  *
-                 * 只在 lg 以上出现：手机上画布只有 54dvh，再塞一个
-                 * 吉祥物进去就真的挡住要看的格子了。
+                 * 只在 lg 以上出现：手机上画布只有 54dvh，再塞一个吉祥物
+                 * 进去就真的挡住要看的格子了。
                  */}
-                <div className="pointer-events-none absolute inset-x-3 bottom-8 z-20 hidden h-0 lg:block">
-                  <PixelMascotPeek size={64} side="left" />
-                </div>
+                <CanvasBottomPeek hostRef={canvasHostRef} />
               </div>
             </div>
           </div>
@@ -1213,6 +1216,94 @@ export default function Home() {
  * ================================================================ */
 
 /** 顶栏左边的小标记：一个趴着的豆子 */
+/**
+ * 趴在画布下沿的吉祥物。
+ *
+ * 为什么不能只用 CSS 定位：`PixelMascotPeek` 的语义是"扒在最近的定位
+ * 祖先的上边缘"，但画布的定位祖先是**滚动容器**（`px-inset`，`overflow:auto`），
+ * 而画布在容器里是居中的 —— 52×64 的图在 1216px 宽的容器里只占 572px，
+ * 左右各空 322px。于是挂容器左边缘的吉祥物落在了空白里。
+ *
+ * 竖向同理：画布底部与容器底部之间还有一段滚动余量，也不是同一条线。
+ *
+ * 所以这里实测：拿 canvas 元素的 `getBoundingClientRect()` 减去面板的，
+ * 得到画布左下角相对面板的偏移，再把吉祥物放到那个点上。canvas 的
+ * width/height 属性在缩放、换图、换网格密度时都会变，用
+ * MutationObserver 盯这两个属性；滚动和窗口尺寸变化各自挂监听。
+ * 全程只读 DOM、只写一个 style，不触发 React 重渲染。
+ */
+function CanvasBottomPeek({ hostRef }: { hostRef: React.RefObject<HTMLDivElement | null> }) {
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    const box = boxRef.current;
+    if (!host || !box) return;
+
+    let raf = 0;
+    const measure = () => {
+      raf = 0;
+      const canvas = host.querySelector('canvas');
+      if (!canvas) {
+        box.style.opacity = '0';
+        return;
+      }
+      const cr = canvas.getBoundingClientRect();
+      const hr = host.getBoundingClientRect();
+      // 画布可能被滚出视口，或还没布局出尺寸 —— 两种都不该乱跳
+      if (cr.width < 8 || cr.height < 8) {
+        box.style.opacity = '0';
+        return;
+      }
+      box.style.opacity = '1';
+      box.style.left = `${Math.round(cr.left - hr.left)}px`;
+      // 吉祥物自身的下沿对齐画布下沿：PixelMascotPeek 会再把它往下探
+      // 一格（爪子压在线上），所以这里给的是"线"的位置。
+      box.style.top = `${Math.round(cr.bottom - hr.top)}px`;
+    };
+    const schedule = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(measure);
+    };
+
+    measure();
+
+    /* 缩放/换图/换网格都会改 canvas 的 width/height 属性 */
+    const mo = new MutationObserver(schedule);
+    mo.observe(host, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['width', 'height'],
+    });
+
+    const scroller = host.querySelector('.px-inset');
+    scroller?.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+    /* 左栏折叠、历史/图例出现都会改变中栏宽度，画布跟着重新居中 */
+    const ro = new ResizeObserver(schedule);
+    ro.observe(host);
+
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      mo.disconnect();
+      scroller?.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      ro.disconnect();
+    };
+  }, [hostRef]);
+
+  return (
+    <div
+      ref={boxRef}
+      className="pointer-events-none absolute z-20 hidden transition-opacity duration-200 lg:block"
+      style={{ left: 0, top: 0, opacity: 0 }}
+      aria-hidden
+    >
+      <PixelMascotPeek size={64} side="left" />
+    </div>
+  );
+}
+
 function MascotMark() {
   /*
    * 尺寸 40 而不是 26：吉祥物的原生网格是 40×34 个 4px 格，缩到 26px
