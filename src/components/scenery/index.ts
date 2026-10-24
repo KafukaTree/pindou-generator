@@ -31,3 +31,9 @@ export type {
   MascotAnchor,
   MascotAwareness,
 } from './MascotRoamer';
+
+export { MascotMark, MascotPromptButton } from './MascotMark';
+export type { MascotMarkProps, MascotPromptButtonProps } from './MascotMark';
+
+export { MascotPromptPopover } from './MascotPromptPopover';
+export type { MascotPromptPopoverProps } from './MascotPromptPopover';
