@@ -2,9 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Toaster, toast } from 'sonner';
-import { Moon, Sun, Sparkles, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import {
+  Moon,
+  Sun,
+  Sparkles,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Grid2x2,
+  RefreshCw,
+  X,
+} from 'lucide-react';
 
 import { FileUpload } from '@/components/image-upload/FileUpload';
+import { NewCanvasDialog } from '@/components/blank-canvas/NewCanvasDialog';
 import { PatternSettings } from '@/components/settings/PatternSettings';
 import {
   PatternCanvas,
@@ -37,12 +47,21 @@ import {
   type HistoryVersion,
 } from '@/hooks/useHistory';
 import {
+  estimateSizeCm,
   generatePattern,
   imageDataFromSource,
   patternToThumbnail,
   type GenerateOptions,
   type PatternResult,
 } from '@/lib/pattern/generate';
+import {
+  blankSourceKey,
+  blankThumbnail,
+  makeBlankId,
+  makeBlankPattern,
+  parseBlankSourceKey,
+} from '@/lib/pattern/blank';
+import { BRANDS, BRAND_META, type Brand } from '@/lib/color/palette';
 import { readStorage, writeStorage } from '@/hooks/useLocalStorage';
 import { cn } from '@/lib/utils';
 
@@ -167,6 +186,33 @@ export default function Home() {
     return saved ? { ...DEFAULT_OPTIONS, ...saved } : DEFAULT_OPTIONS;
   });
 
+  /*
+   * ---- 空白画布 ----------------------------------------------------------
+   *
+   * 有值时表示"当前这张图纸不是从图片生成的，而是用户从空板子开始画的"。
+   * 它和 `sourceDataUrl` 是互斥的两个来源：
+   *
+   *   sourceDataUrl  → 走引擎（重算 effect）
+   *   blankCanvas    → 不走引擎，直接造一张全空 cells 的图纸
+   *
+   * 为什么要一个独立 state 而不是"造一张纯白图去生成"：引擎会对白底做
+   * 自动裁背景、超采样、调色板选择，最后给出一张可能被裁空的图纸，颜色
+   * 还是它自己编的 —— 与"我要一块空板子"完全不是一回事。
+   *
+   * 尺寸单独存：网格密度滑杆在空白画布下不参与重算（那样会静默换掉用户
+   * 的画布尺寸），改尺寸只走「新建空白画布」对话框。
+   *
+   * `id` 是这块画布的身份，只在"新建"那一刻生成一次。它进历史记录的
+   * sourceDataUrl 占位串，作用见 `blankSourceKey` 的注释：没有它，两块
+   * 内容无关的 29×29 板子会被历史去重逻辑并成同一条，后画的顶掉先画的。
+   */
+  const [blankCanvas, setBlankCanvas] = useState<{
+    cols: number;
+    rows: number;
+    id: string;
+  } | null>(null);
+  const [newCanvasOpen, setNewCanvasOpen] = useState(false);
+
   // ---- 输出 --------------------------------------------------------------
   const [pattern, setPattern] = useState<PatternResult | null>(null);
   const [isWorking, setIsWorking] = useState(false);
@@ -180,7 +226,7 @@ export default function Home() {
    * onActivityChange 上报。
    */
   const [canvasActivity, setCanvasActivity] = useState<CanvasActivity>('idle');
-  const hasCanvasImage = sourceDataUrl !== null;
+  const hasCanvasImage = sourceDataUrl !== null || blankCanvas !== null;
 
   /*
    * 左栏折叠：把左栏（图 + 参数）收起来，让图纸吃满整行。
@@ -272,6 +318,9 @@ export default function Home() {
   const handleImage = useCallback(
     (dataUrl: string, info: { width: number; height: number; name: string }) => {
       setError(null);
+      // 换图 = 离开空白画布。两种来源互斥，留着 blankCanvas 会让重算
+      // effect 一直早退，用户传了图却一张图纸也出不来。
+      setBlankCanvas(null);
       setSourceDataUrl(dataUrl);
       setImageInfo(info);
       // 换图就清空笔刷：归一化坐标在新图上毫无意义
@@ -285,6 +334,13 @@ export default function Home() {
 
   // 源图变化 → 解码
   useEffect(() => {
+    /*
+     * 空白画布下 sourceDataUrl 是 null，但**不能**顺手把 pattern 清掉 ——
+     * 空白画布的图纸是直接造出来的，不走引擎。这个分支原来只判断
+     * sourceDataUrl，创建空白画布时会把刚造好的图纸又抹成 null，
+     * 表现就是"点了新建，中间一片空白，还以为没生效"。
+     */
+    if (!sourceDataUrl && blankCanvas) return;
     if (!sourceDataUrl) {
       sourceRef.current = null;
       imageDataRef.current = null;
@@ -326,7 +382,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, [sourceDataUrl]);
+  }, [sourceDataUrl, blankCanvas]);
 
   /* ---------------------------------------------------------------
    * 源图解码：边长跟着网格密度走
@@ -356,6 +412,12 @@ export default function Home() {
   );
 
   useEffect(() => {
+    /*
+     * 空白画布不走引擎。图纸由另一个 effect 直接造（见下方"空白画布 →
+     * 造图纸"），这里必须早退，否则 options 一变就会拿上一张图的
+     * imageData 重新生成，把用户画的板子顶掉。
+     */
+    if (blankCanvas) return;
     const img = sourceRef.current;
     if (!sourceDataUrl || !img) return;
     /*
@@ -398,7 +460,23 @@ export default function Home() {
     };
     // optionsKey 是 options 的稳定序列化，避免每帧新对象触发重算
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceDataUrl, optionsKey, imageReady, ensureSource]);
+  }, [sourceDataUrl, optionsKey, imageReady, ensureSource, blankCanvas]);
+
+  /*
+   * 空白画布 → 造图纸。
+   *
+   * 依赖只有 blankCanvas 与品牌：尺寸定了就不该再变。**故意不监听
+   * optionsKey** —— 网格密度滑杆在空白画布下不参与任何计算，若跟着它
+   * 重造，用户拖一下滑杆画布尺寸就变了，画了一半的图会被 resize 掉。
+   * 改尺寸的唯一入口是「新建空白画布」，那是显式操作。
+   */
+  useEffect(() => {
+    if (!blankCanvas) return;
+    setPattern(makeBlankPattern(blankCanvas.cols, blankCanvas.rows, options));
+    setIsWorking(false);
+    setError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blankCanvas]);
 
   /* ---------------------------------------------------------------
    * 历史：只在"图案真的变了"之后记一条
@@ -438,12 +516,27 @@ export default function Home() {
    */
   const lastRecordedRef = useRef<string>('');
   useEffect(() => {
-    if (!displayPattern || !imageInfo || !sourceDataUrl) return;
-    const signature = `${optionsKey}|${displayPattern.cols}x${displayPattern.rows}|${displayPattern.totalBeads}|e${editedCount}`;
+    /*
+     * 图片来源有两条：引擎生成的（要 imageInfo + sourceDataUrl）与空白画布
+     * （两者都没有，但有 blankCanvas）。原来这里只认第一条，于是空白画布
+     * 画了一小时也不会进历史 —— 刷新就全没了。
+     */
+    const blank = blankCanvas;
+    if (!displayPattern) return;
+    if (!blank && (!imageInfo || !sourceDataUrl)) return;
+    const signature = blank
+      ? `blank:${blank.id}|${blank.cols}x${blank.rows}|${options.brand}|${displayPattern.totalBeads}|e${editedCount}`
+      : `${optionsKey}|${displayPattern.cols}x${displayPattern.rows}|${displayPattern.totalBeads}|e${editedCount}`;
     if (lastRecordedRef.current === signature) return;
     lastRecordedRef.current = signature;
 
-    const preview = patternToThumbnail(displayPattern, 132);
+    /*
+     * 空白画布的缩略图画棋盘格而不是"空画布"：一张全空白的图在历史列表里
+     * 区分不出是"还没画"还是"加载失败"。用空底板棋盘，一眼知道是张空板子。
+     */
+    const preview = blank
+      ? blankThumbnail(blank.cols, blank.rows, 132)
+      : patternToThumbnail(displayPattern, 132);
     if (!preview) return;
 
     /*
@@ -459,9 +552,17 @@ export default function Home() {
      */
     let cancelled = false;
     void (async () => {
-      const compact = await compressSourceDataUrl(sourceDataUrl).catch(
-        () => sourceDataUrl,
-      );
+      /*
+       * 空白画布没有原图可压。它用 `blank:<cols>x<rows>` 作占位串 ——
+       * 一是 `HistoryItem.sourceDataUrl` 必填（上层拿它做外层去重），
+       * 二是把尺寸编进字符串，让 29×29 与 96×96 的两块空板天然是两条记录，
+       * 不会被去重并成一条。
+       */
+      const compact = blank
+        ? blankSourceKey(blank.cols, blank.rows, blank.id)
+        : await compressSourceDataUrl(sourceDataUrl as string).catch(
+            () => sourceDataUrl as string,
+          );
       if (cancelled) return;
       /*
        * 历史写入是**同步返回结果**的（不是 Promise），所以这里可以立刻
@@ -479,9 +580,11 @@ export default function Home() {
         rows: displayPattern.rows,
         totalBeads: displayPattern.totalBeads,
         colorCount: displayPattern.palette.length,
-        sourceMeta: imageInfo
-          ? { width: imageInfo.width, height: imageInfo.height, name: imageInfo.name }
-          : undefined,
+        sourceMeta: blank
+          ? { width: blank.cols, height: blank.rows, name: `空白画布 ${blank.cols}×${blank.rows}` }
+          : imageInfo
+            ? { width: imageInfo.width, height: imageInfo.height, name: imageInfo.name }
+            : undefined,
         // 手改覆盖层跟着版本走，恢复历史时能一起恢复回来
         ...(editedCount > 0 ? { edits } : {}),
       });
@@ -504,6 +607,7 @@ export default function Home() {
     sourceDataUrl,
     addToHistory,
     imageInfo,
+    blankCanvas,
   ]);
 
   /*
@@ -522,15 +626,55 @@ export default function Home() {
   const handleRestore = useCallback(
     (item: HistoryItem, version?: HistoryVersion) => {
       const v = version ?? item.versions[item.versions.length - 1];
-      setSourceDataUrl(item.sourceDataUrl);
+      /*
+       * 空白画布与图片来源是互斥的两条路，恢复前必须先判断这一条记录
+       * 属于哪条。
+       *
+       * 早期版本这里直接 setSourceDataUrl(item.sourceDataUrl)：空白画布
+       * 的占位串是 `blank:64x64`，不是 dataURL，赋给 sourceDataUrl 之后
+       * 解码 effect 会拿它去 `img.src`，触发 onerror，用户看到的是
+       * "这张图片解不开，换一张试试" —— 明明什么都没传。
+       */
+      const blankSize =
+        parseBlankSourceKey(item.sourceDataUrl) ??
+        (item.sourceMeta?.name?.startsWith('空白画布') &&
+        v.cols > 0 &&
+        v.rows > 0
+          ? { cols: v.cols, rows: v.rows }
+          : null);
+
+      if (blankSize) {
+        // 先清图源再设空白：顺序反了会让"清空 pattern"的 effect 多跑一帧
+        setSourceDataUrl(null);
+        setImageInfo(null);
+        sourceRef.current = null;
+        imageDataRef.current = null;
+        sourceEdgeRef.current = 0;
+        /*
+         * 复用记录里的 id，而不是新生成一个。
+         *
+         * 生成新的会让"恢复之后再涂两笔"变成一条**新记录**，历史里于是
+         * 出现同一张图的两个分叉，用户完全无法分辨哪个是哪个。复用则
+         * 继续挂在原来那条记录上、多出一个版本，语义正确。
+         */
+        setBlankCanvas({
+          cols: v.cols,
+          rows: v.rows,
+          id: blankSize.id ?? makeBlankId(),
+        });
+      } else {
+        setBlankCanvas(null);
+        setSourceDataUrl(item.sourceDataUrl);
+        setImageInfo(
+          (prev) =>
+            prev ??
+            (item.sourceMeta
+              ? { ...item.sourceMeta }
+              : { width: 0, height: 0, name: '历史图案' }),
+        );
+      }
+
       setOptions((prev) => ({ ...prev, ...v.settings }));
-      setImageInfo(
-        (prev) =>
-          prev ??
-          (item.sourceMeta
-            ? { ...item.sourceMeta }
-            : { width: 0, height: 0, name: '历史图案' }),
-      );
       setBrushes([]);
       /*
        * 恢复该版本上的手工编辑。
@@ -548,8 +692,39 @@ export default function Home() {
     [],
   );
 
+  /*
+   * 新建空白画布。
+   *
+   * 顺序有讲究：先清 sourceDataUrl 再设 blankCanvas。反过来的话，那个
+   * "没有源图就清空 pattern" 的 effect 会先跑一轮把图纸抹掉，虽然紧接着
+   * 空白画布 effect 会再造一张，但中间那一帧的空白会闪一下。
+   *
+   * 同时把 sourceRef / imageDataRef 一起清掉：它们是上一张图的内存缓存，
+   * 留着不影响正确性（blankCanvas 分支根本不读它们），但 320 格时的
+   * 解码位图有几十 MB，用户不会再切回来了，早点放手。
+   */
+  const handleCreateBlank = useCallback(
+    (cols: number, rows: number, brand: Brand) => {
+      setSourceDataUrl(null);
+      setImageInfo(null);
+      sourceRef.current = null;
+      imageDataRef.current = null;
+      sourceEdgeRef.current = 0;
+      setError(null);
+      setBrushes([]);
+      setEdits(EMPTY_EDITS);
+      setOptions((prev) => ({ ...prev, brand }));
+      setBlankCanvas({ cols, rows, id: makeBlankId() });
+      // 记一笔历史时不要让"签名相同"挡住
+      lastRecordedRef.current = '';
+      toast.success(`已新建 ${cols} × ${rows} 的空白画布，点「编辑」开始画`);
+    },
+    [],
+  );
+
   const handleClear = useCallback(() => {
     setSourceDataUrl(null);
+    setBlankCanvas(null);
     setImageInfo(null);
     setPattern(null);
     setError(null);
@@ -557,13 +732,46 @@ export default function Home() {
     setEdits(EMPTY_EDITS);
   }, []);
 
-  const hasImage = Boolean(sourceDataUrl);
+  const hasImage = Boolean(sourceDataUrl) || blankCanvas !== null;
+
+  /*
+   * 新建画布会**替换**当前图纸 —— 这句话必须提前说，不能让用户按完
+   * 才发现刚画的东西没了。只在"真的会丢东西"时才提示：一张刚生成的、
+   * 没手改过的图纸重来不心疼；画了格的才需要提醒，并且给出具体数量。
+   */
+  const replaceWarning = useMemo<string | null>(() => {
+    if (!hasImage) return null;
+    if (blankCanvas && editedCount > 0) {
+      return `当前这张 ${blankCanvas.cols} × ${blankCanvas.rows} 的空白画布上已经画了 ${editedCount} 格，新建会把它替换掉。`;
+    }
+    if (blankCanvas) {
+      return `当前这块 ${blankCanvas.cols} × ${blankCanvas.rows} 的空白画布会被替换掉。`;
+    }
+    return '新建画布会替换掉当前这张从图片生成的图纸（原图仍留在历史记录里，可以随时恢复）。';
+  }, [hasImage, blankCanvas, editedCount]);
 
   const sizeCm = pattern?.meta.sizeCm ?? null;
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
       <Toaster position="top-center" richColors />
+
+      {/*
+       * 新建画布对话框。
+       *
+       * 默认行列取"当前图纸的实际尺寸"，其次才是参数里的 gridSize ——
+       * 用户如果已经有一张 96 格的图，新建时最可能的意图是"再来一张
+       * 同样大小的"，而不是回到默认 64。
+       */}
+      <NewCanvasDialog
+        open={newCanvasOpen}
+        onOpenChange={setNewCanvasOpen}
+        defaultCols={pattern?.cols ?? options.gridSize}
+        defaultRows={pattern?.rows ?? options.gridSize}
+        defaultBrand={options.brand}
+        onCreate={handleCreateBlank}
+        replaceWarning={replaceWarning}
+      />
 
       {/* 背景布景：花朵与草木，压在内容之下 */}
       <div className="pointer-events-none fixed inset-0 z-0">
@@ -712,17 +920,77 @@ export default function Home() {
           <div className="wb-left">
             <Section
               index="01"
-              title="放一张图"
-              hint="JPG / PNG / WebP / GIF"
+              title={blankCanvas ? '空白画布' : '放一张图'}
+              hint={
+                blankCanvas
+                  ? `${blankCanvas.cols} × ${blankCanvas.rows}`
+                  : 'JPG / PNG / WebP / GIF'
+              }
+              /*
+               * 折叠入口放在左栏自己的标题栏上。
+               *
+               * 之前放在画布标题栏（中间那栏的右上角），用户反馈说不好用：
+               * 想收起左栏时，视线和鼠标都在左边，按钮却在右侧画布标题上，
+               * 每次都要横跨半个屏幕。折叠按钮应该长在**它要折叠的那块**上，
+               * 这是就地操作原则 —— 用户截图标注也指的正是这个位置。
+               */
+              action={
+                hasImage ? (
+                  <button
+                    type="button"
+                    onClick={toggleFocus}
+                    className="px-btn px-btn-ghost !px-1 !py-0.5"
+                    aria-pressed={leftCollapsed}
+                    title="收起左侧面板，让图纸占满整行"
+                    aria-label="收起左侧的图片与参数面板"
+                    data-testid="collapse-left"
+                  >
+                    <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
+                  </button>
+                ) : undefined
+              }
               className="order-1"
             >
-              <FileUpload
-                onImage={handleImage}
-                onClear={handleClear}
-                previewUrl={sourceDataUrl}
-                imageInfo={imageInfo}
-                disabled={isWorking && !pattern}
-              />
+              {blankCanvas ? (
+                <BlankCanvasCard
+                  cols={blankCanvas.cols}
+                  rows={blankCanvas.rows}
+                  brand={options.brand}
+                  onResize={() => setNewCanvasOpen(true)}
+                  onClear={handleClear}
+                />
+              ) : (
+                <FileUpload
+                  onImage={handleImage}
+                  onClear={handleClear}
+                  previewUrl={sourceDataUrl}
+                  imageInfo={imageInfo}
+                  disabled={isWorking && !pattern}
+                />
+              )}
+
+              {/*
+               * 「新建空白画布」的入口放在图源区域底部，而不是顶栏。
+               *
+               * 它和"传一张图"是同一件事的两种做法（决定图纸从哪来），
+               * 摆在一起用户才看得懂是二选一。放顶栏会被读成另一个功能。
+               */}
+              {!blankCanvas && (
+                <div className="mt-3 border-t-2 border-dashed border-[var(--line)] pt-3">
+                  <button
+                    type="button"
+                    onClick={() => setNewCanvasOpen(true)}
+                    className="px-btn px-btn-sm w-full justify-center"
+                    data-testid="new-blank-canvas"
+                  >
+                    <Grid2x2 className="h-3.5 w-3.5" aria-hidden />
+                    从空白画布开始
+                  </button>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+                    没有参考图？选一块空板子，用画笔一格一格涂。
+                  </p>
+                </div>
+              )}
             </Section>
 
             {/* 没图的时候，参数面板只露一个引导，避免空滑杆让人无所适从 */}
@@ -735,14 +1003,36 @@ export default function Home() {
                 hideHeader
                 className="order-3"
               >
-                <PatternSettings
-                  value={options}
-                  onChange={setOptions}
-                  actualCols={pattern?.cols}
-                  actualRows={pattern?.rows}
-                  sizeCm={sizeCm}
-                  isWorking={isWorking}
-                />
+                {/*
+                 * 空白画布只有"色号体系"一个参数是有意义的。
+                 *
+                 * 网格密度决定画布尺寸 —— 空白画布的尺寸由用户在建的时候
+                 * 定死了，滑杆在这里是假的；颜色数量 / 精细度 / 成片度 /
+                 * 彩度增强全部是引擎参数，空白画布不走引擎，它们一个都
+                 * 不会生效。把一堆无效滑杆留给用户，比不给更糟：他会调了
+                 * 半天发现画面没反应，然后怀疑整个工具。
+                 *
+                 * 所以这里换成一个只含品牌选择的窄面板，并把"其余参数对
+                 * 空白画布不生效"直接写在界面上。
+                 */}
+                {blankCanvas ? (
+                  <BlankSettings
+                    brand={options.brand}
+                    onBrandChange={(brand) => setOptions((prev) => ({ ...prev, brand }))}
+                    cols={blankCanvas.cols}
+                    rows={blankCanvas.rows}
+                    onResize={() => setNewCanvasOpen(true)}
+                  />
+                ) : (
+                  <PatternSettings
+                    value={options}
+                    onChange={setOptions}
+                    actualCols={pattern?.cols}
+                    actualRows={pattern?.rows}
+                    sizeCm={sizeCm}
+                    isWorking={isWorking}
+                  />
+                )}
               </Section>
             ) : (
               <div className="px-panel-flat order-3 px-5 py-6">
@@ -795,31 +1085,23 @@ export default function Home() {
                   )}
                 </div>
                 {/*
-                 * 专注模式开关。
-                 *
-                 * 只在有图时出现 —— 没图的时候左栏的「放一张图」是唯一入口，
-                 * 收起来用户就不知道下一步做什么了。
-                 * 文案随状态变（"收起左栏"/"展开左栏"），不要只给图标：
-                 * 一个面板图标在"收"和"展"两种状态下的方向解读因人而异。
+                 * 折叠开关已经挪到左栏自己的标题栏里（见 Section 01 的
+                 * action）。这里只在**已收起**时留一个展开入口 —— 收起后
+                 * 左栏整体不存在，它的标题栏也没了，必须有个地方能把人
+                 * 请回去。收起态的展开路径有两条：这条按钮 + 屏幕最左侧
+                 * 那条 24px 竖边条（见下）。
                  */}
-                {hasImage && (
+                {hasImage && leftCollapsed && (
                   <button
                     type="button"
                     onClick={toggleFocus}
                     className="px-btn px-btn-ghost px-btn-sm ml-auto hidden shrink-0 lg:inline-flex"
                     aria-pressed={leftCollapsed}
-                    title={
-                      leftCollapsed
-                        ? '展开左侧的图片与参数面板'
-                        : '收起左侧面板，让图纸占满整行'
-                    }
+                    title="展开左侧的图片与参数面板"
+                    data-testid="expand-left"
                   >
-                    {leftCollapsed ? (
-                      <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
-                    ) : (
-                      <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
-                    )}
-                    {leftCollapsed ? '展开左栏' : '收起左栏'}
+                    <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
+                    展开左栏
                   </button>
                 )}
                 <p className="hidden text-[11px] text-[var(--ink-3)] md:block">
@@ -831,14 +1113,28 @@ export default function Home() {
                 {error ? (
                   <ErrorBlock message={error} onRetry={handleClear} />
                 ) : !hasImage ? (
-                  <EmptyStage onSample={handleImage} />
+                  <EmptyStage
+                    onSample={handleImage}
+                    onBlank={() => setNewCanvasOpen(true)}
+                  />
                 ) : (
                   <PatternCanvas
                     pattern={pattern}
                     brand={options.brand}
                     fill
-                    brushes={brushes}
-                    onBrushesChange={setBrushes}
+                    /*
+                     * 空白画布下**不给**刷区域能力。
+                     *
+                     * 刷区域的语义是"把选中的这块交给更高档的精细度算法
+                     * 重算" —— 它要跑引擎，输入是原图。空白画布没有原图，
+                     * 实测点「应用重建」后颗数还是 0：用户刷了半天、点了
+                     * 一下，画面一点没变，和"功能坏了"无法区分。
+                     *
+                     * PatternCanvas 用 `typeof onBrushesChange === 'function'`
+                     * 判断要不要显示刷区域按钮，所以这里不传它就等于关掉。
+                     */
+                    brushes={blankCanvas ? undefined : brushes}
+                    onBrushesChange={blankCanvas ? undefined : setBrushes}
                     regionFeather={regionFeather}
                     onRegionFeatherChange={setRegionFeather}
                     /* 编辑层：传的是引擎原始 pattern，画布内部自己叠加
@@ -939,11 +1235,14 @@ function Section({
   className,
   hideHeader = false,
   padded = true,
+  action,
   children,
 }: {
   index: string;
   title: string;
   hint?: string;
+  /** 标题栏最右侧的动作按钮（排在手写 hint 左边） */
+  action?: React.ReactNode;
   busy?: boolean;
   className?: string;
   /**
@@ -968,22 +1267,202 @@ function Section({
           <span className="px-section-no">{index}</span>
           <h2 className="px-section-title">{title}</h2>
         </div>
-        {hint && (
-          <span
-            className={cn(
-              'font-px text-[9.5px] tracking-wide',
-              busy ? 'text-[var(--clay)]' : 'text-[var(--ink-3)]',
-            )}
-          >
-            {busy && (
-              <span className="mr-1.5 inline-block size-1.5 animate-pulse bg-[var(--clay)] align-middle" />
-            )}
-            {hint}
-          </span>
-        )}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {action}
+          {hint && (
+            <span
+              className={cn(
+                'font-px text-[9.5px] tracking-wide',
+                busy ? 'text-[var(--clay)]' : 'text-[var(--ink-3)]',
+              )}
+            >
+              {busy && (
+                <span className="mr-1.5 inline-block size-1.5 animate-pulse bg-[var(--clay)] align-middle" />
+              )}
+              {hint}
+            </span>
+          )}
+        </div>
       </div>
       <div className="px-4 py-4">{children}</div>
     </section>
+  );
+}
+
+/**
+ * 空白画布的参数面板。
+ *
+ * 与 PatternSettings 的取舍见调用点的注释：空白画布不走引擎，所以网格
+ * 密度、颜色数量、精细度、成片度、彩度增强全部无效。这里只保留真正
+ * 生效的两项 —— 品牌（决定色卡）和尺寸（决定成品多大）。
+ *
+ * 「尺寸」在这一版是只读展示 + 跳对话框，没做直接改：
+ * 改尺寸会重建 cells，用户已经画的格子在尺寸变化下没有合理的映射方式。
+ * 与其猜（按比例缩放？保留左上？），不如让他重新建一张 —— 这是明确、
+ * 可预期、不会悄悄吃掉工作的行为。
+ */
+function BlankSettings({
+  brand,
+  onBrandChange,
+  cols,
+  rows,
+  onResize,
+}: {
+  brand: Brand;
+  onBrandChange: (b: Brand) => void;
+  cols: number;
+  rows: number;
+  onResize: () => void;
+}) {
+  const cm = estimateSizeCm(cols, rows);
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="px-section-no" aria-hidden>
+            02
+          </span>
+          <h3 className="px-section-title">画布参数</h3>
+        </div>
+        <span className="px-tag px-tag-clay" style={{ fontSize: 10 }}>
+          空白
+        </span>
+      </div>
+
+      <div className="px-rule" />
+
+      <div>
+        <div className="mb-1.5 flex items-baseline justify-between gap-2">
+          <span className="text-[12px] font-semibold text-[var(--ink)]">尺寸</span>
+          <button type="button" onClick={onResize} className="px-btn px-btn-sm px-btn-ghost !py-0.5">
+            <RefreshCw className="h-3 w-3" aria-hidden />
+            换尺寸
+          </button>
+        </div>
+        <div className="px-inset flex items-center justify-between gap-2 px-2.5 py-2">
+          <span className="text-[13px] font-semibold tabular-nums text-[var(--ink)]">
+            {cols} × {rows}
+          </span>
+          <span className="text-[11.5px] tabular-nums text-[var(--ink-2)]">
+            {cols * rows} 格 · 约 {cm.w} × {cm.h} cm
+          </span>
+        </div>
+      </div>
+
+      <div className="px-rule" />
+
+      <div>
+        <p className="mb-1.5 text-[12px] font-semibold text-[var(--ink)]">色号体系</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          {BRANDS.map((b) => {
+            const active = brand === b;
+            return (
+              <button
+                key={b}
+                type="button"
+                aria-pressed={active}
+                onClick={() => onBrandChange(b)}
+                title={BRAND_META[b].note}
+                className={cn(
+                  'border-2 px-2 py-1.5 text-[12px] font-semibold transition-colors duration-75',
+                  active
+                    ? 'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)]'
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] hover:bg-[var(--paper-hi)]',
+                )}
+              >
+                {BRAND_META[b].label}
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+          色卡里能选哪些色号，按这个品牌的真实豆色来。
+        </p>
+      </div>
+
+      <div className="border-t-2 border-dashed border-[var(--line)] pt-2.5">
+        <p className="text-[11px] leading-relaxed text-[var(--ink-3)]">
+          网格密度、颜色数量、精细度算法这些是给「图片生成图纸」用的，
+          空白画布不走那套流程，所以这里不提供。
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 空白画布在图源区域的"已选态"卡片。
+ *
+ * 对应 FileUpload 的已选态：用户已经有一块确定尺寸的空板子，这个位置
+ * 就该显示"你选的是什么"，而不是继续挂着上传框 —— 否则用户会以为
+ * 还得再传一张图才能开始。
+ *
+ * 三件事必须在卡片里能一眼看到：
+ *   1. 尺寸（这是他刚才在对话框里做的唯一决定）；
+ *   2. 怎么开始画（「点画布的编辑按钮」这句话，新用户不知道编辑在哪）；
+ *   3. 换尺寸 / 删掉的入口。
+ */
+function BlankCanvasCard({
+  cols,
+  rows,
+  brand,
+  onResize,
+  onClear,
+}: {
+  cols: number;
+  rows: number;
+  brand: Brand;
+  onResize: () => void;
+  onClear: () => void;
+}) {
+  const cm = estimateSizeCm(cols, rows);
+  return (
+    <div className="space-y-2.5">
+      <div className="px-inset flex items-center gap-2.5 p-2.5">
+        {/* 缩略：一张按比例的棋盘格，代表"空板子" */}
+        <div className="px-checker h-[58px] w-[58px] shrink-0 border border-[var(--line)]" aria-hidden />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <Grid2x2 className="h-3.5 w-3.5 shrink-0 text-[var(--clay)]" aria-hidden />
+            <span className="truncate text-[13px] font-semibold text-[var(--ink)]">
+              空白画布
+            </span>
+            <span className="px-tag px-tag-ink ml-auto shrink-0" style={{ fontSize: 10 }}>
+              {brand}
+            </span>
+          </div>
+          <p className="mt-1 text-[12.5px] font-semibold tabular-nums text-[var(--ink-2)]">
+            {cols} × {rows}
+            <span className="ml-1.5 font-normal text-[var(--ink-3)]">
+              约 {cm.w} × {cm.h} cm
+            </span>
+          </p>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1.5">
+        <button type="button" onClick={onResize} className="px-btn px-btn-sm flex-1 justify-center">
+          <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+          换尺寸
+        </button>
+        <button
+          type="button"
+          onClick={onClear}
+          className="px-btn px-btn-sm px-btn-danger flex-1 justify-center"
+        >
+          <X className="h-3.5 w-3.5" aria-hidden />
+          移除
+        </button>
+      </div>
+
+      <p className="text-[11.5px] leading-relaxed text-[var(--ink-2)]">
+        点画布工具条上的
+        <span className="mx-1 px-tag px-tag-clay" style={{ fontSize: 10 }}>
+          编辑
+        </span>
+        开始画：手绘上色、橡皮擦掉、油漆桶填一片，右侧色卡里挑色号。
+      </p>
+    </div>
   );
 }
 
@@ -1008,11 +1487,13 @@ const SAMPLE_IMAGES = [
 /** 空状态：一块空板子 + 一朵花 + 一只趴着的豆，外加几个可以直接点的示例 */
 function EmptyStage({
   onSample,
+  onBlank,
 }: {
   onSample: (
     dataUrl: string,
     info: { width: number; height: number; name: string },
   ) => void;
+  onBlank: () => void;
 }) {
   const [pending, setPending] = useState<string | null>(null);
 
@@ -1067,6 +1548,9 @@ function EmptyStage({
           从左边放一张图，或点下面的示例先看看效果。
           人物、宠物、游戏立绘都合适 —— 描边清楚、色块分明的图，拼出来最好看。
         </p>
+        <p className="mt-2 text-[12px] leading-relaxed text-[var(--ink-3)]">
+          没有参考图？也可以从一块空板子开始，自己一格一格画。
+        </p>
       </div>
 
       <div className="grid w-full max-w-[380px] grid-cols-4 gap-2">
@@ -1098,6 +1582,22 @@ function EmptyStage({
           </button>
         ))}
       </div>
+
+      {/*
+       * 「从空白画布开始」在空状态里必须是**并列选项**，不是藏起来的次级
+       * 入口。用户第一次进来看见四个示例图，很自然会以为"必须上传一张图"，
+       * 于是想要的像素小人就没了下文。把它摆成和示例同级的按钮。
+       */}
+      <button
+        type="button"
+        onClick={onBlank}
+        disabled={pending !== null}
+        className="px-btn px-btn-sm"
+        data-testid="empty-new-blank"
+      >
+        <Grid2x2 className="h-3.5 w-3.5" aria-hidden />
+        从空白画布开始
+      </button>
 
       <div className="flex items-center gap-1.5 font-px text-[9px] tracking-[0.18em] text-[var(--ink-3)]">
         <Sparkles className="size-3" />
