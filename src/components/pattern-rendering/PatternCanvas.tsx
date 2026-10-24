@@ -33,7 +33,7 @@ import type { DetailBrush } from '@/lib/pattern/regions';
 import type { EditDelta, EditMap } from '@/lib/pattern/edits';
 import { PixelCursor, PixelSwatch } from '@/components/scenery';
 import { BrushSizeButton } from './BrushSizeButton';
-import { Redo2, RotateCcw, Undo2 } from 'lucide-react';
+import { Hand, Redo2, RotateCcw, Undo2 } from 'lucide-react';
 import { groupByCode, groupByFamily } from '@/lib/color/family';
 import {
   usePatternCanvas,
@@ -257,6 +257,7 @@ export function PatternCanvas({
     clearBrushes,
     regionSummary,
     useFill,
+    canvasGutter,
     pendingCount,
     pendingLabel,
     livePreview,
@@ -484,11 +485,25 @@ export function PatternCanvas({
     [],
   );
 
-  const EDIT_TOOLS: { tool: EditTool; label: string; title: string }[] = [
-    { tool: 'pencil', label: '手绘', title: '逐格涂色（可拖动连涂）' },
-    { tool: 'eraser', label: '橡皮', title: '把格子擦成空白（不拼豆）' },
-    { tool: 'picker', label: '取色', title: '选中某一格的色号作为当前画笔' },
-    { tool: 'fill', label: '油漆桶', title: '把同色连通区一次填满当前色号' },
+  /*
+   * 编辑工具。
+   *
+   * `pan`（抓手）排在最前面 —— 用户原话：「然后画笔的左边可以加一个"抓手"
+   * 吧，抓手就是用来控制画板的上下左右灵活移动的」。放在画笔左边有两个
+   * 理由：一是用户点名要在那里；二是在手势顺序上它也确实是"先移动视线、
+   * 再下笔"，所以它占快捷键 1，原画笔顺延到 2、橡皮 3、取色 4、油漆桶 5。
+   */
+  const EDIT_TOOLS: { tool: EditTool; label: string; title: string; icon?: 'hand' }[] = [
+    {
+      tool: 'pan',
+      label: '抓手',
+      title: '拖动画板（上下左右移动视口，不改格子）· 快捷键 1',
+      icon: 'hand',
+    },
+    { tool: 'pencil', label: '手绘', title: '逐格涂色（可拖动连涂）· 快捷键 2' },
+    { tool: 'eraser', label: '橡皮', title: '把格子擦成空白（不拼豆）· 快捷键 3' },
+    { tool: 'picker', label: '取色', title: '选中某一格的色号作为当前画笔 · 快捷键 4' },
+    { tool: 'fill', label: '油漆桶', title: '把同色连通区一次填满当前色号 · 快捷键 5' },
   ];
 
   const brushRadiusCells = useMemo(() => {
@@ -763,13 +778,25 @@ export function PatternCanvas({
           onEditPointerLeave();
           return;
         }
+        /*
+         * 工具快捷键：1 = 抓手，2–5 = 手绘/橡皮/取色/油漆桶。
+         *
+         * 抓手排 1 而不是给个字母：数字键是**位置键**，用户记的是"最左边那个
+         * 是 1"，不是"抓手叫什么"。把它插在最左边却让 1 仍是手绘，会让视觉
+         * 顺序和键盘顺序错开一位，每次切工具都要多错一次。
+         *
+         * 顺带兼容手绘的老习惯：`h`（hand）也给抓手，避免老用户按 1 想画
+         * 却得到抓手时无从下手 —— 虽然位次变了，但"1 是第一个工具"这条
+         * 规则没变，title 里也写了位次。
+         */
         const toolKey: Record<string, EditTool> = {
-          '1': 'pencil',
-          '2': 'eraser',
-          '3': 'picker',
-          '4': 'fill',
+          '1': 'pan',
+          '2': 'pencil',
+          '3': 'eraser',
+          '4': 'picker',
+          '5': 'fill',
         };
-        const t = toolKey[e.key];
+        const t = toolKey[e.key] ?? (e.key === 'h' || e.key === 'H' ? 'pan' : undefined);
         if (t) {
           e.preventDefault();
           setEditTool(t);
@@ -895,6 +922,86 @@ export function PatternCanvas({
     window.addEventListener('keydown', onWindowKey, true);
     return () => window.removeEventListener('keydown', onWindowKey, true);
   }, [overlayTrayOpen]);
+
+  /*
+   * 手机上进入编辑态，把画布滚进视野。
+   *
+   * 用户 / Lead 实测（390×844）：点「编辑」之后画布滚动区的 top 是 619，
+   * 视口只有 844 —— 下沿 819 勉强贴着底边，而画布本体 canvas 的下沿到 855,
+   * 已经**超出视口**。用户点完「编辑」看到的是「01 放一张图 + 一排按钮」，
+   * 得手动往下滑才看得见画布，而编辑模式的核心诉求恰恰是"画板占主要面板"。
+   *
+   * 只在**窄屏**（<64rem，即 .wb 单列布局）做：那里页面整体是纵向长流，
+   * 画布被前面的面板推到屏幕下方。桌面上画布始终在视口里，不需要也不该滚
+   * —— 桌面滚一下会把顶栏和左栏一起带走，反而更晃。
+   *
+   * 用 `scrollIntoView({block:'nearest'})` 而不是 'start'：'start' 会把
+   * 画布顶到视口最上沿，把刚出现的编辑工具条（抓手/手绘那一排）顶出屏幕 ——
+   * 工具条是进编辑后立刻要点的东西，不能滚走。'nearest' 只滚"差多少滚多少"，
+   * 工具条保持在画布上方可见。
+   *
+   * 一次性、非 sticky：只在 editActive 从 false → true 那一下滚，之后用户
+   * 自己滚到哪儿就是哪儿（做成 sticky 的话用户想回头调参数会被拽回来）。
+   */
+  useEffect(() => {
+    if (!editActive || isDesktop) return;
+    const host = hostRef.current;
+    if (!host) return;
+    /*
+     * 等一帧：编辑工具条是在同一个 commit 里渲染出来的，它的高度会改变
+     * host 内部布局。此时立刻量位置会得到"工具条出现前"的旧几何，滚过
+     * 之后画布又被工具条往下推 ~50px，等于没滚准。
+     */
+    const raf = requestAnimationFrame(() => {
+      /*
+       * 要**从最内层往外逐层滚**，不是只找第一个可滚祖先。
+       *
+       * 实测 360×780 才发现有两层都在滚：host 自己（`flex flex-col gap-2`
+       * 带 overflowY:auto，scrollH 427 / clientH 349，内部溢出 78px）和外面
+       * 的 `.wb`（单列布局的整页滚动）。只滚外层的话，画布在 host 里仍然被
+       * 工具条挤出可视区；只滚内层的话，host 在 `.wb` 里还压在「01 放一张图」
+       * 下面。所以两层都要处理，从里往外各滚各的"差多少"。
+       *
+       * 一直走到 body 为止，**不设层数上限**：原来写的是「最多 4 层」，
+       * 而实测在 390×844 上画布宿主到 `.wb`（真正承载整页纵向滚动的那一层）
+       * 隔了 6 层 —— 上限 4 直接让自动滚动从来没执行过：点完编辑
+       * `wb.scrollTop` 只有 1，画布仍然在 y=638 的屏幕下方（视口 844）。
+       *
+       * 不滚 body / html：它们是文档级滚动，移动端 Safari 上会触发橡皮筋回弹，
+       * 而且这里也走不到（`while (el !== document.body)` 就停了）。
+       */
+      let el: HTMLElement | null = host;
+      while (el && el !== document.body) {
+        const cs = getComputedStyle(el);
+        const scrollable = /auto|scroll/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 1;
+        if (scrollable) {
+          const target = host.getBoundingClientRect();
+          const view = el.getBoundingClientRect();
+          /*
+           * 把 host 的上沿对齐到容器的上沿（而不是只补偿下沿溢出）。
+           *
+           * 只补偿下沿时，"画布太高、容器太矮"的情况永远补不完 —— 溢出量
+           * 大于可滚距离，滚到底画布还是露不全。对齐上沿则保证：进来第一眼
+           * 看到的是**工具条 + 画布顶部**，正是要下笔的地方；画布底部超出的
+           * 部分本来就要靠画布区自己的滚动/缩放处理。
+           */
+          const delta = target.top - view.top;
+          if (Math.abs(delta) < 2) {
+            el = el.parentElement;
+            continue;
+          }
+          el.scrollTo({
+            top: el.scrollTop + delta,
+            // 瞬时滚动：动画滚动会让"点编辑 → 画面动"看着像卡顿，
+            // 再叠上 cellPx 重算引起的画布尺寸变化会更乱。
+            behavior: 'auto',
+          });
+        }
+        el = el.parentElement;
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [editActive, isDesktop, hostRef]);
 
   // ---------------------------------------------------------------- 空状态
   if (!pattern || !hasPattern) {
@@ -1063,9 +1170,9 @@ export function PatternCanvas({
               aria-label="编辑工具条"
             >
               <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-                {/* 四个工具 */}
+                {/* 五个工具：抓手 + 手绘 / 橡皮 / 取色 / 油漆桶 */}
                 <div className="flex items-center gap-1" role="group" aria-label="编辑工具">
-                  {EDIT_TOOLS.map(({ tool, label, title }) => {
+                  {EDIT_TOOLS.map(({ tool, label, title, icon }) => {
                     const active = editTool === tool;
                     return (
                       <button
@@ -1086,18 +1193,33 @@ export function PatternCanvas({
                             : { padding: '4px 7px' }
                         }
                       >
-                        <PixelCursor
-                          kind={
-                            tool === 'pencil'
-                              ? 'pencil'
-                              : tool === 'eraser'
-                                ? 'eraser'
-                                : tool === 'picker'
-                                  ? 'picker'
-                                  : 'fill'
-                          }
-                          size={14}
-                        />
+                        {/*
+                          抓手用 lucide 的 Hand，其余沿用像素风 PixelCursor。
+
+                          视觉上确实不是同一套（一个是连续描边的图标，一个是
+                          像素块），但这里选 lucide 是有意的：PixelCursor 的
+                          图标集是"落笔类"动作（笔尖、橡皮、吸管、桶），抓手
+                          属于"移动视口"，语义上就该长得不一样。而且
+                          PixelCursor 归 scenery 那位队友维护，我没有合适的
+                          12×12 手形像素网格可加（加一个歪的会更难看）。
+                          尺寸对齐到 14px，与其它四个图标的视觉重量一致。
+                        */}
+                        {icon === 'hand' ? (
+                          <Hand className="h-3.5 w-3.5" aria-hidden="true" />
+                        ) : (
+                          <PixelCursor
+                            kind={
+                              tool === 'pencil'
+                                ? 'pencil'
+                                : tool === 'eraser'
+                                  ? 'eraser'
+                                  : tool === 'picker'
+                                    ? 'picker'
+                                    : 'fill'
+                            }
+                            size={14}
+                          />
+                        )}
                         <span className="text-[11px]">{label}</span>
                       </button>
                     );
@@ -1492,7 +1614,7 @@ export function PatternCanvas({
         ref={scrollRef}
         tabIndex={0}
         onKeyDown={onKeyDown}
-        className="px-inset relative"
+        className="px-inset px-scroll-always relative"
         style={{
           // 不能有 padding：滚动时内容会滑进 padding 区，从 sticky 标尺左侧/上方漏出来
           padding: 0,
@@ -1501,7 +1623,30 @@ export function PatternCanvas({
           flex: useFill ? '1 1 auto' : undefined,
           // 给画布区留一块**能用手指画**的高度下限（0 会被工具条挤成 4px）
           minHeight: useFill ? 200 : undefined,
-          overflow: 'auto',
+          /*
+           * 纵向滚动条**常驻**（overflowY: scroll）。
+           *
+           * 用户原话：「这个框的那个滚动条我觉得可以常驻显示，要不然开画笔的
+           * 时候，和滚轮放大还是上下移动有点分不清，有那个滚动条常驻就可以
+           * 直接操作滚动条」。
+           *
+           * `scrollbarColor: 'auto'` 这一行是**整件事的关键**，而且必须是内联的
+           * —— 它得压过 `html { scrollbar-color: … }` 那条继承值（globals.css:209）。
+           * `scrollbar-color` 是继承属性，一落到本元素，Chromium 就整体切到
+           * 覆盖式滚动条：`::-webkit-scrollbar` 样式全部失效、且**一个像素都不
+           * 预留**（实测 offsetWidth-clientWidth 恒为 4＝只剩 2px×2 边框）。
+           * 打回 auto 之后恢复经典滚动条：占 12px、常驻可见、可拖，而
+           * `::-webkit-scrollbar` 的像素风也重新生效（外观在 `.px-scroll-always`
+           * 里，伪元素没法内联，但"占位/常驻"这件事只靠这一行就成立）。
+           *
+           * 只锁 Y 轴、X 轴仍是 auto：横向内容永远按宽度算好了（cellPx 的
+           * availW 已经把 SCROLLBAR_ALLOWANCE 扣掉），多留一条横向空槽只是
+           * 在画布底下挂一条永远空的灰条。
+           */
+          overflowY: 'scroll',
+          overflowX: 'auto',
+          scrollbarWidth: 'auto',
+          scrollbarColor: 'auto',
           overscrollBehavior: 'contain',
           display: 'flex',
           justifyContent: 'safe center',
@@ -1516,6 +1661,20 @@ export function PatternCanvas({
             gridTemplateColumns: showRulers ? `${RULER_LEFT}px ${cssW}px` : `${cssW}px`,
             gridTemplateRows: showRulers ? `${RULER_TOP}px ${cssH}px` : `${cssH}px`,
             flex: 'none',
+            /*
+             * 画布四周的留白做在**滚动内容**上，不做在滚动容器上。
+             *
+             * 用户反馈「下面的不容易看到并拖动编辑…要把画板周围的拖动底部
+             * 空间预留的大一点」。实测（编辑态 1600×1000，duck 52×64）滚到
+             * 四边极限时到容器边框的距离是 左 18 / 上 2 / 右 30 / 下 2 ——
+             * 上下贴死了，边缘格既点不准也看不出下沿还有内容。
+             *
+             * 为什么不能做成滚动容器的 padding：内容滚动时会滑进 padding 区，
+             * 从 sticky 标尺旁边漏出来（容器那条 `padding: 0` 的注释就是这个
+             * 教训）。做在内容上，这块空白就跟着画布一起滚 —— 滚到底时它就是
+             * "画布之外还看得见的一片纸"，正是落笔需要的余量。
+             */
+            padding: canvasGutter,
           }}
         >
           {/* 左上角 */}
@@ -1711,9 +1870,16 @@ export function PatternCanvas({
               cursor: brushMode
                 ? 'none'
                 : editActive
-                  ? editTool === 'picker'
-                    ? 'copy'
-                    : 'crosshair'
+                  ? editTool === 'pan'
+                    ? /*
+                       * 抓手用 grab / grabbing：这两个光标是系统级的"可拖"语义，
+                       * 用户不用读文字就知道能按住甩。crosshair 在抓手上是错的
+                       * —— 它暗示"这里会落笔"。
+                       */
+                      'grab'
+                    : editTool === 'picker'
+                      ? 'copy'
+                      : 'crosshair'
                   : cellCss >= 8
                     ? 'crosshair'
                     : 'default',

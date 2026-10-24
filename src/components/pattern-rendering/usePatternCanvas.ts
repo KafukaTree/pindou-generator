@@ -73,6 +73,47 @@ const ZOOM_STEP = 0.25;
 export const RULER_LEFT = 24;
 export const RULER_TOP = 18;
 
+/**
+ * 画布四周留给"手指/鼠标落点"的空白。
+ *
+ * 用户反馈：「现在的状态是下面的不容易看到并拖动编辑，我猜测可能要把画板
+ * 的周围的拖动底部空间预留的大一点」。实测（编辑态 1600×1000，duck 52×64）
+ * 滚到四边极限时到容器边框的距离是 左 18 / 上 **2** / 右 30 / 下 **2** ——
+ * 上下贴着边框"顶死"了，下沿那个位置既看不出还有内容、也没有地方落笔。
+ *
+ * 这块留白必须**在滚动内容之内**（做成内容的 padding，跟着内容一起滚），
+ * 不能做成容器的 padding —— 容器 padding 的话内容滚动时会滑进 padding 区，
+ * 从 sticky 标尺旁边漏出来（画布区那条 `padding: 0` 的注释就是在说这个）。
+ *
+ * 20px 的依据：手机上一根手指的触点半径大约 20–24px，光标落点要在画布之外
+ * 有地方放，边缘格才点得准；桌面端 20px 也刚好让"顶死"的观感消失。
+ */
+export const CANVAS_GUTTER = 20;
+/**
+ * 窄屏（手机）用的留白。
+ *
+ * 20px 在手机上会把整整一列格子挤掉（430 宽、64 列的图：留给画布的宽度
+ * 少 40px 后每格从 5px 掉到 4px，画布从 320 缩到 256）。手机上手指点不准
+ * 的问题已经在画板外框高度上解决过了，这里不需要再吃宽度，8px 够让格子
+ * 不贴着边框即可。
+ */
+export const CANVAS_GUTTER_NARROW = 8;
+
+/**
+ * 边缘自动滚动的热区宽度（CSS px）与速度区间（px / 帧）。
+ *
+ * 指针进入滚动容器**可视边**往里 EDGE_ZONE 的这条带，画面就开始朝那个
+ * 方向滚；越贴边越快，从 EDGE_SPEED_MIN 线性加到 EDGE_SPEED_MAX。
+ *
+ * 40px 大约是一个指尖的直径：再窄的话，笔尖压在画面边缘的格子上时就
+ * 频繁误触发滚动；再宽则"明明还在画面中央，画面自己跑起来了"。
+ * 速度按 60fps 折算，12px/帧 ≈ 720px/秒，够从画布顶端一口气拉到尾，
+ * 而 2px/帧 让人在刚进热区时能精确停在想停的位置。
+ */
+const EDGE_ZONE = 40;
+const EDGE_SPEED_MIN = 2;
+const EDGE_SPEED_MAX = 12;
+
 /** .px-inset 的内边距 + 边框，以及滚动条预留 */
 const FRAME_PAD = 20;
 /** 滚动容器 px-inset 的边框（1px 描边 + 极小的内衬） */
@@ -1260,8 +1301,15 @@ function drawEditPreview(
  *
  * `pencil` 是唯一会连续绘制（拖出一片）的；`eraser` 同理；`picker` 与
  * `fill` 都是一次性点击 —— 它们没有"拖动"的语义，拖也只算点一下。
+ *
+ * `pan`（抓手）是用户后补的一项：
+ * 「然后画笔的左边可以加一个"抓手"吧，抓手就是用来控制画板的上下左右
+ * 灵活移动的」。它**不碰任何格子**，只改滚动容器的 scrollLeft/scrollTop。
+ * 放大到 400% 之后画布比可视区大好几倍，靠滚动条拖动要反复瞄准；抓手是
+ * "按住就甩"的那种操作。摆在工具组最左边（画笔左边）—— 先移动视线、
+ * 再下笔，是鼠标手势的自然顺序。
  */
-export type EditTool = 'pencil' | 'eraser' | 'picker' | 'fill';
+export type EditTool = 'pan' | 'pencil' | 'eraser' | 'picker' | 'fill';
 
 /**
  * 笔头粗细（直径，格）。
@@ -1957,12 +2005,27 @@ export function usePatternCanvas(
    * 横幅图会算出 3000px 高的画布，用户得滚一整屏才看得到底边。
    * 方形图上这个上限永远不会生效，格子直接按宽度铺满，画布自然 1:1。
    */
+  /*
+   * 画布外那一圈留白到底多宽。
+   *
+   * 窄屏用 8px、桌面用 20px（理由见 CANVAS_GUTTER_NARROW 的注释）。
+   * 这个值同时被 cellPx（算可用宽高）和 PatternCanvas（给内容块加 padding）
+   * 用，所以统一在这里算、通过返回值传给渲染层 —— 两边各算一份的话，
+   * padding 只要比扣掉的宽一点，内容就会横向溢出。
+   */
+  const canvasGutter =
+    viewportW > 0 && viewportW < NARROW_VIEWPORT ? CANVAS_GUTTER_NARROW : CANVAS_GUTTER;
+
   const cellPx = useMemo(() => {
     if (!pattern) return 16;
     const rulerX = showRulers ? RULER_LEFT : 0;
     // 有滚动容器的实测宽度就优先用它（减掉边框），否则退回 hostWidth
     const baseW = viewportW > 0 ? viewportW - FRAME_BORDER : (hostWidth || 640) - FRAME_PAD;
-    const availW = Math.max(120, baseW - rulerX - SCROLLBAR_ALLOWANCE);
+    // 两侧各留一圈留白（见 CANVAS_GUTTER 注释：给边缘格留落点，别贴着边框）
+    const availW = Math.max(
+      120,
+      baseW - rulerX - SCROLLBAR_ALLOWANCE - canvasGutter * 2,
+    );
     const fitW = Math.floor(availW / Math.max(1, pattern.cols));
 
     let fit = fitW;
@@ -1986,7 +2049,11 @@ export function usePatternCanvas(
        */
       if (useFill && viewportH > 0) {
         const rulerY = showRulers ? RULER_TOP : 0;
-        const availH = Math.max(80, viewportH - FRAME_BORDER - rulerY);
+        // 上下各留 CANVAS_GUTTER（编辑态要能滚到图以外的空白再落笔）
+        const availH = Math.max(
+          80,
+          viewportH - FRAME_BORDER - rulerY - canvasGutter * 2,
+        );
         const fitH = Math.floor(availH / Math.max(1, pattern.rows));
         const tallCap = Math.floor(fitH * EDIT_TALL_FACTOR);
         if (fit > tallCap) fit = tallCap;
@@ -2004,7 +2071,11 @@ export function usePatternCanvas(
     if (useFill && viewportH > 0) {
       const rulerY = showRulers ? RULER_TOP : 0;
       // 横向滚动条只有在真的溢出时才占位，先按不出现算，留 1 格余量即可
-      const availH = Math.max(80, viewportH - FRAME_BORDER - rulerY);
+      // 上下各留 CANVAS_GUTTER，与编辑态同一套留白，避免进出编辑时格子跳变
+      const availH = Math.max(
+        80,
+        viewportH - FRAME_BORDER - rulerY - canvasGutter * 2,
+      );
       const fitH = Math.floor(availH / Math.max(1, pattern.rows));
       /*
        * 高度约束只在**它还给出可读格子**时才在窄屏采用。
@@ -2023,7 +2094,17 @@ export function usePatternCanvas(
 
     const base = Math.max(MIN_FIT_CELL, Math.min(MAX_FIT_CELL, fit));
     return Math.max(2, Math.round(base * zoom));
-  }, [pattern, hostWidth, viewportW, viewportH, showRulers, zoom, useFill, editing]);
+  }, [
+    pattern,
+    hostWidth,
+    viewportW,
+    viewportH,
+    showRulers,
+    zoom,
+    useFill,
+    editing,
+    canvasGutter,
+  ]);
 
   const metrics = useMemo<CanvasMetrics | null>(() => {
     if (!hasPattern || !pattern) return null;
@@ -2789,6 +2870,15 @@ export function usePatternCanvas(
       if (!pattern || !editEnabled) return;
       const tool = editToolRef.current;
       const code = currentCodeRef.current;
+      /*
+       * 抓手不是"编辑"，不该产生任何 delta。
+       *
+       * 正常路径上 onEditPointerDown 已经在 pan 分支里 return 了、根本不会
+       * 走到这里；但键盘快捷键（1–5 切工具）+ 落点事件是两条独立的路径，
+       * 这一句是防"切到抓手后还有残留笔在落点"的兜底 —— 抓手唯一合法的
+       * 副作用是移动视口。
+       */
+      if (tool === 'pan') return;
 
       if (tool === 'picker') {
         const picked = pickCodeAt(pattern, editsRef.current, index);
@@ -3190,35 +3280,62 @@ export function usePatternCanvas(
    * 分派 —— 谁的模式开着就走谁，绝不两边都跑（否则一次拖动既改格子
    * 又画选区，两种遮罩叠在一起，用户完全看不懂发生了什么）。
    */
-  const onEditPointerDown = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (!editEnabled || brushModeRef.current) return;
-      // 只响应主键：右键/中键在画布上是"别的动作"，不该落笔
-      if (e.button !== undefined && e.button !== 0) return;
-      const index = cellAt(e.clientX, e.clientY);
-      if (index === null) return;
-      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-      editStrokeRef.current = null;
-      applyToolAt(index);
-    },
-    [editEnabled, cellAt, applyToolAt],
-  );
+  /*
+   * 抓手的拖拽状态。
+   *
+   * 不用 React state：指针每动一像素都要读上一次位置、算位移，走 state 会
+   * 每帧额外渲染一次整块画布（三层 canvas 一起 redraw），拖起来会掉帧。
+   * 这里只需要记住"按下时指针在哪、当时滚到哪"。
+   */
+  const panRef = useRef<{
+    pointerId: number;
+    x: number;
+    y: number;
+    left: number;
+    top: number;
+  } | null>(null);
 
-  const onEditPointerMove = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>) => {
-      if (!editEnabled || brushModeRef.current) return;
-      const index = cellAt(e.clientX, e.clientY);
-      setEditCursor(
-        index === null || !pattern
-          ? null
-          : { col: index % pattern.cols, row: Math.floor(index / pattern.cols) },
-      );
+  /*
+   * 边缘自动滚动（edge auto-scroll）。
+   *
+   * 用户反馈：「下面的不容易看到并拖动编辑，我猜测可能要把画板周围的拖动
+   * 底部空间预留的大一点」。实测（编辑态 1600×1000，画布高 1152px、可视
+   * 高 742px）从容器中间起笔往下拖到容器外 40px，scrollTop 采样全程 0 ——
+   * 笔拖到边上画面不跟着走，要画下半部分得先松手、滚下去、再落笔。
+   *
+   * 判据用指针到滚动容器**可视边**的距离：进入 EDGE_ZONE 就按比例滚，
+   * 越靠边越快（EDGE_SPEED_MIN → EDGE_SPEED_MAX 线性）。不能只在
+   * pointermove 里滚 —— 指针停住不动时 pointermove 不触发，用户把笔杵在
+   * 底边就再也滚不动了，所以必须用 rAF 循环自己跑。
+   */
+  const panEdgeRef = useRef<{ x: number; y: number } | null>(null);
+  const edgeRafRef = useRef<number | null>(null);
+  /** 停掉边缘自动滚动的 rAF 循环（抬手 / 取消 / 退出编辑都要调） */
+  const stopEdgeScroll = useCallback(() => {
+    if (edgeRafRef.current !== null) {
+      cancelAnimationFrame(edgeRafRef.current);
+      edgeRafRef.current = null;
+    }
+    panEdgeRef.current = null;
+  }, []);
+
+  /**
+   * 把一次落点画到第 `index` 格，并从上一格的笔心插值过来。
+   *
+   * 从 onEditPointerMove 里抽出来的：边缘自动滚动时，指针本身没动，
+   * 但滚动让**指针底下的格子变了**，那种情况下也要按同样的插值规则补画
+   * （否则滚过去的那些格子不会被涂到，画面里会出现一条没画上的断带）。
+   * 两条路径共用这一份，插值规则就只有一处。
+   */
+  const paintToIndex = useCallback(
+    (index: number | null) => {
       // 只有笔在拖动中才连续画：取色器/油漆桶没有拖动语义，拖也只算点一下
-      if (!editStrokeRef.current) return;
+      const stroke0 = editStrokeRef.current;
+      if (!stroke0) return;
       if (index === null) return;
       // 夹紧到边界太远会画成一条穿图的直线 —— 用上一个格子和当前格子
       // 做直线插值（Bresenham），这样快速拖动也不会漏格
-      const stroke = editStrokeRef.current;
+      const stroke = stroke0;
       /*
        * 起点用 anchor（上一笔的**笔心**），不是 cells 的末尾。
        * 粗笔一次盖章写进 cells 的是一整片格子，末尾是笔头右下角；
@@ -3229,40 +3346,195 @@ export function usePatternCanvas(
         stampBrush(index, stroke.after);
         return;
       }
-      if (last !== index) {
-        /*
-         * 走一遍两点之间的格子，避免快速拖动跳过中间格（相邻时就是它自己）。
-         *
-         * 每个中间格都用 stampBrush 盖章（而不是 paintCell 单格）—— 否则
-         * 笔宽 > 1 时「按下是粗圆点、一拖就变细线」。
-         */
-        let c0 = last % pattern.cols;
-        let r0 = Math.floor(last / pattern.cols);
-        const c1 = index % pattern.cols;
-        const r1 = Math.floor(index / pattern.cols);
-        const dc = Math.abs(c1 - c0);
-        const dr = Math.abs(r1 - r0);
-        const sc = c0 < c1 ? 1 : -1;
-        const sr = r0 < r1 ? 1 : -1;
-        let err = dc - dr;
-        for (let guard = 0; guard < 4096; guard++) {
-          stampBrush(r0 * pattern.cols + c0, stroke.after);
-          if (c0 === c1 && r0 === r1) break;
-          const e2 = err * 2;
-          if (e2 > -dr) {
-            err -= dr;
-            c0 += sc;
-          }
-          if (e2 < dc) {
-            err += dc;
-            r0 += sr;
-          }
-        }
-      } else {
+      if (last === index) {
         stampBrush(index, stroke.after);
+        return;
+      }
+      /*
+       * 走一遍两点之间的格子，避免快速拖动跳过中间格（相邻时就是它自己）。
+       *
+       * 每个中间格都用 stampBrush 盖章（而不是 paintCell 单格）—— 否则
+       * 笔宽 > 1 时「按下是粗圆点、一拖就变细线」。
+       */
+      let c0 = last % pattern.cols;
+      let r0 = Math.floor(last / pattern.cols);
+      const c1 = index % pattern.cols;
+      const r1 = Math.floor(index / pattern.cols);
+      const dc = Math.abs(c1 - c0);
+      const dr = Math.abs(r1 - r0);
+      const sc = c0 < c1 ? 1 : -1;
+      const sr = r0 < r1 ? 1 : -1;
+      let err = dc - dr;
+      for (let guard = 0; guard < 4096; guard++) {
+        stampBrush(r0 * pattern.cols + c0, stroke.after);
+        if (c0 === c1 && r0 === r1) break;
+        const e2 = err * 2;
+        if (e2 > -dr) {
+          err -= dr;
+          c0 += sc;
+        }
+        if (e2 < dc) {
+          err += dc;
+          r0 += sr;
+        }
       }
     },
-    [editEnabled, cellAt, pattern, stampBrush],
+    [pattern, stampBrush],
+  );
+
+  /**
+   * 启动边缘自动滚动的 rAF 循环（幂等：已在跑就不再开一条）。
+   *
+   * 为什么不用 pointermove 直接滚：pointermove 只在指针**动**的时候来。
+   * 用户把笔停在容器底边不动、想让它继续往下滚，是最自然的操作，而那种
+   * 情况下一个事件都不会再来，画面就卡住了。rAF 循环自己按当前位置跑，
+   * 指针停着也继续滚。
+   *
+   * 滚动发生后必须补画：滚动改变的只是视口，指针在屏幕上的位置没变，
+   * 但指针底下已经是别的格子了。补画走 paintToIndex，和普通拖动同一套
+   * Bresenham —— 滚过去的每一格都练得上，画出来才不会断。
+   */
+  const startEdgeScroll = useCallback(() => {
+    if (edgeRafRef.current !== null) return;
+    const tick = () => {
+      const scroll = scrollRef.current;
+      const ptr = panEdgeRef.current;
+      if (!scroll || !ptr || !editStrokeRef.current) {
+        edgeRafRef.current = null;
+        return;
+      }
+      const rect = scroll.getBoundingClientRect();
+      // 只在指针还停在滚动容器上时滚；拖到容器外就停（不然手一滑出界画面狂滚）
+      if (
+        ptr.x < rect.left ||
+        ptr.x > rect.right ||
+        ptr.y < rect.top ||
+        ptr.y > rect.bottom
+      ) {
+        edgeRafRef.current = null;
+        return;
+      }
+      /** 0 = 没进热区，1 = 正贴边 */
+      const ramp = (dist: number) => {
+        if (dist >= EDGE_ZONE) return 0;
+        const t = 1 - Math.max(0, dist) / EDGE_ZONE;
+        return t * t; // 平方：靠近边缘时提速更明显，离开一点就迅速变慢
+      };
+      const top = rect.top + EDGE_ZONE;
+      const bottom = rect.bottom - EDGE_ZONE;
+      const left = rect.left + EDGE_ZONE;
+      const right = rect.right - EDGE_ZONE;
+      let dx = 0;
+      let dy = 0;
+      if (ptr.y < top) dy = -ramp(ptr.y - rect.top);
+      else if (ptr.y > bottom) dy = ramp(rect.bottom - ptr.y);
+      if (ptr.x < left) dx = -ramp(ptr.x - rect.left);
+      else if (ptr.x > right) dx = ramp(rect.right - ptr.x);
+      if (dx === 0 && dy === 0) {
+        edgeRafRef.current = null;
+        return;
+      }
+      const beforeLeft = scroll.scrollLeft;
+      const beforeTop = scroll.scrollTop;
+      if (dy !== 0) {
+        const step = Math.round(dy * EDGE_SPEED_MAX);
+        scroll.scrollTop += Math.max(
+          -EDGE_SPEED_MAX,
+          Math.min(EDGE_SPEED_MAX, step || Math.sign(dy) * EDGE_SPEED_MIN),
+        );
+      }
+      if (dx !== 0) {
+        const step = Math.round(dx * EDGE_SPEED_MAX);
+        scroll.scrollLeft += Math.max(
+          -EDGE_SPEED_MAX,
+          Math.min(EDGE_SPEED_MAX, step || Math.sign(dx) * EDGE_SPEED_MIN),
+        );
+      }
+      // 滚到边了（滚动量没变）就没有继续跑的必要，交给下一次 move 重启
+      if (scroll.scrollLeft === beforeLeft && scroll.scrollTop === beforeTop) {
+        edgeRafRef.current = null;
+        return;
+      }
+      // 指针底下的格子变了 —— 补画，否则滚过的部分会留下一条断带
+      paintToIndex(cellAt(ptr.x, ptr.y));
+      edgeRafRef.current = requestAnimationFrame(tick);
+    };
+    edgeRafRef.current = requestAnimationFrame(tick);
+  }, [paintToIndex, cellAt]);
+
+  const onEditPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!editEnabled || brushModeRef.current) return;
+      // 只响应主键：右键/中键在画布上是"别的动作"，不该落笔
+      if (e.button !== undefined && e.button !== 0) return;
+      /*
+       * 抓手：按下即开始平移，**不读格子**。
+       *
+       * 放在 cellAt 之前是必需的 —— 画布放大到 400% 时可视区里可能全是
+       * 同一格的放大像素、也可能正好落在留白上（cellAt 返回 null），
+       * 而抓手这两种情况都得能拖动。它操作的是滚动容器，不是图案。
+       */
+      if (editToolRef.current === 'pan') {
+        const scroll = scrollRef.current;
+        if (!scroll) return;
+        (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+        panRef.current = {
+          pointerId: e.pointerId,
+          x: e.clientX,
+          y: e.clientY,
+          left: scroll.scrollLeft,
+          top: scroll.scrollTop,
+        };
+        return;
+      }
+      const index = cellAt(e.clientX, e.clientY);
+      if (index === null) return;
+      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+      editStrokeRef.current = null;
+      applyToolAt(index);
+      /*
+       * 按下也要启动边缘滚动：笔一落就停在底边（最常见的是想画最下面那几行，
+       * 落点本来就在底部热区）时，没有 pointermove 就永远不会开始滚。
+       */
+      if (editStrokeRef.current) {
+        panEdgeRef.current = { x: e.clientX, y: e.clientY };
+        startEdgeScroll();
+      }
+    },
+    [editEnabled, cellAt, applyToolAt, startEdgeScroll],
+  );
+
+  const onEditPointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!editEnabled || brushModeRef.current) return;
+      /*
+       * 抓手拖动中：把指针位移换算成滚动量。
+       *
+       * 用「按下时的 scrollLeft - 指针位移」而不是「累加 delta」：累加会把
+       * 滚动容器在到达两端时的夹紧损失吃掉，指针拖出去再拖回来，画布会
+       * 慢慢跑偏（常见的手感 bug）。以起点为基准则是指针在哪画布就在哪，
+       * 拖到边界自然停住，拖回来立刻跟手。
+       */
+      const pan = panRef.current;
+      if (pan) {
+        const scroll = scrollRef.current;
+        if (!scroll) return;
+        scroll.scrollLeft = pan.left - (e.clientX - pan.x);
+        scroll.scrollTop = pan.top - (e.clientY - pan.y);
+        return;
+      }
+      const index = cellAt(e.clientX, e.clientY);
+      setEditCursor(
+        index === null || !pattern
+          ? null
+          : { col: index % pattern.cols, row: Math.floor(index / pattern.cols) },
+      );
+      paintToIndex(index);
+      // 记下指针位置，供边缘自动滚动的 rAF 循环读取（指针停住时 move 不再触发）
+      panEdgeRef.current = { x: e.clientX, y: e.clientY };
+      startEdgeScroll();
+    },
+    [editEnabled, cellAt, pattern, paintToIndex, startEdgeScroll],
   );
 
   const onEditPointerUp = useCallback(
@@ -3270,14 +3542,32 @@ export function usePatternCanvas(
       if (!editEnabled) return;
       const el = e.currentTarget as HTMLElement;
       if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      /*
+       * 抓手收尾：只清状态，**不提交笔**。
+       *
+       * commitEditStroke 会把 editStrokeRef 里攒的格子写成一条 delta；
+       * 抓手根本没攒格子（editStrokeRef 一直是 null），走一遍也是空操作，
+       * 但显式分流更安全 —— 万一将来抓手里误碰了 editStrokeRef，这里
+       * 能挡住"拖一下画布多出一笔手改"这种事。
+       */
+      // 抬手必须停掉边缘自动滚动（漏清的话松手后画面还在自己滚）
+      stopEdgeScroll();
+      if (panRef.current) {
+        panRef.current = null;
+        return;
+      }
       commitEditStroke();
     },
-    [editEnabled, commitEditStroke],
+    [editEnabled, commitEditStroke, stopEdgeScroll],
   );
 
   const onEditPointerLeave = useCallback(() => {
-    setEditCursor(null);
-  }, []);
+    // 笔拖出容器就停滚（rAF 里也有一道同样的判断，这里提前收掉更省事）
+    stopEdgeScroll();
+    // 抓手拖到画布外（pointer capture 还在）不能清 panRef，否则松手前
+    // 再拖回来就不动了。只有真的没在拖时才清悬停格。
+    if (!panRef.current) setEditCursor(null);
+  }, [stopEdgeScroll]);
 
   // ---- 撤销 / 重做（统一历史） ----
   /*
@@ -3404,6 +3694,16 @@ export function usePatternCanvas(
     setBrushMode(false);
   }, [applyPending, setBrushMode]);
 
+  /*
+   * 卸载时收掉边缘自动滚动的 rAF 循环。
+   *
+   * 退出编辑/切到刷区域时 onEditPointerDown/Move 都不再走，但 rAF 是**自己
+   * 排自己**的，没人调 stopEdgeScroll 的话它会一直跑下去 —— 而且 tick 里
+   * 只在 `!editStrokeRef.current` 时才自然退出，退出编辑时那条笔往往还
+   * 挂着（用户按 Esc 走的，不是抬手走的），于是画面在退出编辑后还在滚。
+   */
+  useEffect(() => stopEdgeScroll, [stopEdgeScroll]);
+
   return {
     hostRef,
     scrollRef,
@@ -3468,6 +3768,8 @@ export function usePatternCanvas(
     hasAnything,
     exitBrushMode,
     useFill,
+    /** 画布外那一圈留白的宽度（窄屏更窄，见 CANVAS_GUTTER_NARROW） */
+    canvasGutter,
     // ---- 编辑（② 工具栏） ----
     displayPattern,
     editEnabled,
