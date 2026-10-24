@@ -484,13 +484,38 @@ export default function Home() {
 
   useEffect(() => {
     /*
-     * 空态不写：用户点「清空」之后，磁盘上不该还留着上一次的会话，
-     * 否则刷新一下刚才清掉的东西又冒出来。null 直接删键。
+     * ---- 三个"这一轮不许动磁盘"的前置条件 ----------------------------
+     *
+     * 这几个判断写错过一次，症状是**刷新两次就丢**（用户反馈「连续刷新
+     * 多次会丢失」）。根因很隐蔽：mount 时 restore effect 和本 effect 在
+     * 同一次 commit 里按定义顺序执行，而 restore 里的 setState 要到下一次
+     * 渲染才生效 —— 所以本 effect 的首轮读到的 `sourceDataUrl` 仍然是
+     * null。那时若把它当"空态"，就会把磁盘上那份完好的会话删掉。
+     *
+     * 恢复前先什么都不做，等 sessionBooting 落成 false（restore effect
+     * 同一批里设的）再开始写。
      */
-    if (!blankCanvas && !compactSource) {
+    if (sessionBooting) return;
+
+    /*
+     * 空的判据必须是「没有图源」= `sourceDataUrl` + `blankCanvas`。
+     *
+     * **不能**用 `compactSource` —— 它是压缩后的副本，刚恢复或刚上传时
+     * 有几十毫秒还是 null（要异步解码 canvas 才能算出来）。用它判断会让
+     * 每一轮"图已就绪、压缩还没好"的写入都把会话删掉。
+     */
+    if (!blankCanvas && !sourceDataUrl) {
       clearWorkspaceSession();
       return;
     }
+
+    /*
+     * 压缩副本还没算出来：这一轮**什么都不做**（既不写也不删）。
+     * 磁盘上那份要么是上次的正确内容，要么还不存在 —— 两种情况下
+     * "不动"都对。等 compactSource 好了下一轮自然会写。
+     */
+    if (!blankCanvas && !compactSource) return;
+
     /*
      * 240ms debounce：编辑模式下每一笔都会改 edits，逐笔写 localStorage
      * 是同步阻塞（比画一格的耗时还长）。用户松手 240ms 后再落盘，
@@ -514,7 +539,9 @@ export default function Home() {
     }, 240);
     return () => window.clearTimeout(timer);
   }, [
+    sessionBooting,
     blankCanvas,
+    sourceDataUrl,
     compactSource,
     imageInfo,
     edits,
