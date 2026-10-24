@@ -231,7 +231,14 @@ export function selectPalette(
   const nC = cand.length;
 
   // 预计算所有点与所有候选的距离平方
-  const dist = new Float64Array(nP * nC);
+  /*
+   * 距离矩阵用 Float32 而不是 Float64：320 格时 nP≈3.4 万、nC=291，
+   * 矩阵有 980 万个元素 —— Float64 要 78MB，仅分配 + 逐元素写入就
+   * 吃掉可观的 GC 时间。这里存的是 OKLab 距离平方（量级 < 1，比较
+   * 用途），Float32 的 7 位有效数字绰绰有余，内存减半、缓存命中率
+   * 也明显更好。
+   */
+  const dist = new Float32Array(nP * nC);
   for (let i = 0; i < nP; i++) {
     const p = points[i].lab;
     for (let j = 0; j < nC; j++) {
@@ -470,8 +477,7 @@ export function selectPalette(
     // 找最近的一对重复中心
     let worstA = -1;
     let worstB = -1;
-    const DUP_MAX = Number(process.env.PINDOU_DUP ?? '1') * MIN_SEP;
-    let worstD = DUP_MAX;
+    let worstD = MIN_SEP;
     for (let a = 0; a < chosen.length; a++) {
       for (let b = a + 1; b < chosen.length; b++) {
         const d = Math.sqrt(beadDist2(cand[chosen[a]].lab, cand[chosen[b]].lab));
@@ -488,10 +494,42 @@ export function selectPalette(
     const dropA = own[worstA] <= own[worstB];
     const drop = dropA ? worstA : worstB;
     const dropJ = chosen[drop];
-    // 该中心负责的点：被它吸走、且离其余中心更远的那些
     const rest = chosen.filter((_, ci) => ci !== drop);
+    /*
+     * 计算"删掉 drop 后，各候选色能救回多少剥夺距离"。
+     *
+     * 复杂度说明（这条在 320 格上必须省，否则整管线会从 1.7s 涨到 4.5s）：
+     * 朴素写法是"对每个候选 q 扫一遍全部点"，即 O(nC · nP · k)，320 格时
+     * 约 10 亿次 —— 实测单项就吃掉 3 秒。实际上**只有被 drop 吸走的那些点
+     * 才可能产生收益**（其余点的 bd 与 withDrop 相等，`withDrop >= bd`
+     * 会直接跳过），所以先扫一遍点集算出 bd 与归属，再只对 drop 的那一小
+     * 撮点累加候选收益：O(nP · k + ownDrop · nC)。
+     */
     let gainMax = 0;
     let bestJ = -1;
+    const candGain = new Float64Array(nC);
+    for (let i = 0; i < nP; i++) {
+      let bd = Infinity;
+      let bj = -1;
+      for (let cj = 0; cj < rest.length; cj++) {
+        const d = dist[i * nC + rest[cj]];
+        if (d < bd) {
+          bd = d;
+          bj = cj;
+        }
+      }
+      if (bj < 0) continue;
+      // 该点是否本来归 drop 管（drop 比所有 rest 都近）
+      const dd = dist[i * nC + dropJ];
+      if (dd >= bd - 1e-12) continue;
+      const pw = points[i].weight;
+      const row = i * nC;
+      for (let q = 0; q < nC; q++) {
+        if (chosen.includes(q)) continue;
+        const c2 = dist[row + q];
+        if (c2 < bd) candGain[q] += (bd - c2) * pw;
+      }
+    }
     for (let q = 0; q < nC; q++) {
       if (chosen.includes(q)) continue;
       // 补位色自身必须也满足间隔约束（与 rest 全部 ≥ MIN_SEP）
@@ -503,26 +541,10 @@ export function selectPalette(
         }
       }
       if (!ok) continue;
-      // 它能"救回"多少被剥夺的距离
-      let gain = 0;
-      for (let i = 0; i < nP; i++) {
-        let bd = Infinity;
-        for (const j of rest) {
-          const d = dist[i * nC + j];
-          if (d < bd) bd = d;
-        }
-        const withDrop = Math.min(bd, dist[i * nC + dropJ]);
-        if (withDrop >= bd) continue; // 本来就不归 drop 管
-        const cand2 = dist[i * nC + q];
-        if (cand2 < bd) gain += (bd - cand2) * points[i].weight;
-      }
-      if (gain > gainMax) {
-        gainMax = gain;
+      if (candGain[q] > gainMax) {
+        gainMax = candGain[q];
         bestJ = q;
       }
-    }
-    if (process.env.PINDOU_DUP) {
-      console.log(`[dup] guard=${guard} pair=${cand[chosen[worstA]].code}/${cand[chosen[worstB]].code} d=${worstD.toFixed(4)} drop=${cand[dropJ].code} -> ${cand[bestJ].code} gain=${gainMax.toFixed(4)}`);
     }
     if (bestJ < 0 || gainMax < 1e-6) break;
     chosen[drop] = bestJ;
@@ -1089,9 +1111,6 @@ export function generatePattern(
    */
   const lightCandidates = candidates.filter(isNeutralLight);
   const darkCandidates = candidates.filter(isNeutralDark);
-  if (process.env.PINDOU_FEAT) {
-    console.log('[feat]', structuralFeatures.map((f, i) => `${i}:${f.role} area=${f.area} conf=${f.confidence.toFixed(2)} stab=${f.stability.toFixed(2)} contra=${f.contrast.toFixed(2)} partner=${f.partner} bbox=[${f.x0},${f.y0},${f.x1},${f.y1}]`).join('\n       '));
-  }
   const placement = planFeaturePlacement(structuralFeatures, {
     cols,
     rows,
@@ -1101,9 +1120,6 @@ export function generatePattern(
     lightCandidates,
     darkCandidates,
   });
-  if (process.env.PINDOU_FEAT) {
-    console.log('[plan]', placement.plans.map((p) => `${p.role}:${p.bead.code} k=${p.minBeads} cells=${p.cells.length} conf=${p.confidence.toFixed(2)} g=${p.groupId}`).join(' | '));
-  }
   const rescuedHexes = placeStructuralFeatures(
     cells, palette, placement.plans, cols, rows, colorLimit, protectedCellsEarly,
     lightCandidates, darkCandidates,
@@ -1171,19 +1187,6 @@ export function generatePattern(
    *   3. 若该色全部块都很小（最大块 < 4 格），整色剪掉。
    * 被 enforceAccents 钉住的小特征（眼睛高光）走白名单，不动。
    */
-  if (process.env.PINDOU_MICRO) {
-    const rep = (tag: string, cc: Int16Array, pl: BeadColor[]) => {
-      const nn = cols * rows; const sn = new Uint8Array(nn); let micro = 0; let protMicro = 0;
-      for (let i = 0; i < nn; i++) { if (sn[i] || cc[i] < 0) continue; const v = cc[i]; const st = [i]; sn[i] = 1; let sz = 0; let pr = 0;
-        while (st.length) { const j = st.pop()!; sz++; if (protectedCells && protectedCells[j]) pr++; const r = (j / cols) | 0, c = j % cols;
-          for (const [dy, dx] of [[-1,0],[1,0],[0,-1],[0,1]]) { const rr = r+dy, ccx = c+dx; if (rr<0||ccx<0||rr>=rows||ccx>=cols) continue; const k = rr*cols+ccx; if (sn[k]||cc[k]!==v) continue; sn[k]=1; st.push(k);} }
-        if (sz < 3) { micro++; if (pr) protMicro++; } }
-      let pn = 0;
-      for (let i = 0; i < nn; i++) if (protectedCells && protectedCells[i]) pn++;
-      console.log(`[micro ${tag}] micro=${micro} protMicro=${protMicro} colors=${pl.length} protCells=${pn}/${nn}`);
-    };
-    rep('pre-defrag', pruned.cells, pruned.palette);
-  }
   const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, protectedCells);
   /*
    * 混色消除放在最后：它判的是"这个色号在源图里到底存不存在"，
@@ -1208,22 +1211,6 @@ export function generatePattern(
   );
   const finalCells = clipped.cells;
   const finalPalette = clipped.palette;
-
-  if (process.env.PINDOU_MICRO) {
-    const rep2 = (tag: string, cc: Int16Array, pl: BeadColor[]) => {
-      const nn = cols * rows; const sn = new Uint8Array(nn); let micro = 0; let protMicro = 0;
-      for (let i = 0; i < nn; i++) { if (sn[i] || cc[i] < 0) continue; const v = cc[i]; const st = [i]; sn[i] = 1; let sz = 0; let pr = 0;
-        while (st.length) { const j = st.pop()!; sz++; if (protectedCells && protectedCells[j]) pr++; const r = (j / cols) | 0, c = j % cols;
-          for (const [dy, dx] of [[-1,0],[1,0],[0,-1],[0,1]]) { const rr = r+dy, ccx = c+dx; if (rr<0||ccx<0||rr>=rows||ccx>=cols) continue; const k = rr*cols+ccx; if (sn[k]||cc[k]!==v) continue; sn[k]=1; st.push(k);} }
-        if (sz < 3) { micro++; if (pr) protMicro++; } }
-      let pn = 0;
-      for (let i = 0; i < nn; i++) if (protectedCells && protectedCells[i]) pn++;
-      console.log(`[micro ${tag}] micro=${micro} protMicro=${protMicro} colors=${pl.length} protCells=${pn}/${nn}`);
-    };
-    rep2('post-defrag', defragged.cells, defragged.palette);
-    rep2('post-blend', deblended.cells, deblended.palette);
-    rep2('post-limit', clipped.cells, clipped.palette);
-  }
 
   // --- 统计（唯一真相来源）----------------------------------------------
   return finalize(finalCells, finalPalette, pooled, cols, rows, {
