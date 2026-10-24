@@ -81,6 +81,29 @@ const SCROLLBAR_ALLOWANCE = 12;
 
 const MIN_FIT_CELL = 4;
 const MAX_FIT_CELL = 48;
+/**
+ * 高度约束的适用门槛（CSS px / 格）。
+ *
+ * 高度参与取小值的目的是"打开就一眼看到整张图、不用滚"。但这笔交易的
+ * 前提是换来的格子还能看清 —— 手机竖屏上 64 行的图按高度算下来只有
+ * 2px/格，被 MIN_FIT_CELL 夹回 4px 后，画布只有 208px 宽而容器有 338px：
+ * 既没铺满宽度，格子又糊得连色号和标尺数字都读不出来，两头不占。
+ *
+ * 所以：只有当高度约束还能给出可读格子时才采用它；否则让宽度说了算，
+ * 竖向滚动交给滚动容器（手机上本来就在滚，这个代价更小）。
+ */
+const MIN_READABLE_CELL = 6;
+/**
+ * "窄屏"的判定线（CSS px，滚动容器宽度）。只有窄屏才允许为了可读性放弃
+ * "整图铺满"的取小值。
+ *
+ * 桌面（尤其矮窗口，如 1440×700 里可视区只有 356px 高）上，按高度取小值
+ * 会得到 5px/格 —— 确实偏小，但一打开就能看全整张图是桌面端最有价值的
+ * 默认值（桌面没有"本来就在滚"这回事，滚动条还是显式的干扰）。放宽后
+ * 这张图会跳成 19px/格、画布 1216px 高，等于默认就进了放大状态。
+ * 所以这条规则只对窄屏生效：手机上滚动是常态，可读性才是矛盾的主要方面。
+ */
+const NARROW_VIEWPORT = 640;
 
 /** 色号字号上限（CSS px）。放大到 4× 时字也该跟着长，但不必无限长 */
 const MAX_CODE_FONT = 30;
@@ -109,6 +132,26 @@ const MIN_FILL_HOST_HEIGHT = 240;
  * —— 再高，用户就没法判断这块重算后色号对不对了。
  */
 const REGION_MASK_ALPHA = 0.2;
+/**
+ * 已应用区域的**常态**内纹透明度。
+ *
+ * 0.2 常驻的问题很具体：用户看到的是"画面脏了一块"—— 陶土色糊在整片
+ * 重算区域上，压住了豆子本身的颜色，而那块区域其实只是在说"这里重算过"。
+ * 常态降到 0.1（≈26/255），只留一层能感觉到"范围不同"的极淡底纹，
+ * 主要信息交给外沿那圈虚线；鼠标移到这块区域上时再升回 0.2 让它"发亮"。
+ */
+const REGION_MASK_IDLE_ALPHA = 0.1;
+/**
+ * 遮罩层"这一格算不算在区域里"的门槛（权重）。
+ *
+ * 填充与轮廓**必须用同一个门槛**。早先填充用 0.02、轮廓也用 0.02，但
+ * 权重 0.02 处的填充 alpha 只有 0.02×0.28×255 ≈ 1.4 —— 肉眼看是透明的，
+ * 而轮廓线是 0.95 不透明的一整条。于是"松手后的 pending"总比"拖动中的
+ * live"多出一圈只有轮廓、没有填充的虚边，量 bbox 时直径差出 10%。
+ * 现在两者统一到 0.06（填充 alpha ≈ 4.3，虽然淡但确实画了），量出来
+ * 的几何范围就等于用户看到的范围。
+ */
+const MASK_MIN_WEIGHT = 0.06;
 /**
  * 待应用选区的遮罩透明度。
  *
@@ -756,6 +799,7 @@ function drawRegionMask(
   liveWeights: Float32Array | null,
   liveBox: { c0: number; r0: number; c1: number; r1: number } | null,
   tokens: CanvasTokens,
+  appliedFocus: boolean,
 ) {
   const { cols, rows, cellDev } = metrics;
   const devW = cols * cellDev;
@@ -775,72 +819,144 @@ function drawRegionMask(
   /*
    * 这一层只回答一个问题：**哪些地方会被重新分析**。
    *
-   * 刻意保持克制 —— 曾经试过两种"更花"的表达，都不合适：
+   * 曾经试过两种"更花"的表达，都不合适：
    *   a) 斜线网按密度分桶：各环覆盖率 28.4/26.4/27.7… 几乎恒定，
    *      线距收窄与 alpha 变淡互相抵消，肉眼看不出梯度；
-   *   b) 每格撒采样点阵：梯度是出来了，但点阵把色号盖住了。
+   *   b) 每格撒采样点阵：梯度是出来了，但把色号盖住了。
    *      拼豆画布上真正的主角永远是色号，标记层不能抢。
    *
-   * 现在每层只做两件事：极淡底纹（按权重衰减）+ 一圈外沿轮廓。
-   * 精度本身有没有真的渐变，看的是**重算后的图像**，不是这层标记 ——
-   * 标记若画得像另一种颜色，反而会误导用户以为区域被涂色了。
+   * 现在分层很轻：极淡底纹（按权重衰减）+ 一圈外沿轮廓。
+   * 精度有没有真的渐变，看的是**重算后的图像**，不是这层标记。
    *
-   * 两套配色区分状态：
-   *   - 已应用（appliedField）：陶土色 + 虚线轮廓
-   *   - 待应用（pendingField）：天空蓝 + **实线**轮廓（更亮、更肯定，
-   *     因为这是"你正要提交的东西"，需要比已应用的更醒目）
+   * ------------------------------------------------------------------
+   * 关键改动：**每格只填一次**（优先级合成，不是三层叠着填）。
+   *
+   * 早先的实现是依次刷三遍（applied 一遍、pending 一遍、live 一遍），
+   * 于是同一格被画 2–4 次，canvas 的 source-over 会让 alpha 按
+   * 1-(1-a)^n 累积：设计上中心 0.28（71/255）实际量到 184（0.72），
+   * 已应用区域设计 0.2 量到 96。数值超标只是表象，真正的后果是
+   * **两种颜色叠出一种说不清的第三种色**，用户没法判断自己看到的是
+   * 已应用还是草稿。
+   *
+   * 现在先在内存里把每格的最终 (颜色, alpha) 算出来、再只 fillRect 一次：
+   *   - 优先级 live > pending > applied（草稿盖住历史，因为草稿是"正在做的"）
+   *   - live 与 pending 同为草稿色 --sky，取权重较大者（不叠加）
+   *   - 因此每格 alpha 上限严格 = weight × PENDING_MASK_ALPHA ≤ 0.28
+   * ------------------------------------------------------------------
+   *
+   * 配色语义：
+   *   - 已应用（applied）：陶土色，**常态只有 0.1**（"这里重算过"的极淡
+   *     痕迹，不糊住豆子颜色），鼠标移进该区域时升到 0.2 让它发亮；
+   *   - 待应用（pending）：天空蓝 0.28 + **实线**轮廓，比已应用醒目 ——
+   *     这是"你正要提交的东西"；
+   *   - 拖动中（live）：与 pending 同色同档，但不画轮廓（轮廓留给抬手后，
+   *     否则每一帧都在重算外沿，线条会一路抖，像坏了）。
    */
-  const paint = (
-    field: RegionField | null,
-    color: string,
-    lineColor: string,
-    maskAlpha: number,
-    lineAlpha: number,
-    dashed: boolean,
-  ) => {
-    if (!field?.active) return;
-    const weights = field.w;
+  const appliedAlpha = appliedFocus ? REGION_MASK_ALPHA : REGION_MASK_IDLE_ALPHA;
+  const aw = appliedField?.active ? appliedField.w : null;
+  const pw = pendingField?.active ? pendingField.w : null;
+  const lw = liveWeights;
 
-    // 1) 极淡底纹：中心最浓，边缘随权重自然衰减到 0
-    ctx.fillStyle = color;
+  // 只扫会被扫到的范围：三层里任何一层可能有权重的格子并集
+  let c0 = cols - 1;
+  let c1 = 0;
+  let r0 = rows - 1;
+  let r1 = 0;
+  let any = false;
+  const scan = (w: Float32Array | null) => {
+    if (!w) return;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const weight = weights[r * cols + c];
-        if (weight <= 0.02) continue;
-        ctx.globalAlpha = weight * maskAlpha;
-        ctx.fillRect(c * cellDev, r * cellDev, cellDev, cellDev);
+        if (w[r * cols + c] < MASK_MIN_WEIGHT) continue;
+        any = true;
+        if (c < c0) c0 = c;
+        if (c > c1) c1 = c;
+        if (r < r0) r0 = r;
+        if (r > r1) r1 = r;
       }
     }
+  };
+  scan(aw);
+  scan(pw);
+  if (lw) {
+    const b = liveBox;
+    if (b) {
+      if (b.c0 < c0) c0 = Math.max(0, b.c0);
+      if (b.c1 > c1) c1 = Math.min(cols - 1, b.c1);
+      if (b.r0 < r0) r0 = Math.max(0, b.r0);
+      if (b.r1 > r1) r1 = Math.min(rows - 1, b.r1);
+      any = true;
+    } else {
+      scan(lw);
+    }
+  }
+  if (!any) return;
 
-    /*
-     * 2) 外沿轮廓。
-     *
-     * 描在"权重刚过 0.02"的位置而不是 0.5：0.5 那圈是**参数变化最快**的
-     * 地方，描上去会形成一条视觉硬线，正是用户要避免的"生硬"。描在最
-     * 外沿只标记区域范围，中间的过渡区留给图像自己去渐变。
-     *
-     * 用连续 stroke 而非逐格 fillRect：相邻格的边界段在格角首尾相接，
-     * 逐段 stroke 才连得成一条折线（逐格填小方块会裂成碎屑）。
-     */
-    ctx.globalAlpha = lineAlpha;
-    ctx.strokeStyle = lineColor;
+  // ---- 1) 底纹：每格只填一次 ----
+  for (let r = r0; r <= r1; r++) {
+    const rowBase = r * cols;
+    for (let c = c0; c <= c1; c++) {
+      const i = rowBase + c;
+      const wl = lw ? lw[i] : 0;
+      const wp = pw ? pw[i] : 0;
+      // 草稿层：live 与 pending 取较大权重（同色，叠加只会变深）
+      const draft = wl > wp ? wl : wp;
+      if (draft >= MASK_MIN_WEIGHT) {
+        ctx.globalAlpha = draft * PENDING_MASK_ALPHA;
+        ctx.fillStyle = tokens.sky;
+      } else {
+        const wa = aw ? aw[i] : 0;
+        if (wa < MASK_MIN_WEIGHT) continue;
+        ctx.globalAlpha = wa * appliedAlpha;
+        ctx.fillStyle = tokens.clay;
+      }
+      ctx.fillRect(c * cellDev, r * cellDev, cellDev, cellDev);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  /*
+   * ---- 2) 外沿轮廓 ----
+   *
+   * 描在"权重刚过 MASK_MIN_WEIGHT"的位置而不是 0.5：0.5 那圈是**参数变化最快**的
+   * 地方，描上去会形成一条视觉硬线，正是用户要避免的"生硬"。描在最
+   * 外沿只标记区域范围，中间的过渡区留给图像自己去渐变。
+   *
+   * 用连续 stroke 而非逐格 fillRect：相邻格的边界段在格角首尾相接，
+   * 逐段 stroke 才连得成一条折线（逐格填小方块会裂成碎屑）。
+   */
+  const outline = (
+    w: Float32Array | null,
+    color: string,
+    alpha: number,
+    dashed: boolean,
+    skip?: Float32Array | null,
+  ) => {
+    if (!w) return;
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
     ctx.lineWidth = Math.max(1, Math.round(cellDev * 0.07));
     if (dashed) {
       const dash = Math.max(2, Math.round(cellDev * 0.5));
       ctx.setLineDash([dash, dash]);
     }
     ctx.beginPath();
-    const at = (r: number, c: number) =>
-      r < 0 || c < 0 || r >= rows || c >= cols ? 0 : weights[r * cols + c];
+    const at = (r: number, c: number) => {
+      if (r < 0 || c < 0 || r >= rows || c >= cols) return 0;
+      const i = r * cols + c;
+      // 被草稿覆盖的地方不参与已应用轮廓，避免两条轮廓叠在一处
+      if (skip && skip[i] >= MASK_MIN_WEIGHT) return 0;
+      return w[i];
+    };
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const inside = at(r, c) > 0.02;
-        if (inside !== at(r, c + 1) > 0.02) {
+        const inside = at(r, c) >= MASK_MIN_WEIGHT;
+        if (inside !== at(r, c + 1) >= MASK_MIN_WEIGHT) {
           const x = (c + 1) * cellDev;
           ctx.moveTo(x, r * cellDev);
           ctx.lineTo(x, (r + 1) * cellDev);
         }
-        if (inside !== at(r + 1, c) > 0.02) {
+        if (inside !== at(r + 1, c) >= MASK_MIN_WEIGHT) {
           const y = (r + 1) * cellDev;
           ctx.moveTo(c * cellDev, y);
           ctx.lineTo((c + 1) * cellDev, y);
@@ -852,41 +968,21 @@ function drawRegionMask(
     ctx.globalAlpha = 1;
   };
 
-  // 先画已应用（低调、虚线），再画待应用盖在上面（更醒目、实线）
-  paint(appliedField, tokens.clay, tokens.clayDeep, REGION_MASK_ALPHA, 0.4, true);
-  paint(pendingField, tokens.sky, tokens.sky, PENDING_MASK_ALPHA, 0.95, false);
-
   /*
-   * 3) 正在拖的这一笔：alpha 与 pending 同档，但**不画轮廓**。
+   * 轮廓的 alpha 刻意低于"看起来最精神"的 0.95。
    *
-   * 轮廓留给抬手后的 pending —— 拖动时每一帧都在重算外沿，轮廓线会
-   * 一路抖动，反而像坏了。所以"拖"和"已提交"的视觉差就是这圈实线
-   * 轮廓（外加 tag 从无到有）。
-   *
-   * 早先这里取 pending 的 0.75 倍（约 0.21），实测在白格上也几乎看不见，
-   * 用户抱怨的"按着没反应"等于没解决 —— 预览必须一眼可见，0.28 是
-   * 上限内能保证看得清的值。
+   * 轮廓是 1 设备像素的线，它**必然**落在填充格上（格边界就是填充边缘），
+   * source-over 复合后峰值 = lineAlpha + fillAlpha×(1-lineAlpha)。0.95 时
+   * 实测峰值到 187/255 —— 那不是我们设计的上限，会让"标记层最浓的地方"
+   * 变成一个说不清的数字。现在压到 0.75/0.34：峰值降到 ~150/87，
+   * 仍明显高于填充（0.28×weight），"这是范围边界"读得出来，但整层
+   * 的最浓处回到可解释的量级。
    */
-  if (liveWeights) {
-    /*
-     * 只遍历这一笔扫过的包围盒。
-     *
-     * 320 格是 86,400 格，全遍历一遍在 pointermove 里要 20ms+（实测手感
-     * 发滞）；而一笔最多只盖住几千格。包围盒由 growLiveBox 在盖章时
-     * 顺手累加，成本为 0。
-     */
-    const box = liveBox ?? { c0: 0, r0: 0, c1: cols - 1, r1: rows - 1 };
-    ctx.fillStyle = tokens.sky;
-    for (let r = Math.max(0, box.r0); r <= Math.min(rows - 1, box.r1); r++) {
-      for (let c = Math.max(0, box.c0); c <= Math.min(cols - 1, box.c1); c++) {
-        const weight = liveWeights[r * cols + c];
-        if (weight <= 0.02) continue;
-        ctx.globalAlpha = weight * PENDING_MASK_ALPHA;
-        ctx.fillRect(c * cellDev, r * cellDev, cellDev, cellDev);
-      }
-    }
-    ctx.globalAlpha = 1;
-  }
+  // 已应用：虚线（历史痕迹，低调）；被草稿盖住的地方跳过
+  outline(aw, tokens.clayDeep, 0.34, true, lw ?? pw);
+  // 待应用：实线（更亮更肯定）
+  outline(pw, tokens.sky, 0.75, false);
+  // live 也画实线吗？不 —— 拖动中每一帧外沿都在变，画轮廓会抖成"坏掉了"
 }
 
 /**
@@ -896,27 +992,46 @@ function drawRegionMask(
 function drawBrushRing(
   ctx: CanvasRenderingContext2D,
   metrics: CanvasMetrics,
-  cursor: { x: number; y: number; r: number } | null,
+  cursor: { x: number; y: number; core: number; reach: number } | null,
   tokens: CanvasTokens,
 ) {
   if (!cursor) return;
   // ctx 已 scale(eff)，这里的坐标系就是 CSS px，直接用即可
-  const { x: cx, y: cy, r: radius } = cursor;
-  if (radius < 1) return;
+  const { x: cx, y: cy, core, reach } = cursor;
+  if (reach < 1) return;
 
+  /*
+   * 双圈：内圈实线 = 核心半径（权重恒为 1，这里一定改到位），
+   * 外圈虚线 = reach（含羽化带，只是过渡）。
+   *
+   * 早先是单圈且传的是裸半径 —— 比引擎实际重算范围小一个羽化带
+   * （默认 feather=0.55 时小 1.73 倍），用户按圆环判断"我这笔盖到了没"
+   * 必然判断错。现在两档画出来，"核心/过渡"一眼分得开。
+   */
+  // 过渡带：内外圈之间铺一层极淡的草稿色
   ctx.beginPath();
-  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-  ctx.globalAlpha = 0.13;
+  ctx.arc(cx, cy, reach, 0, Math.PI * 2);
+  ctx.arc(cx, cy, core, 0, Math.PI * 2, true);
+  ctx.globalAlpha = 0.07;
   // 刷子模式下画出来的一切都先进"待应用"草稿层，所以圆环用草稿色 --sky，
   // 和它在遮罩层里留下的蓝色选区是同一个语义
   ctx.fillStyle = tokens.sky;
   ctx.fill();
 
-  // 虚线间距随格宽走：固定间距在放大后会变成一串疏点，缩小时又会糊成实线
-  const dash = Math.max(3, Math.min(9, Math.round(metrics.cellCss * 0.5)));
-  ctx.globalAlpha = 0.95;
+  // 内圈核心：实线，稍微实一点
+  ctx.beginPath();
+  ctx.arc(cx, cy, core, 0, Math.PI * 2);
+  ctx.globalAlpha = 0.9;
   ctx.strokeStyle = tokens.sky;
   ctx.lineWidth = metrics.eff >= 1.5 ? 1.5 : 1;
+  ctx.stroke();
+
+  // 外圈 reach：虚线间距随格宽走（固定间距放大后会变成一串疏点，
+  // 缩小时又会糊成实线）
+  const dash = Math.max(3, Math.min(9, Math.round(metrics.cellCss * 0.5)));
+  ctx.beginPath();
+  ctx.arc(cx, cy, reach, 0, Math.PI * 2);
+  ctx.globalAlpha = 0.55;
   ctx.setLineDash([dash, dash]);
   ctx.stroke();
   ctx.setLineDash([]);
@@ -924,7 +1039,7 @@ function drawBrushRing(
   // 圆心十字：大笔刷下更需要一个精确落点
   ctx.globalAlpha = 0.8;
   ctx.fillStyle = tokens.sky;
-  const arm = Math.max(2, Math.round(radius * 0.14));
+  const arm = Math.max(2, Math.round(core * 0.14));
   ctx.fillRect(cx - arm, cy - 0.5, arm * 2, 1);
   ctx.fillRect(cx - 0.5, cy - arm, 1, arm * 2);
   ctx.globalAlpha = 1;
@@ -1161,6 +1276,15 @@ export function usePatternCanvas(
   const brushModeRef = useRef(false);
   const brushAlgorithmRef = useRef<DetailAlgorithm>('crisp');
   const brushRadiusRef = useRef(0.12);
+  /**
+   * 羽化值的 ref 镜像。
+   *
+   * 实时层必须用与引擎同一个 feather 算 band —— 否则按住时画的圈和松手后
+   * 引擎重算的范围又会对不上（这正是缺陷 ① 的一半原因）。走 ref 是为了
+   * 让 stampLive/growLiveBox 这些 useCallback 不必因为 feather 变化而重建。
+   */
+  const featherRef = useRef(0.55);
+  featherRef.current = regionFeather;
 
   /**
    * 推进实时层。
@@ -1430,6 +1554,16 @@ export function usePatternCanvas(
       setBrushModeState((prev) => {
         const v = typeof next === 'function' ? next(prev) : next;
         brushModeRef.current = v;
+        /*
+         * 进刷子模式时自动打开「区域标记」，退出时**保留用户的选择**。
+         *
+         * 为什么进来自动开：刷子模式的整个心智就是"看哪些地方会被重算"，
+         * 标记关着的时候用户刷完看不出区别（尤其重算结果本身很接近）。
+         * 为什么退出不复原：用户可能特意关掉它（不想让标记盖住图案），
+         * 退出时硬切回打开等于把他的选择丢了 —— 下次进来又会"自己变回来"。
+         * 开关本身现在常驻主工具条，任何时候都能手动关（见 PatternCanvas）。
+         */
+        if (v) setShowRegionOverlayState(true);
         if (!v) {
           setBrushCursor(null);
           // 切出刷子模式时清掉实时层：否则那张半成品遮罩会一直挂着，
@@ -1524,11 +1658,16 @@ export function usePatternCanvas(
   /**
    * 100% 时的格子大小。
    *
-   * fill 模式下**同时**受宽度和高度约束：只按宽度算的话，64×54 的图在
+   * fill 模式下**优先**同时受宽度和高度约束：只按宽度算的话，64×54 的图在
    * 1440 宽的中栏里每格约 18px，图高 972px，而可视区只有 566px ——
    * 打开就要滚动才能看全，工作台上"一眼看到整张图"的意义就没了。
    * 所以高度也参与取小值，让整张图刚好铺满可视区（用户仍可放大看细节，
    * 那时才出现滚动条，是符合预期的）。
+   *
+   * 但高度约束只在**还能给出可读格子**时生效（MIN_READABLE_CELL）：手机
+   * 竖屏 64 行的图按高度只能给出 2px/格，夹到地板值 4px 之后画布远窄于
+   * 容器、格子却仍然看不清，等于把宽度白白扔掉还照样要滚。这种情况下
+   * 让宽度说了算，滚动由容器承担。
    *
    * 高度约束只在 useFill 成立、且 hostHeight 是有效值时启用：非 fill 模式
    * 高度本来就由内容决定，拿它算会形成反馈环。
@@ -1547,7 +1686,19 @@ export function usePatternCanvas(
       // 横向滚动条只有在真的溢出时才占位，先按不出现算，留 1 格余量即可
       const availH = Math.max(80, viewportH - FRAME_BORDER - rulerY);
       const fitH = Math.floor(availH / Math.max(1, pattern.rows));
-      fit = Math.min(fitW, fitH);
+      /*
+       * 高度约束只在**它还给出可读格子**时才在窄屏采用。
+       *
+       * 桌面端（含矮窗口）一律保留"整图铺满"：桌面没有"本来就在滚"这回事，
+       * 一打开就能看全整张图是默认值里最有用的那个，即使格子小到 4–5px
+       * 也仍然是可读的整体轮廓，而且用户一放大就能看细节。
+       *
+       * 窄屏上这条交易就不成立了：手机上本来就在滚，而 4px 的格子连标尺
+       * 数字和色号都糊成一团 —— 既没换来"不用滚"，又把宽度白白扔掉
+       * （390 宽下 52 列的图只画到 208px，容器却有 338px）。
+       */
+      const keepHeightConstraint = viewportW >= NARROW_VIEWPORT || fitH >= MIN_READABLE_CELL;
+      if (keepHeightConstraint) fit = Math.min(fitW, fitH);
     }
 
     const base = Math.max(MIN_FIT_CELL, Math.min(MAX_FIT_CELL, fit));
@@ -2349,21 +2500,54 @@ export function usePatternCanvas(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayPattern, editMarks, metrics, showCodes, showGrid, themeTick, scrollTick]);
 
+  /**
+   * 鼠标是否落在"已应用区域"内。
+   *
+   * 用来做 hover 加强：已应用区域常态只有 0.1 的极淡底纹（见
+   * REGION_MASK_IDLE_ALPHA 的注释），移到它上面时才升到 0.2。
+   * 取的是布尔值而不是 hover 对象 —— hover 每移动一格都变，进依赖数组
+   * 会让整层遮罩每格重画一次；只有"进入/离开该区域"才需要重画。
+   */
+  const appliedFocus = !!(
+    hover &&
+    pattern &&
+    regionField?.active &&
+    regionField.w[hover.row * pattern.cols + hover.col] >= MASK_MIN_WEIGHT
+  );
+
   // ---- 区域遮罩层（独立 canvas，绝不画在图案本体上） ----
   useEffect(() => {
     const canvas = maskRef.current;
     if (!canvas || !metrics) return;
     const tokens = readTokens(canvas);
+    /*
+     * 「显不显示区域标记」这个开关只控制**已应用**区域的历史标记。
+     *
+     * 待应用草稿（pending）和拖动中的实时预览（live）**无视这个开关**：
+     * 它们是"正在进行的操作"，不是"历史痕迹"。早先三者一起被开关管着，
+     * 用户一旦关过标记（偏好持久化了 '0'），进刷子拖动就什么都不显示、
+     * 只有工具条数字在涨 —— 那看起来就是"笔刷坏了"。
+     */
     drawRegionMask(
       canvas,
       metrics,
       showRegionOverlay ? regionField : null,
-      showRegionOverlay ? pendingField : null,
-      showRegionOverlay ? liveRef.current : null,
+      pendingField,
+      liveRef.current,
       liveBoxRef.current,
       tokens,
+      appliedFocus,
     );
-  }, [metrics, regionField, pendingField, showRegionOverlay, themeTick, pattern, liveTick]);
+  }, [
+    metrics,
+    regionField,
+    pendingField,
+    showRegionOverlay,
+    appliedFocus,
+    themeTick,
+    pattern,
+    liveTick,
+  ]);
 
   // ---- overlay 绘制：刷子模式画笔刷圆环，否则画 hover 高亮 ----
   useEffect(() => {
@@ -2386,11 +2570,23 @@ export function usePatternCanvas(
       ctx.scale(eff, eff);
       // 归一化 → CSS 像素：半径相对长边，格子是正方形所以单位宽一致
       const unit = metrics.cellCss;
-      const ring = brushCursor
+      // 圆环必须用与引擎同一套几何（核心 + 羽化带），否则按圆环判断会判错
+      const geo = brushCursor
+        ? brushGeometry(
+            brushCursor.x,
+            brushCursor.y,
+            brushCursor.r,
+            cols,
+            rows,
+            featherRef.current,
+          )
+        : null;
+      const ring = geo
         ? {
-            x: brushCursor.x * cols * unit,
-            y: brushCursor.y * rows * unit,
-            r: brushCursor.r * Math.max(cols, rows) * unit,
+            x: geo.cx * unit,
+            y: geo.cy * unit,
+            core: geo.radiusCells * unit,
+            reach: geo.reach * unit,
           }
         : null;
       drawBrushRing(ctx, metrics, ring, tokens);

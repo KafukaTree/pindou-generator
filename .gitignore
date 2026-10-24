@@ -42,3 +42,5 @@ next-env.d.ts
 
 # agent scratch (screenshots, probe scripts) — never shipped
 /.work/
+# 引擎实验室的临时排查脚本（下划线开头），只保留正式门禁与工具
+/tools/engine-lab/_*.mjs

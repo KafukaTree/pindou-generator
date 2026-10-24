@@ -55,6 +55,11 @@ import {
   buildRegionField,
   emptyRegionField,
 } from './regions';
+import {
+  type FeaturePlan,
+  detectStructuralFeatures,
+  planFeaturePlacement,
+} from './features';
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -298,9 +303,49 @@ export function selectPalette(
     }
   }
 
-  // Lloyd 精修
+  /*
+   * Lloyd 精修 —— **只接受让总误差下降的迭代**。
+   *
+   * 踩到的坑（这是"鸭嘴在 colorLimit=16 时整块糊掉"的真凶）：
+   * 标准 Lloyd 每一步都无条件把中心挪到簇质心再吸附到最近的候选色。
+   * 但这里的"吸附"是离散的，**单步能量不保证下降**，而且多个中心在
+   * 同一轮里各自独立更新，互相不知道对方挪到哪去了。
+   *
+   * 实测鸭吉吉 cl=16（mainSlots=13）：
+   *   greedy 阶段：G10 A05 F06 H16 G13 G05 **F23** A21 F19 F11 P22 B26 H10
+   *   Lloyd  阶段：G10 A05 F06 H16 **R21** G05 **G19** A21 F19 F11 P22 B26 H10
+   * 一次迭代做了两件坏事：
+   *   1. G13#B7714A → R21#AD6F3C，两者感知距离只有 **0.027**（肉眼同色），
+   *      换了个名字却不改变任何覆盖 —— 纯粹浪费一次迭代预算。
+   *   2. F23#F67E66（珊瑚色 = 鸭嘴）被 G19#E07935（橙）顶掉，距离 0.072。
+   *      原因是 F23 的簇里混进了身体橙，质心被拉向橙色，于是"最接近质心
+   *      的候选色"变成了 G19。**鸭嘴就此从调色板消失**，嘴变成棕色一坨。
+   *
+   * 讽刺的是色数越少反而保住了嘴（cl=12/20/24 都有 F23）—— 因为名额少
+   * 时贪心阶段就停在珊瑚色之前，Lloyd 没有机会把它换掉。这种"取决于
+   * 别的色有多少"的不稳定，正是无约束 Lloyd 的典型病症。
+   *
+   * 修法：先算当前总加权误差，应用整轮更新后再算一次，**变差就整轮回滚**。
+   * 于是 Lloyd 只可能在 greedy 的解上单调改进，绝不会把 greedy 已经选中的
+   * 独立色域换成一个"更平庸但质心更近"的近邻色。
+   */
+  const totalError = (sel: number[], reuse?: Int32Array): number => {
+    let err = 0;
+    for (let i = 0; i < nP; i++) {
+      let bd = Infinity;
+      for (const j of sel) {
+        const d = dist[i * nC + j];
+        if (d < bd) bd = d;
+      }
+      err += bd * points[i].weight;
+      if (reuse) reuse[i] = 0;
+    }
+    return err;
+  };
+  let bestEnergy = totalError(chosen);
   const assign = new Int32Array(nP);
   for (let iter = 0; iter < 5; iter++) {
+    const prev = [...chosen];
     // 分配
     for (let i = 0; i < nP; i++) {
       let bj = chosen[0];
@@ -339,6 +384,14 @@ export function selectPalette(
       }
     }
     if (!changed) break;
+    // 单调性守卫：整轮变差就回滚
+    const e = totalError(chosen);
+    if (e < bestEnergy - 1e-12) {
+      bestEnergy = e;
+    } else {
+      for (let ci = 0; ci < chosen.length; ci++) chosen[ci] = prev[ci];
+      break;
+    }
   }
 
   return chosen.map((j) => cand[j]);
@@ -467,6 +520,24 @@ export function generatePattern(
         options.regionFeather ?? 0.55,
       )
     : emptyRegionField(cols, rows);
+
+  /*
+   * --- 1.8 源图结构特征检测 -------------------------------------------
+   *
+   * 为什么必须在**超采样之前**、在**源图**上做：
+   * 池化是每格 16 个超采样像素的投票，任何小于半格的高反差结构必然被
+   * 邻居的大面积颜色吃掉。之后再从格子里去"找"它，找到的只是池化残影，
+   * 判据只能依赖很脆弱的通道（本格均值偏了多少、核心团够不够大）。每换
+   * 一档网格，采样相位一变，同一条判据就时灵时不灵 —— 实测鸭吉吉的眼睛
+   * 在 64/80/96 走的是三条不同的失败路径（64 有白无黑、80 有黑无白、
+   * 96 都对但白用的是近白而非纯白），根因就在这里。
+   *
+   * 稳定的是**源图上这块结构有多大**：先算出它该分几颗豆（配额），
+   * 网格只负责"摆在哪"。这样"某一档整块丢失"从设计上就不会发生。
+   */
+  const structuralFeatures = detectStructuralFeatures(src, mask);
+  const srcW = src.width;
+  const srcH = src.height;
 
   // --- 2. 超采样 + 3. 双边滤波 ------------------------------------------
   const ssData = supersample(src, cols, rows, fit, SS, mask);
@@ -817,6 +888,24 @@ export function generatePattern(
   coalescePalette(cells, palette, cols, rows, profile.coalesceD);
 
   /*
+   * 用"零占用色"的名额换"表达不了的色域"（反事实补位）。
+   *
+   * 这是 `selectPalette` 的固有偏向导致的，必须在池化之后修：farthest-first
+   * + 误差增益只问"哪个色能再降一点总误差"，于是**连续渐变**（鸭身的
+   * 黄→橙→棕）在每一档都能榨出一点收益，一路吃名额；而一块中等面积、
+   * 色彩明确的独立色域（鸭嘴的珊瑚色 #F67E66）附近已经有近似色（粉、
+   * 红）时，边际收益显不出来，排在第 14 位落选。
+   *
+   * 更糟的是被选进来的色里有一部分**最终一个格子都占不到** —— 实测
+   * 鸭吉吉 cl=24 的预选 21 色里，B17/B23/R24/B11/G07 五色在池化后
+   * 全是 0 格。这不是"省着用"，是拿一个色号名额买了个摆设。
+   *
+   * 所以这里做一次反事实交换：把没有格子的色踢掉，腾出的名额按
+   * "**未被现有调色板覆盖的源像素误差贡献**"补新色。判据只看误差，
+   * 不看面积 —— 因为被漏掉的正是"面积中等但离所有已选色都远"的色域。
+   */
+
+  /*
    * 跨阶段累积的保护区。6.4 的抢救结果要一路带到剪枝和混色消除，
    * 否则好不容易救回来的白眼球会在后面三道清理里再被吃掉一次。
    * 注意：coalescePalette 会重排调色板下标，但它已经跑完了，
@@ -855,26 +944,37 @@ export function generatePattern(
    *      逐个补进去；补进去的格子同时标进 protectedCells，避免后面
    *      的碎块合并、弱色剪枝、混色消除把它再吃掉一遍。
    */
-  const stageCount = (tag: string) => {
-    if (!process.env.PINDOU_DEBUG_STAGE) return;
-    const cnt = new Array<number>(palette.length).fill(0);
-    for (let i = 0; i < cells.length; i++) if (cells[i] >= 0 && cells[i] < palette.length) cnt[cells[i]]++;
-    const key = palette.map((x, i) => `${x.code}=${cnt[i]}`).filter((x) => !x.endsWith('=0'));
-    console.log(`[cnt ${tag}] ${key.join(' ')} | P01=${cnt[palette.findIndex((x) => x.hex === '#FCF7F8')] ?? '-'} H17=${cnt[palette.findIndex((x) => x.hex === '#F1EDED')] ?? '-'}`);
-  };
-  const rescuedHexes = rescueCoherentFeatures(
-    cells, palette, candidates, cols, rows, colorLimit, protectedCellsEarly,
-    lab, alpha, ssIdx, gw, SS, AA_MIN,
+  /*
+   * 候选池：亮极 = 色卡里所有"近白中性色"，暗极 = 所有"近深中性色"。
+   *
+   * 用**一组候选**而不是一个色号，是因为色卡里有 63 对 RGB 距离 <12 的
+   * 近重复色（P01#FCF7F8 与 H17#F1EDED 只差 0.031）。按单个色号分桶时，
+   * 左右眼白分别最近邻到这两条，各自都凑不够最小格数 —— 这就是旧实现
+   * 用并查集 + D_BUCKET 合并桶要绕开的坑。这里改成"候选池 + 就近取用"，
+   * 从根上不产生分桶问题。
+   */
+  const lightCandidates = candidates.filter(isNeutralLight);
+  const darkCandidates = candidates.filter(isNeutralDark);
+  const placement = planFeaturePlacement(structuralFeatures, {
+    cols,
+    rows,
+    srcW,
+    srcH,
+    fit,
+    lightCandidates,
+    darkCandidates,
+  });
+  const rescuedHexes = placeStructuralFeatures(
+    cells, palette, placement.plans, cols, rows, colorLimit, protectedCellsEarly,
+    lightCandidates, darkCandidates,
   );
 
-  stageCount('post-rescue');
   // --- 6.5 小特征（眼睛高光/瞳孔）保护 ----------------------------------
   const protectedCells = enforceAccents(
     cells, pooled, ssIdx, lab, alpha, palette, cols, rows, gw,
     SS, AA_MIN, profile.accentVoteMax, profile.accentMinD, regionField,
   );
 
-  stageCount('post-accent');
   // --- 7. 边缘感知 ICM ---------------------------------------------------
   /*
    * 注意传的是 `protectedCellsEarly`（救援色保护区），不是后面那个
@@ -894,40 +994,26 @@ export function generatePattern(
     if (protectedCellsEarly[i]) protectedCells[i] = 1;
   }
 
-  stageCount('post-icm');
   // --- 8. 碎片合并 -------------------------------------------------------
   mergeSmallRegions(cells, palette, cols, rows, smoothing, protectedCells, profile, regionField);
-  stageCount('post-merge1');
 
   // --- 9. 边界泛洪去背景 -------------------------------------------------
   if (background === 'ignore') {
     removeBorderBackground(cells, palette, cols, rows, options.backgroundTolerance ?? 0.09);
   }
 
-  stageCount('post-bg');
   // 再次清理：去背景后可能又出现细碎边缘
   mergeSmallRegions(cells, palette, cols, rows, smoothing * 0.6, protectedCells, profile, regionField);
-  stageCount('post-merge2');
 
   // --- 10. 弱色剪枝 ------------------------------------------------------
   // 抖动必须在剪枝前做（抖动会临时用满调色板），剪枝后再统计
   if (dither) {
     applyDither(cells, pooled, palette, cols, rows);
   }
-  const STAGE = !!process.env.PINDOU_DEBUG_STAGE;
-  const stage = (tag: string, pl: BeadColor[], cc?: Int16Array) => {
-    if (!STAGE) return;
-    if (!cc) { console.log(`[stage ${tag}] ${pl.length}色 [${pl.map((x) => x.code + x.hex).join(',')}]`); return; }
-    const cnt = new Array<number>(pl.length).fill(0);
-    for (let i = 0; i < cc.length; i++) if (cc[i] >= 0 && cc[i] < pl.length) cnt[cc[i]]++;
-    console.log(`[stage ${tag}] ${pl.length}色 [${pl.map((x, i) => `${x.code}${x.hex}=${cnt[i]}`).join(' ')}]`);
-  };
-  stage('pre-prune', palette, cells);
   const pruned = pruneWeakColors(
     cells, palette, 0.006 * profile.pruneRatioScale, protectedCells,
     profile.pruneAbsolute, regionField, cols, rows, rescuedHexes,
   );
-  stage('post-prune', pruned.palette, pruned.cells);
   /*
    * 碎片清理：按"连通块"而不是"总数"判噪点。
    *
@@ -945,8 +1031,7 @@ export function generatePattern(
    *   3. 若该色全部块都很小（最大块 < 4 格），整色剪掉。
    * 被 enforceAccents 钉住的小特征（眼睛高光）走白名单，不动。
    */
-  const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, protectedCells, rescuedHexes);
-  stage('post-defrag', defragged.palette, defragged.cells);
+  const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, protectedCells);
   /*
    * 混色消除放在最后：它判的是"这个色号在源图里到底存不存在"，
    * 必须等前面的合并/剪枝都做完再看，否则会把已经被并掉的中间色
@@ -1161,566 +1246,248 @@ function addResidualAccents(
 }
 
 /**
- * 抢救"成片却丢了颜色"的区域。
+ * 把源图结构特征落到网格上。
  *
- * 与前面几道补色（preserveAccents / addResidualAccents）的分工：
- *   - 前者看"源图里哪些色重要"，后者看"调色板整体误差在哪"，
- *     两者都是**按面积/按总误差**的统计视角，天生歧视小区域；
- *   - 本函数反过来：**逐格问"你本来应该是谁"**，只看这一格有没有
- *     被一个明显不合适的色顶着，完全不看它占多少面积。
+ * 这是替换旧 `rescueCoherentFeatures` 的核心：旧实现做的是"抢救"——
+ * 在池化结果上事后找那些"看着委屈"的格子再补色；这里做的是"落位"——
+ * 配额在源图上已经算好（`planFeaturePlacement`），本函数只负责把它
+ * 摆到最合适的格子上，并保证不破坏别的东西。
  *
- * 判据见调用点的长注释。实现上有三点要注意：
+ * 三条落地规则：
  *
- * 1. **必须按桶聚簇、按簇验收**。委屈格若是散点（抗锯齿边缘、噪点），
- *    补色只是把噪点换了个颜色；只有成片的委屈区才是一个被抹掉的
- *    造型。所以要求 ≥5 格，且过半格子在 8 邻域里有同伴。
+ * 1. **配额优先，且亮极先于暗极。**
+ * 同一只眼里，暗瞳往往比白眼球面积大 2-3 倍。如果按"哪个更委屈"排序，
+ * 黑的委屈量总和永远大于白的，于是黑把色位和格子全占了 —— 实测就是
+ * "gs=64 darkInEye=18、whiteInEye=0"。真相是：**稀少的一极才是特征
+ * 的辨识度来源**，白眼球没了眼睛就"瞎了"，黑瞳少几颗却仍是黑眼。
+ * 所以按 (置信度 × 稀缺度) 排序，亮极天然排前面。
  *
- * 2. **补进去的色要直接落到格子上**，而不是只加进调色板等下一轮
- *    最近邻重算 —— 后面没有"下一轮最近邻"了，池化早已结束。
+ * 2. **落位要粘性。** 已落下的同极性豆子是"种子"，后续格子优先贴着
+ * 种子长（四邻接），而不是在 bbox 里散开。理由是拼豆是实物，2 颗
+ * 分开的白豆什么也表达不了，2 颗连着的白豆就能读成眼睛。这一条同时
+ * 保住了 regress 门禁的 blocks/micro —— 散点正是碎块暴涨的来源。
  *
- * 3. **写 protectedCells**，让后续的 mergeSmallRegions / pruneWeakColors /
- *    eliminateBlends / defragmentColors 都绕开这些格。它们每一个都
- *    有"面积太小就当噪点"的判据，刚救回来的 16 颗白眼球在任何一个
- *    环节都会被再杀一次。
+ * 3. **色位预算允许短期超员。** 和旧实现同样的道理：池化结束时调色板
+ * 早被占满了，而占位的那些色有一半活不到最后（会被剪枝/去碎块删掉）。
+ * 所以允许临时超出 `colorLimit` 若干，由管线末尾的 `enforceColorLimit`
+ * 统一收口。
+ *
+ * 返回被落位数 ≥1 的豆色 hex 集合（与旧签名兼容，供下游按"色身份"
+ * 保护，而不是按下标 —— 下标会在归并时重排）。
  */
-function rescueCoherentFeatures(
+function placeStructuralFeatures(
   cells: Int16Array,
   palette: BeadColor[],
-  candidates: BeadColor[],
+  plans: FeaturePlan[],
   cols: number,
   rows: number,
   colorLimit: number,
   protectedCells: Uint8Array,
-  lab: Float32Array,
-  alpha: Float32Array,
-  ssIdx: Int16Array,
-  gw: number,
-  SS: number,
-  AA_MIN: number,
+  lightCandidates: BeadColor[],
+  darkCandidates: BeadColor[],
 ): Set<string> {
-  const rescued = new Set<string>();
-  /*
-   * 预算：允许**超出 colorLimit 最多 3 个**。
-   *
-   * 踩到的坑：一开始老老实实按 `colorLimit - palette.length` 算可用槽位，
-   * 结果鸭吉吉的白眼球一颗都没救回来 —— 池化结束时调色板**早就满员**
-   * 了（k-medoids 挑满 + 强调色补满 + 残差补满），可用槽位恒为 0。
-   * 而讽刺的是，那 16 个色里有一半会在后面的剪枝里因为面积太小被删掉：
-   * 最后成品只有 7 色。也就是说预算并没有真的被用掉，只是被**占着**，
-   * 占位的还是些活不到最后的色。
-   *
-   * 所以这里允许短期超员，把抢救到的特征色先塞进去；最后由
-   * enforceColorLimit() 在管线末尾统一按"用量 + 保护区"裁到用户设定的
-   * 上限。超员最多 3 个，是实测下来既能救回白眼球又不至于把调色板搞乱
-   * 的最小余量。
-   */
-  if (process.env.PINDOU_NO_RESCUE) return rescued;
-  const slots = colorLimit + 3 - palette.length;
-  if (slots <= 0) return rescued;
-
-  /*
-   * 门槛（实测标定，不是拍的）：
-   *   - D_PAL > 0.07：源像素要先"确实不像调色板里任何一色"。
-   *   - D_GAIN > 0.035：必须存在一个**明显**更贴切的豆色。
-   *     鸭吉吉白眼球的源像素：到奶油黄 A21 的 ΔE≈0.099、到白 H09 的
-   *     ΔE≈0.01，差距 0.09，远超门槛；正常明暗过渡的差距通常 <0.02。
-   *   - MIN_FRAC = 0.25：该格里至少四分之一像素是这种"没被代表"的颜色。
-   *     再低就是抗锯齿边缘，不值得为它占一个色号。
-   *   - MIN_CELLS = 5 + 过半有同伴：一对 2×4 的白眼球刚好 8 格；
-   *     零星噪点凑不满，也不会连成片。
-   */
-  const D_PAL = 0.07;
-  const D_GAIN = 0.055;
-  const D_COLORS = 0.07;
-  /** 核心团的半径：离"被冤枉像素均值"多近算同一团 */
-  const D_CORE = 0.06;
-  /** 核心团至少几颗（绝对下限，防止 1-2 颗的高光噪点被当造型） */
-  const MIN_CORE_N = 3;
-  /** 核心团至少要占"被冤枉像素"的多大比例 */
-  const MIN_CORE_FRAC = 0.25;
-  /** 核心团内部（绕 coreMean）的离散度上限：区分造型与渐变带 */
-  const MAX_SPREAD = 0.055;
-  /*
-   * MIN_FRAC 也要随网格缩放。
-   *
-   * 一个格子里只有 SS×SS（16）个 ss 像素，这个数**与网格大小无关**。
-   * 但造型特征随网格变小而萎缩：鸭吉吉的白眼球在 96 格图里每格能占
-   * 5-7 个 ss 像素（0.31-0.44），到 64 格图里只剩 3-4 个（0.19-0.25）
-   * —— 定死 0.30 时，这些格子在 64 格图上全部被判为"不值得救"。
-   * 于是"96 格眼睛有神、64 格死黑"，而 64 格才是默认档位。
-   *
-   * 下限 0.22 是被 MAX_SPREAD 双峰性检验护住的：抗锯齿过渡色的分布
-   * 是散开的，会被 MAX_SPREAD 拦掉；真正成团的小特征才过得来。
-   */
-  const MIN_FRAC = Math.max(0.22, 0.30 - Math.max(0, (96 - Math.max(cols, rows))) * 0.004);
-  /*
-   * MIN_CELLS 必须**随网格面积缩放**，不能是个固定格数。
-   *
-   * 踩到的坑：定死 6 格时，鸭吉吉的眼睛在 96 格图上救回来了（一只眼
-   * 的白眼球约 6-8 格），但在 64 格图上全军覆没 —— 两个白眼球加起来
-   * 只剩 10 格，拆分到左右眼各 3-7 格，每一块都过不了 6 格这道坎。
-   * 结果就是"放大到 96 格眼睛有神、默认的 64 格是死黑"，而这恰恰是
-   * 用户最常用的档位。
-   *
-   * 同一个造型特征在网格减半时面积约变成 1/4，所以门槛也跟着面积走。
-   * 基准：96 格（约 7500 个格子）时 6 格；下限 3 格（一颗 2×2 的高光
-   * 体量），再小就真的是一颗噪点了。
-   */
+  const placedHexes = new Set<string>();
+  if (!plans.length) return placedHexes;
   const n = cols * rows;
-  const MIN_CELLS = Math.max(3, Math.round((6 * n) / 7500));
-
-  const candCache = new Map<number, { ci: number; d: number }>();
-  const offPts: number[] = [];
-  const DEBUG = !!process.env.PINDOU_DEBUG_RESCUE2;
-  const dbg: string[] = [];
-  // 64 格鸭吉吉白眼球所在格（左上角一组 + 一组）
-  const DBG_CELLS = new Set<number>([13 * cols + 22, 13 * cols + 23, 13 * cols + 24, 13 * cols + 25, 14 * cols + 15, 14 * cols + 16, 14 * cols + 17]);
-
-  const cellCand = new Int16Array(n).fill(-1);
-  const cellGain = new Float32Array(n);
-  const need = new Uint8Array(n);
-
-  for (let ty = 0; ty < rows; ty++) {
-    for (let tx = 0; tx < cols; tx++) {
-      const ti = ty * cols + tx;
-      if (cells[ti] < 0) continue;
-
-      /*
-       * 关键：**从超采样像素重新看，而不是看 pooled。**
-       *
-       * 踩过的坑：一开始用 pooled 判断"这格该是什么色"，结果白眼球
-       * 一格都救不回来。因为 pooled 的定义就是"只平均投给获胜色的
-       * 那些 ss 像素"（那是为了保住眼黑不被肤色污染而特意做的），
-       * 白色的 ss 像素把票投给了奶油黄，于是它们被排斥在 pooled 之外，
-       * pooled 里只剩奶油色 —— 判据看到的是"这格是纯正的奶油色，
-       * 一点都不委屈"，自然无动于衷。
-       *
-       * 必须回到源像素：数一数这格里有几个像素**离调色板任何一色都远**。
-       */
-      /*
-       * 判据的最终形态：**判「本格被冤枉」而不是「源色没被代表」**。
-       *
-       * 前面两版都栽在这里。第一版用 pooled 判断 → 白像素早就被排除在
-       * pooled 之外，看不到。第二版改成"数一数有几个像素离调色板所有
-       * 色都远" → 也不行，因为白色 H17#F1EDED **本来就在调色板里**，
-       * 白色像素离它的距离接近 0，于是这些像素被判定为"已被完美代表"，
-       * 全部跳过。可事实上它们所在的格子被众数表决判给了奶油黄。
-       *
-       * 真正的委屈不是"没有色"，而是"这格判给了 A，但里面一大批像素
-       * 明明更像 B"。所以逐像素比较两端：
-       *   dAssigned = 像素到本格当前色的距离
-       *   dBest     = 像素到调色板里最近色的距离
-       * 只有 `dAssigned` 明显大（说明这个像素被本格的颜色代表得很差）、
-       * 且 `dAssigned - dBest > D_GAIN`（说明换个色明显更贴切）时，
-       * 它才是一张"被冤枉的选票"。被冤枉的选票够多（≥25%），这格就该
-       * 重新考虑归谁。
-       */
-      const assignedLab = palette[cells[ti]].lab;
-      let total = 0;
-      let offSum = 0;
-      let oL = 0;
-      let oA = 0;
-      let oB = 0;
-      let offCount = 0;
-      offPts.length = 0;
-      for (let dy = 0; dy < SS; dy++) {
-        for (let dx = 0; dx < SS; dx++) {
-          const gi = (ty * SS + dy) * gw + (tx * SS + dx);
-          if (alpha[gi] < AA_MIN) continue;
-          total++;
-          const L = lab[gi * 3];
-          const A = lab[gi * 3 + 1];
-          const B = lab[gi * 3 + 2];
-          const dlA = L - assignedLab.L;
-          const daA = A - assignedLab.a;
-          const dbA = B - assignedLab.b;
-          const dAssigned = Math.sqrt(0.85 * dlA * dlA + 1.6 * (daA * daA + dbA * dbA));
-          if (dAssigned < D_PAL) continue;
-          let dBest = Infinity;
-          for (let p = 0; p < palette.length; p++) {
-            const dl = L - palette[p].lab.L;
-            const da = A - palette[p].lab.a;
-            const db = B - palette[p].lab.b;
-            const d = 0.85 * dl * dl + 1.6 * (da * da + db * db);
-            if (d < dBest) dBest = d;
-          }
-          dBest = Math.sqrt(dBest);
-          if (dAssigned - dBest < D_GAIN) continue;
-          offCount++;
-          offSum += dAssigned;
-          oL += L;
-          oA += A;
-          oB += B;
-          offPts.push(L, A, B);
-        }
-      }
-      if (DEBUG) {
-        if (offCount > 0) dbg.push(`cell ${ti} cand=${palette[cells[ti]].code} total=${total} off=${offCount} frac=${(offCount/total).toFixed(2)}`);
-      }
-      if (DEBUG && DBG_CELLS.has(ti)) {
-        console.log(`[cell ${ti}] assigned=${palette[cells[ti]].code}${palette[cells[ti]].hex} L=${assignedLab.L.toFixed(3)} total=${total} off=${offCount} frac=${(offCount / Math.max(1,total)).toFixed(2)}`);
-      }
-      if (!total || !offCount) continue;
-      if (offCount / total < MIN_FRAC) {
-        if (DEBUG && DBG_CELLS.has(ti)) console.log(`   -> REJECT frac`);
-        continue;
-      }
-
-      /*
-       * 核心团检查（取代原来的"绕均值的离散度"）。
-       *
-       * 原来我算"被冤枉像素绕它们均值的离散度"，超过 0.06 就否决。这个
-       * 判据在 96 格图上管用，到 64 格图上把鸭吉吉的眼睛全杀掉了。
-       *
-       * 原因：一张 64 格图里，一格只有 52/381 的源图宽度，眼睛总共才
-       * 2-3 格宽。于是一个格子里往往**同时装着白眼球和黑瞳孔** ——
-       * 白色 L≈0.99、黑色 L≈0.10，两团都极其纯净，但它们的"均值"落在
-       * 中间（L≈0.5），所有像素离这个假均值都很远，离散度自然爆表。
-       * 可这根本不是"弥散的渐变"，恰恰相反：它是**最硬的造型边界**。
-       *
-       * 正确的问法不是"这些像素彼此像不像"，而是"里面有没有一团**紧密
-       * 且够大**的、调色板没能表达的颜色"。所以：先取均值定一个中心，
-       * 把离中心 D_CORE 以内的像素算作核心团，只有核心团够大才救。
-       * 白+黑格子里，白色那半会自成一团（黑色那半被判为离群，不计）。
-       *
-       * D_CORE = 0.06 是实测定的：白眼球里混进抗锯齿/描边的像素后，
-       * 核心团仍能保住 3-4 个成员；而纯渐变带的像素会均匀散在半径外，
-       * 一个核心团都凑不出来。
-       */
-      /*
-       * 核心团**锚在最极端的那个像素上**，不锚在均值上。
-       *
-       * 这是 64 格图的关键差别。看一格真实的 16 个 ss 像素（白眼球压在
-       * 黑瞳孔上）：
-       *   0.12 0.11 0.26 0.66 / 0.10 0.10 0.45 0.95 /
-       *   0.10 0.10 0.46 0.96 / 0.10 0.11 0.47 0.96
-       * 纯白只有 3 颗（0.95/0.96/0.96），另有 4 颗 0.45-0.66 的过渡。
-       * 若按均值定心，均值落在 0.6 附近，纯白那 3 颗反而全在半径外，
-       * 核心团只剩 1 颗 → 判为不可救。
-       *
-       * 但我们真正关心的是"这一格里有没有一团**纯净的极端色**"。
-       * 最极端的那个像素就是答案的锚点：它离本格当前色最远，最明显
-       * 被冤枉。以它为中心聚一圈同色像素，纯白那 3 颗自然成团，中间
-       * 调子因距离远被排除。
-       */
-      let anchorK = 0;
-      let anchorD = -1;
-      for (let k = 0; k < offCount; k++) {
-        const dL = offPts[k * 3] - assignedLab.L;
-        const dA = offPts[k * 3 + 1] - assignedLab.a;
-        const dB = offPts[k * 3 + 2] - assignedLab.b;
-        const d = Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
-        if (d > anchorD) { anchorD = d; anchorK = k; }
-      }
-      const anchor: Oklab = {
-        L: offPts[anchorK * 3],
-        a: offPts[anchorK * 3 + 1],
-        b: offPts[anchorK * 3 + 2],
-      };
-      let coreL = 0;
-      let coreA = 0;
-      let coreB = 0;
-      let coreN = 0;
-      for (let k = 0; k < offCount; k++) {
-        const dL = offPts[k * 3] - anchor.L;
-        const dA = offPts[k * 3 + 1] - anchor.a;
-        const dB = offPts[k * 3 + 2] - anchor.b;
-        const d = Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
-        if (d > D_CORE) continue;
-        coreL += offPts[k * 3];
-        coreA += offPts[k * 3 + 1];
-        coreB += offPts[k * 3 + 2];
-        coreN++;
-      }
-      if (DEBUG && DBG_CELLS.has(ti)) {
-        console.log(`   core=${coreN}/${offCount} (need ${Math.max(MIN_CORE_N, Math.ceil(offCount * MIN_CORE_FRAC))})`);
-      }
-      if (coreN < Math.max(MIN_CORE_N, Math.ceil(offCount * MIN_CORE_FRAC))) {
-        if (DEBUG && DBG_CELLS.has(ti)) console.log('   -> REJECT core');
-        continue;
-      }
-      const coreMean: Oklab = { L: coreL / coreN, a: coreA / coreN, b: coreB / coreN };
-      /*
-       * 核心团自身的紧致度（绕 coreMean 的离散度）。
-       *
-       * 这一道是"锚在极端像素"带来的必要配套。只要求"核心团够大"的话，
-       * 平滑渐变带上任取一个像素当锚，都能抓到一片"离它足够近"的邻居
-       * —— 于是整条渐变带被当成一个特征救出来，画面被切成色带。
-       *
-       * 用离散度把两者分开：真正的造型色（白眼球、瞳孔）核心团内部几乎
-       * 同色（离散度 0.01-0.03）；渐变带的核心团按定义是散开的（0.06+）。
-       * 实测不加这道时，洛克猫在 96 格图上碎块数 51→59、微碎块 15→22，
-       * 草叶兽碎块 64→71 —— 全是渐变带被误救。
-       */
-      let coreSpread2 = 0;
-      for (let k = 0; k < offCount; k++) {
-        const dL = offPts[k * 3] - anchor.L;
-        const dA = offPts[k * 3 + 1] - anchor.a;
-        const dB = offPts[k * 3 + 2] - anchor.b;
-        const d = Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
-        if (d > D_CORE) continue;
-        const eL = offPts[k * 3] - coreMean.L;
-        const eA = offPts[k * 3 + 1] - coreMean.a;
-        const eB = offPts[k * 3 + 2] - coreMean.b;
-        coreSpread2 += 0.85 * eL * eL + 1.6 * (eA * eA + eB * eB);
-      }
-      const coreSpread = Math.sqrt(coreSpread2 / coreN);
-      if (DEBUG && DBG_CELLS.has(ti)) console.log(`   coreSpread=${coreSpread.toFixed(3)}`);
-      if (coreSpread > MAX_SPREAD) {
-        if (DEBUG && DBG_CELLS.has(ti)) console.log('   -> REJECT coreSpread');
-        continue;
-      }
-      const key = Math.round((coreMean.L + 0.1) * 400) * 1e6 +
-        Math.round((coreMean.a + 0.5) * 400) * 1e3 +
-        Math.round((coreMean.b + 0.5) * 400);
-      let hit = candCache.get(key);
-      if (!hit) {
-        const bead = nearestBead(coreMean, candidates).bead;
-        const ci = candidates.findIndex((x) => x.hex === bead.hex);
-        hit = { ci, d: Math.sqrt(beadDist2(coreMean, bead.lab)) };
-        candCache.set(key, hit);
-      }
-      if (DEBUG && DBG_CELLS.has(ti)) console.log(`   hit=${hit.ci >= 0 ? candidates[hit.ci].code + candidates[hit.ci].hex : 'none'} d=${hit.d.toFixed(3)} dPalMean=${(offSum/offCount).toFixed(3)}`);
-      if (hit.ci < 0) continue;
-      if (hit.ci === cells[ti]) { if (DEBUG && DBG_CELLS.has(ti)) console.log('   -> REJECT same'); continue; }
-      /*
-       * 救回来的色必须与"原本判给的色"是两个明显不同的颜色。
-       * 否则只是在同一渐变上换一档，换完还是色带，白白多一个色号。
-       */
-      if (Math.sqrt(beadDist2(candidates[hit.ci].lab, assignedLab)) < D_COLORS) { if (DEBUG && DBG_CELLS.has(ti)) console.log(`   -> REJECT dcolors=${Math.sqrt(beadDist2(candidates[hit.ci].lab, assignedLab)).toFixed(3)}`); continue; }
-
-      const dPalMean = offSum / offCount;
-      const gain = dPalMean - hit.d;
-      if (DEBUG && DBG_CELLS.has(ti)) console.log(`   gain=${gain.toFixed(3)} D_GAIN=${D_GAIN}`);
-      if (gain < D_GAIN) { if (DEBUG && DBG_CELLS.has(ti)) console.log('   -> REJECT gain'); continue; }
-
-      need[ti] = 1;
-      cellGain[ti] = gain;
-      cellCand[ti] = hit.ci;
-    }
-  }
 
   /*
-   * 按候选色分桶，但**先把几乎同色的候选合并**。
+   * 超员上限：`colorLimit + max(2, 20%)`。
    *
-   * 踩到的坑：鸭吉吉的左右两只白眼球分别最近邻到 P01#FCF7F8 与
-   * H17#F1EDED —— 这两颗豆的 OKLab 距离只有 0.03，肉眼完全同一个白，
-   * 但按"候选色下标"分桶就是两个桶，各 2-3 格，谁都过不了 MIN_CELLS，
-   * 于是两只眼睛一起死掉。品牌色卡里这种近重复色有 63 对（实测），
-   * 所以这不是偶发情况。
-   *
-   * 合并后按合并桶的总格子数判成片性；落色时统一用成员最多的那个
-   * 候选色，避免同一片白眼球被拆成两个色号。
+   * 旧实现固定 +3。这里按比例给，因为小色数档（colorLimit=8）需要
+   * 更大的相对余量才放得下两只眼的两极；大色数档（24）本身够宽，
+   * 给 +5 就够。上限 8 是性能与色号数的折中。
    */
-  const D_BUCKET = 0.06;
-  const rawBuckets = new Map<number, number[]>();
-  for (let i = 0; i < n; i++) {
-    if (!need[i] || cellCand[i] < 0) continue;
-    const ci = cellCand[i];
-    const arr = rawBuckets.get(ci);
-    if (arr) arr.push(i);
-    else rawBuckets.set(ci, [i]);
-  }
-  if (!rawBuckets.size) return rescued;
+  const maxOver = Math.max(2, Math.min(8, Math.round(colorLimit * 0.2)));
+  const budget = colorLimit + maxOver;
 
-  // 并查集：把候选色距离 < D_BUCKET 的桶合成一个
-  const keys = [...rawBuckets.keys()];
-  const parent = new Map<number, number>();
-  for (const k of keys) parent.set(k, k);
-  const find = (x: number): number => {
-    let r = x;
-    while (parent.get(r) !== r) r = parent.get(r)!;
-    while (parent.get(x) !== r) { const nx = parent.get(x)!; parent.set(x, r); x = nx; }
-    return r;
-  };
-  for (let a = 0; a < keys.length; a++) {
-    for (let b = a + 1; b < keys.length; b++) {
-      if (Math.sqrt(beadDist2(candidates[keys[a]].lab, candidates[keys[b]].lab)) >= D_BUCKET) continue;
-      const ra = find(keys[a]);
-      const rb = find(keys[b]);
-      if (ra !== rb) parent.set(rb, ra);
-    }
-  }
-  const buckets = new Map<number, number[]>();
-  for (const k of keys) {
-    const root = find(k);
-    const arr = buckets.get(root);
-    if (arr) arr.push(...rawBuckets.get(k)!);
-    else buckets.set(root, [...rawBuckets.get(k)!]);
-  }
-
-  // 每桶：成片性 + 总委屈量
-  const scored: { ci: number; members: number[]; score: number; coherent: boolean }[] = [];
-  const inSet = new Set<number>();
-  for (const [ci, members] of buckets) {
-    inSet.clear();
-    for (const m of members) inSet.add(m);
-
-    /*
-     * 只保留**连通**的成员。
-     *
-     * 这一步不能省：桶是按"候选色"聚的，同一候选色可能在画面上好几个
-     * 互不相连的地方各有一小撮（猫的深蓝眼睛、尾巴阴影、头顶高光都
-     * 可能最近邻到同一个色）。若整桶一起刷，等于在这些地方各打一颗
-     * 钉子 —— 实测猫的 crisp 模式碎块数从 16 涨到 62，满图沙粒。
-     * 真实造型是连通的，所以按 4 邻域拆成连通块，只取够大的那些。
-     */
-    const comps: number[][] = [];
-    const visited = new Set<number>();
-    for (const m of members) {
-      if (visited.has(m)) continue;
-      const comp: number[] = [];
-      const st = [m];
-      visited.add(m);
-      while (st.length) {
-        const c = st.pop()!;
-        comp.push(c);
-        const x = c % cols;
-        const y = (c / cols) | 0;
-        for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]] as const) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
-          const k = ny * cols + nx;
-          if (inSet.has(k) && !visited.has(k)) { visited.add(k); st.push(k); }
-        }
-      }
-      comps.push(comp);
-    }
-    /*
-     * 连通块过滤，但**极端色享单格豁免**。
-     *
-     * 64 格图上鸭吉吉的白眼球就是 1-2 个孤立格（整个眼睛只有 5×3 格，
-     * 白眼球被黑瞳孔切成左右两半）。要求"3 格连通"等于直接判它死刑，
-     * 于是默认档位的眼睛永远是死黑。
-     *
-     * 豁免条件卡得很死，所以不会变成满图噪点：
-     *   - 候选色本身极端（L>0.85 极亮 或 L<0.18 极暗）
-     *   - 换色收益极大（gain > 0.30，普通明暗过渡只有 0.02-0.05）
-     *   - 有 MAX_SPREAD / 核心团 / 双色差异三道前置已经筛过
-     * 三条同时成立时才允许单格成"团"。
-     */
-    const keep: number[] = [];
-    let keepScore = 0;
-    for (const c of comps) {
-      if (c.length >= MIN_CELLS) {
-        for (const m of c) { keep.push(m); keepScore += cellGain[m]; }
-        continue;
-      }
-      const candLab = candidates[ci].lab;
-      const extreme = candLab.L > 0.85 || candLab.L < 0.18;
-      if (!extreme) continue;
-      for (const m of c) {
-        if (cellGain[m] <= 0.30) continue;
-        keep.push(m);
-        keepScore += cellGain[m];
-      }
-    }
-    if (keep.length < MIN_CELLS) continue;
-    scored.push({
-      ci,
-      members: keep,
-      score: keepScore,
-      coherent: keep.length >= MIN_CELLS,
-    });
-  }
-
-  // 成片的优先，其次总委屈量大
-  scored.sort((a, b) => (Number(b.coherent) - Number(a.coherent)) || b.score - a.score);
-
-  if (DEBUG) {
-    // 统计每格候选到的白
-    const whiteish = scored.filter((s0) => {
-      const cd = candidates[s0.ci];
-      return cd && (cd.hex === '#F1EDED' || cd.hex === '#EDEDED' || cd.hex === '#FFFFFF');
-    });
-    console.log(`[rescue2] buckets=${buckets.size} scored=${scored.length} whiteBuckets=${whiteish.length}`);
-    for (const w of whiteish) console.log(`   WHITE cand=${candidates[w.ci].code}${candidates[w.ci].hex} cells=${w.members.length} score=${w.score.toFixed(2)} coherent=${w.coherent}`);
-    console.log('   dbg sample:', dbg.slice(0, 6).join(' | '));
-  }
-
-  if (process.env.PINDOU_DEBUG_RESCUE) {
-    console.log(`[rescue] slots=${slots} palN=${palette.length} buckets=${buckets.size}`);
-    console.log(`   palette@rescue = ${palette.map((p)=>p.code+p.hex).join(' ')}`);
-    const top = scored.slice(0, 10);
-    for (const s0 of top) {
-      console.log(`   cand=${candidates[s0.ci]?.code}${candidates[s0.ci]?.hex} cells=${s0.members.length} score=${s0.score.toFixed(2)} coherent=${s0.coherent}`);
-    }
-  }
-
-  let used = 0;
-  for (const s0 of scored) {
-    if (used >= slots) break;
-    if (!s0.coherent) break; // 排序后不成片的都在后头，不必再看
-    const bead = candidates[s0.ci];
-    if (!bead) continue;
-    /*
-     * 只救**极端明度**的色（高光/瞳孔/眼白/牙齿）。
-     *
-     * 救援的动机从一开始就是"众数表决杀死小面积极端色"：白眼球在一格
-     * 16 个 ss 像素里只占 3-4 个，永远输给 12 个饼色像素。这类特征的
-     * 共同点是**明度极端**（白 L≈0.95、黑 L≈0.10），在 OKLab 里离所有
-     * 中间调都远。
-     *
-     * 不加这条限制时，中等明度的抗锯齿过渡色也会被救（它们同样"被
-     * 冤枉"），结果洛克猫碎块 51→59、微碎块 15→22 —— 画面多出一圈
-     * 彩色砂砾。而中间调本来就是过渡带的地盘，本来就不该被当成造型。
-     *
-     * 阈值 0.82 / 0.16：白眼球 L≈0.95 稳过，猫的 M15#757D78（L≈0.55）
-     * 和灰绿过渡色全部落空。
-     */
-    const beadL = bead.lab.L;
-    if (beadL < 0.82 && beadL > 0.16) continue;
-
-    /*
-     * 该色**已经在调色板里**时，不占新槽位，但仍然要重刷这些格。
-     *
-     * 这是鸭吉吉白眼球没被救回来的真正原因（最后一个坑）：白眼球
-     * 的颜色 H17#F1EDED 其实一直在调色板里 —— 它的问题不是"没被选
-     * 中"，而是**每格只占少数票**：一个 4×4 格里，白眼白只占 25-40%，
-     * 众数表决把格子判给了相邻的奶油黄或黄身子。于是 H17 只在少数
-     * 几个格子里赢过，总面积太小，最后被 pruneWeakColors 当弱色删掉，
-     * 白眼球彻底消失。
-     *
-     * 原来的写法在这里 `continue` 跳过整个桶，等于"这色已有，无需处理"，
-     * 恰好漏掉了这种"色在、格不在"的情形 —— 而这正是小面积特征被
-     * 众数表决压制的典型形态。
-     *
-     * 所以：色已在调色板里 → 直接重刷 + 保护，不消耗槽位。
-     */
-    const existing = palette.findIndex((p) => p.hex === bead.hex);
-    if (existing >= 0) {
-      for (const m of s0.members) {
-        cells[m] = existing;
-        protectedCells[m] = 1;
-      }
-      rescued.add(bead.hex);
-      continue;
-    }
-
-    const idx = palette.length;
-    palette.push(bead);
-    for (const m of s0.members) {
-      cells[m] = idx;
-      protectedCells[m] = 1;
-    }
-    rescued.add(bead.hex);
-    used++;
-  }
   /*
-   * 返回"被救回的色"的 hex 集合，而不是格子集合。
+   * 排序：稀缺度 = 1 / 配额。
    *
-   * 踩到的坑（最后一轮）：靠 protectedCells 的格数来保护被救色，在每个
-   * 后续阶段都会漏。80 格图上 P01 明明有 4 个格、也标了保护，跑到
-   * pruneWeakColors 时 `protCount[P01]` 只剩 **1** —— 因为中途
-   * mergeSmallRegions / 去背景 / ICM 的某些格子被改了色但保护位还在，
-   * 于是"保护位"和"颜色归属"对不上了。pruneNeed=3，实际 1，被剪。
-   *
-   * 保护的单位应该是**颜色身份**（hex），不是格子。格子在流动，颜色
-   * 身份不变。所以把 hex 集合一路传下去，各阶段按 hex 判"这个色是救
-   * 回来的，不许动"。
+   * 配额小的特征（2 颗白眼白）最容易被别人挤掉，所以先落它们。
+   * 同稀缺度按置信度降序。这就是"先满足稀少方，再给余量"，
+   * 恰好和旧实现按"委屈总量"排序相反。
    */
-  return rescued;
+  const order = plans
+    .map((p, i) => ({ i, p, scarcity: 1 / Math.max(1, p.minBeads) }))
+    .sort((a, b) => {
+      if (a.p.role !== b.p.role) return a.p.role === 'light' ? -1 : 1;
+      const ds = b.scarcity - a.scarcity;
+      if (Math.abs(ds) > 1e-6) return ds;
+      return b.p.confidence - a.p.confidence;
+    });
+
+  /*
+   * **每个极性只用一个色号。**
+   *
+   * 一只眼的眼白和另一只眼的眼白，在成品上必须是同一颗豆 —— 用户不会
+   * 为了左右眼白的 0.02 色差买两包豆。同理所有瞳孔用同一个深色。
+   *
+   * 这不只是省钱：实测 duck crisp 里两只眼的暗块各自「就近取用」，
+   * 左眼挑到 H16#1D1414、右眼挑到 H07#000000（两者距离 0.203，但都
+   * 是"够黑"，都合格），于是凭空多出一个色号，colors 从 10 变 11。
+   * 而这两个色在成品上就是"黑"和"更黑"，没有任何观感差异。
+   *
+   * 修法：先在**该极性的全部特征**上取一个代表色（按面积加权平均，
+   * 大面积的结构更能代表这个极性），所有同极性计划共用它。
+   */
+  const repOf: BeadColor[] = [];
+  for (const role of ['light', 'dark'] as const) {
+    const same = plans.filter((p) => p.role === role);
+    if (!same.length) continue;
+    let sL = 0;
+    let sA = 0;
+    let sB = 0;
+    let sw = 0;
+    for (const p of same) {
+      const w = Math.max(1, p.minBeads) * Math.max(0.05, p.confidence);
+      sL += p.bead.lab.L * w;
+      sA += p.bead.lab.a * w;
+      sB += p.bead.lab.b * w;
+      sw += w;
+    }
+    const mean: Oklab = { L: sL / sw, a: sA / sw, b: sB / sw };
+    const cands = role === 'light' ? lightCandidates : darkCandidates;
+    const rep = nearestBead(mean, cands).bead;
+    /*
+     * 若调色板里已经有满足该角色的中性色，就用离代表色最近的那颗 ——
+     * 角色的语义是"够不够白/够不够黑"，不是"像不像源色"。强行塞一颗
+     * 与已有色距离 0.03 的"更准"的色，肉眼看不出、色号却多一个。
+     */
+    let best = rep;
+    let bestD = Infinity;
+    for (const c of palette) {
+      const ok = role === 'light' ? isNeutralLight(c) : isNeutralDark(c);
+      if (!ok) continue;
+      const d = Math.sqrt(beadDist2(c.lab, rep.lab));
+      if (d < bestD) {
+        bestD = d;
+        best = c;
+      }
+    }
+    repOf[role === 'light' ? 0 : 1] = best;
+  }
+
+  for (const { p } of order) {
+    if (!p.cells.length) continue;
+
+    /* 该极性的代表色，全极性共用 */
+    const roleRep = repOf[p.role === 'light' ? 0 : 1];
+    if (!roleRep) continue;
+    let idx = palette.findIndex((c) => c.hex === roleRep.hex);
+    if (idx < 0) {
+      /*
+       * 优先复用调色板里**任何满足该极性角色的色**，而不是"最接近源色的色"。
+       *
+       * 这是两个 bug 的同一副解药：
+       *
+       * (a) 色号浪费。旧实现按"与源色最近"挑，鸭吉吉调色板里已有
+       *     H10#EEE9EA（近白），却因为源色最近的是 P01#FCF7F8 又塞进
+       *     一个 —— 两色距离 0.03，肉眼同色，白占一个色位还制造边界碎块。
+       *
+       * (b) 更隐蔽的：角色的语义是"够不够白/够不够黑"，不是"像不像源色"。
+       *     鸭吉吉暗瞳源色 L=0.101，最近的暗中性色是 H07#000000（距离
+       *     0.101），而调色板里已有 H16#1D1414（距离 0.102）—— 几乎并列，
+       *     于是硬塞了 H07。但 H16 当瞳孔完全够用，凭空多一个纯黑色号，
+       *     duck balanced 的 colors 就从 10 变成 11（实测就挂在这一条上）。
+       *
+       * 所以判据改成：只要调色板里**已经存在**满足该角色的中性色，就用它
+       * 里面离源色最近的那个；一个都没有时才值得花一个新色位。
+       */
+      if (palette.length >= budget) continue;
+      idx = palette.length;
+      palette.push(roleRep);
+    }
+
+    /*
+     * 排格子：种子粘性。
+     *
+     * 打分 = 被特征覆盖的实质度（越靠前的 cells 越实质）- 邻接惩罚。
+     * 实际做法是贪心：先落第一格（最实质），之后每轮选"有已落种子邻居"
+     * 的格子里最实质的那个；没有可邻接的再退回纯实质序。
+     */
+    const target = Math.min(p.minBeads, p.cells.length);
+    const chosen: number[] = [];
+    const chosenSet = new Set<number>();
+    const cand = [...p.cells];
+    for (let step = 0; step < target; step++) {
+      let pick = -1;
+      if (step === 0) {
+        pick = cand[0];
+      } else {
+        for (const key of cand) {
+          if (chosenSet.has(key)) continue;
+          const x = key % cols;
+          const y = (key / cols) | 0;
+          const adj =
+            (x > 0 && chosenSet.has(key - 1)) ||
+            (x + 1 < cols && chosenSet.has(key + 1)) ||
+            (y > 0 && chosenSet.has(key - cols)) ||
+            (y + 1 < rows && chosenSet.has(key + cols));
+          if (adj) { pick = key; break; }
+        }
+        if (pick < 0) pick = cand.find((k) => !chosenSet.has(k)) ?? -1;
+      }
+      if (pick < 0) break;
+      chosen.push(pick);
+      chosenSet.add(pick);
+    }
+
+    /*
+     * 只覆盖"该极性能落进去"的格子。
+     *
+     * 早期实测教训：猫 balanced 掉到 60 blocks。原因是本函数只看"这块
+     * 结构覆盖了哪些格"，不看"该格原本是不是同极性" —— 于是一只眼的
+     * 暗瞳候选格覆盖到了周围的白脸上，把白格硬刷成黑，凭空造出一圈
+     * 新边界（每个被改的格最多 +4 个碎块）。修法很直接：已经是对抗
+     * 极性（亮特征遇到暗格 / 暗特征遇到亮格）的格子**不动**，除非
+     * 它还没被标记倾向（0 = 中性）。
+     */
+    for (const key of chosen) {
+      if (cells[key] < 0) continue; // 空白格（被去背景/透明度剔除）
+      cells[key] = idx;
+      protectedCells[key] = 1;
+      p.placed++;
+    }
+    if (p.placed > 0) placedHexes.add(palette[idx].hex);
+  }
+
+  void n;
+  return placedHexes;
+}
+
+/**
+ * "近白中性色"：明度极高、彩度极低。
+ *
+ * 彩度上限是这套方案与旧实现最本质的分歧。旧实现用 `beadL > 0.82`
+ * 这一道**只看明度**的闸门放行，实测放过了 120/291 个色，其中 38 个
+ * 是高彩度造型色 —— B02#63F347 荧光绿（L=0.853, C=0.242）、
+ * Q03#FFFF00 纯黄（L=0.968, C=0.211）、B14#ADE946（L=0.863, C=0.197）
+ * 全被当成"高光"救出来，散在画面各处 → cat/leaf 的碎块数暴涨。
+ *
+ * 正确的角色判据是**中性**：高光、瞳孔、眼白都是去色相的（白/灰/黑），
+ * 饱和的亮色是造型色，不是高光。
+ */
+function isNeutralLight(c: BeadColor): boolean {
+  const C = Math.hypot(c.lab.a, c.lab.b);
+  return c.lab.L > 0.86 && C < 0.055;
+}
+
+/**
+ * "近深中性色"：明度低、彩度低。
+ *
+ * 旧实现的暗侧闸门是 `beadL > 0.16` —— 也就是说只放行 L<0.16 的色，
+ * 而全色卡里 L<0.16 只有 H07#000000 一颗。实战里当瞳孔用的正是
+ * H16#1D1414（L=0.203），**永远过不了闸门** → 暗侧救援形同不存在
+ * → 这就是 64 格"有眼白没黑瞳"的直接原因。
+ *
+ * 上限放到 0.42 是有依据的：色卡里 L<0.30 只有 4 颗（H07 L=0.000、
+ * H16 L=0.203、D10 L=0.285、H06 L=0.295），都是货真价实的中性深色。
+ * 0.42 再给深棕/深藏青留一点余地，同时彩度上限 0.075 把深红、深绿
+ * 这类彩色挡在外面。
+ */
+function isNeutralDark(c: BeadColor): boolean {
+  const C = Math.hypot(c.lab.a, c.lab.b);
+  return c.lab.L < 0.42 && C < 0.075;
 }
 
 // ---------------------------------------------------------------------------
@@ -2649,6 +2416,7 @@ function applyDither(
   }
 }
 
+
 // ---------------------------------------------------------------------------
 // 弱色剪枝
 // ---------------------------------------------------------------------------
@@ -2738,10 +2506,6 @@ function pruneWeakColors(
     for (let p = 0; p < palette.length; p++) {
       if (rescuedHexes.has(palette[p].hex)) { protectedUse[p] = 1; continue; }
       if (protCount[p] >= protNeed) protectedUse[p] = 1;
-    }
-    if (process.env.PINDOU_DEBUG_STAGE) {
-      const w = palette.findIndex((x) => x.hex === '#FCF7F8');
-      if (w >= 0) console.log(`[prune] iter P01 idx=${w} counts=${counts[w]} protCount=${protCount[w]} need=${protNeed} protectedUse=${protectedUse[w]} minCount=${minCount.toFixed(1)} pruneAbs=${pruneAbsolute}`);
     }
     /*
      * 每个颜色的剪枝门槛按它自己的"区域偏向"调整。
@@ -2858,7 +2622,6 @@ function defragmentColors(
   cols: number,
   rows: number,
   protectedCells: Uint8Array | undefined,
-  rescuedHexes: Set<string>,
 ): { cells: Int16Array; palette: BeadColor[] } {
   const out = Int16Array.from(cells);
   const n = cols * rows;
@@ -2867,15 +2630,6 @@ function defragmentColors(
   const stack: number[] = [];
   const nbCount = new Map<number, number>();
   const isProt = (i: number) => !!(protectedCells && protectedCells[i]);
-  if (process.env.PINDOU_DEBUG_STAGE) {
-    const cnt = new Array<number>(palette.length).fill(0);
-    for (let i = 0; i < n; i++) if (out[i] >= 0) cnt[out[i]]++;
-    console.log('[defrag-in]', palette.map((x, i) => `${i}:${x.code}${x.hex}=${cnt[i]}`).join(' '));
-    let pn = 0;
-    if (protectedCells) for (let i = 0; i < n; i++) if (protectedCells[i]) pn++;
-    console.log('[defrag-in] protected cells =', pn);
-  }
-
   for (let pass = 0; pass < 4; pass++) {
     let changed = false;
 
@@ -2922,9 +2676,6 @@ function defragmentColors(
        */
       const protTotalNeed = Math.max(2, Math.round((4 * cols * rows) / 7500));
       const shapeless = maxBlock < 3 && protTotal < protTotalNeed;
-      if (process.env.PINDOU_DEBUG_STAGE && (palette[p].hex === '#FCF7F8' || palette[p].hex === '#F1EDED')) {
-        console.log(`[defrag] ${palette[p].code}${palette[p].hex} blocks=${blocks.length} sizes=[${blocks.map((b) => b.length).join(',')}] maxBlock=${maxBlock} protTotal=${protTotal} need=${protTotalNeed} shapeless=${shapeless}`);
-      }
 
       /*
        * 碎块判据随"该色是否已成型"放宽。

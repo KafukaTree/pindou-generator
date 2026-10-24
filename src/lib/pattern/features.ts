@@ -1,0 +1,727 @@
+/**
+ * 源图结构特征检测
+ * =================
+ *
+ * 为什么要在**源图**上单独做一层特征检测，而不是继续在池化结果上"事后救援"：
+ *
+ * 池化是 4×4=16 个超采样像素的众数表决，任何面积小于半格的高反差特征都
+ * 必然被邻近的大面积颜色吃掉。之后再从格子里去"找"它，找到的其实是池化的
+ * 残影 —— 判据只能依赖很脆弱的通道（本格均值偏了多少、核心团够不够大），
+ * 而且每换一个网格档位，采样相位一变，同一条判据就时灵时不灵。
+ * 实测鸭吉吉的眼睛在 64 / 80 / 96 三档走的是三条不同的失败路径：
+ *   64：白活黑死（黑瞳被当作散块溶掉）
+ *   80：黑活白死（白眼球在剪枝时保护位只剩 1 格，need=3 被剪）
+ *   96：都活，但白用的是 H10 而不是源图上那颗纯白
+ *
+ * 真正稳定的量是**源图上这个结构有多大**。所以这里先在源图上把"必须存在于
+ * 成品里的结构"找出来（`StructuralFeature`），算出它应该分到几颗豆子
+ * （配额 `minBeads` 由 detect 之后的调用方按网格换算），再交给网格去解决
+ * "摆在哪"。这样"某一档整块丢失"从设计上就不可能发生 —— 配额是先算的。
+ *
+ * 判据（全部实测标定）：
+ *   1. 中性色：近白 L>0.925 且 C<0.055；近深 L<0.35 且 C<0.075。
+ *      高彩度色（荧光绿 B02 C=0.242、纯黄 Q03 C=0.211）永远不是高光/瞳孔，
+ *      它们是造型色 —— 这是旧实现最大的漏洞（L>0.82 会放行 120 个色，
+ *      其中 38 个高彩度）。
+ *   2. 面积小：占画面 5e-5 ～ 6e-3。太大的是主体（猫的白脸 12905px、
+ *      龟壳亮面 5782px），它们本来就由大面积色承担，不需要配额保护。
+ *   3. 与外围强对比：2px 环平均色差 ≥ 0.30。实测鸭吉吉白眼球 0.478-0.595、
+ *      瞳孔 0.562-0.623；而猫白脸只有 0.088-0.201，自动排除。
+ *   4. 多尺度稳定：sigma=0 / 0.6 / 1.2 至少两个尺度检出，质心偏移 ≤2px
+ *      （原图像素）。单尺度才有的多半是抗锯齿/JPEG 噪点。
+ *   5. 配对：亮结构与暗结构的质心距离 ≤16px 且 |L̄亮 − L̄暗| ≥ 0.35
+ *      —— 显式表达"亮色紧邻深色"这个眼睛的结构定义。
+ *
+ * 性能：检测在长边 ≤512 的副本上做（512×512 的样图完全不降采样），
+ * 三道高斯 + 连通域都是 O(N)，320 格时也不会在 5120×5120 的超采样缓冲上跑。
+ */
+import { srgbToLinear, type Oklab } from '@/lib/color/oklab';
+import type { BeadColor } from '@/lib/color/palette';
+
+export type FeatureRole = 'light' | 'dark';
+
+export interface StructuralFeature {
+  role: FeatureRole;
+  /** 核心平均色（OKLab，源图坐标系） */
+  lab: Oklab;
+  /** 包围盒（源图像素，闭区间） */
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** 质心（源图像素） */
+  cx: number;
+  cy: number;
+  /** 面积（源图像素） */
+  area: number;
+  /** 与外围 2px 环的平均感知对比（OKLab 距离） */
+  contrast: number;
+  /** 多尺度稳定度 0..1 */
+  stability: number;
+  /** 采信度：面积、对比、稳定的合成，用于配额取舍 */
+  confidence: number;
+  /** 配对的反极性特征下标，-1 = 无 */
+  partner: number;
+}
+
+export interface DetectOptions {
+  /** 检测副本的长边上限（性能护栏） */
+  maxEdge?: number;
+  /** 最小面积占画面比例 */
+  minAreaFrac?: number;
+  /** 最大面积占画面比例（超过就认为是主体而不是小特征） */
+  maxAreaFrac?: number;
+  /** 与外围环的最小对比 */
+  minContrast?: number;
+  /** 配对的最大质心距离（源图像素） */
+  pairRadius?: number;
+  /** 配对要求的最小明度差 */
+  pairMinDeltaL?: number;
+  /** 配对两块面积的比值上限（超过就不是"同一只眼的亮暗两半"） */
+  pairMaxAreaRatio?: number;
+}
+
+const NEAR_WHITE = (L: number, C: number) => L > 0.925 && C < 0.055;
+const NEAR_DARK = (L: number, C: number) => L < 0.35 && C < 0.075;
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/**
+ * 可分离高斯模糊（3 通道 Float32，边界钳制）。
+ * sigma 以检测副本的像素为单位。
+ */
+function blur3(
+  src: Float32Array,
+  w: number,
+  h: number,
+  sigma: number,
+): Float32Array {
+  if (sigma <= 0.01) return src;
+  const r = Math.max(1, Math.ceil(sigma * 2.6));
+  const k = new Float32Array(r * 2 + 1);
+  let sum = 0;
+  for (let i = -r; i <= r; i++) {
+    const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+    k[i + r] = v;
+    sum += v;
+  }
+  for (let i = 0; i < k.length; i++) k[i] /= sum;
+
+  const tmp = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      let a0 = 0;
+      let a1 = 0;
+      let a2 = 0;
+      for (let i = -r; i <= r; i++) {
+        let xx = x + i;
+        if (xx < 0) xx = 0;
+        else if (xx >= w) xx = w - 1;
+        const o = (row + xx) * 3;
+        const wgt = k[i + r];
+        a0 += src[o] * wgt;
+        a1 += src[o + 1] * wgt;
+        a2 += src[o + 2] * wgt;
+      }
+      const d = (row + x) * 3;
+      tmp[d] = a0;
+      tmp[d + 1] = a1;
+      tmp[d + 2] = a2;
+    }
+  }
+  const out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let a0 = 0;
+      let a1 = 0;
+      let a2 = 0;
+      for (let i = -r; i <= r; i++) {
+        let yy = y + i;
+        if (yy < 0) yy = 0;
+        else if (yy >= h) yy = h - 1;
+        const o = (yy * w + x) * 3;
+        const wgt = k[i + r];
+        a0 += src[o] * wgt;
+        a1 += src[o + 1] * wgt;
+        a2 += src[o + 2] * wgt;
+      }
+      const d = (y * w + x) * 3;
+      out[d] = a0;
+      out[d + 1] = a1;
+      out[d + 2] = a2;
+    }
+  }
+  return out;
+}
+
+interface RawComp {
+  area: number;
+  cx: number;
+  cy: number;
+  lab: Oklab;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** 4 邻域连通域；test 决定某像素是否属于该极性 */
+function components(
+  lab: Float32Array,
+  alpha: Float32Array,
+  w: number,
+  h: number,
+  test: (L: number, C: number) => boolean,
+  minArea: number,
+): RawComp[] {
+  const n = w * h;
+  const seen = new Uint8Array(n);
+  const out: RawComp[] = [];
+  const stack: number[] = [];
+  const member: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (seen[i] || alpha[i] < 0.9) continue;
+    const L0 = lab[i * 3];
+    const A0 = lab[i * 3 + 1];
+    const B0 = lab[i * 3 + 2];
+    if (!test(L0, Math.hypot(A0, B0))) continue;
+    member.length = 0;
+    stack.length = 0;
+    stack.push(i);
+    seen[i] = 1;
+    let sx = 0;
+    let sy = 0;
+    let sL = 0;
+    let sA = 0;
+    let sB = 0;
+    let x0 = w;
+    let y0 = h;
+    let x1 = -1;
+    let y1 = -1;
+    while (stack.length) {
+      const k = stack.pop()!;
+      member.push(k);
+      const x = k % w;
+      const y = (k / w) | 0;
+      sx += x;
+      sy += y;
+      sL += lab[k * 3];
+      sA += lab[k * 3 + 1];
+      sB += lab[k * 3 + 2];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      const push = (kk: number) => {
+        if (seen[kk] || alpha[kk] < 0.9) return;
+        const L = lab[kk * 3];
+        const A = lab[kk * 3 + 1];
+        const B = lab[kk * 3 + 2];
+        if (!test(L, Math.hypot(A, B))) return;
+        seen[kk] = 1;
+        stack.push(kk);
+      };
+      if (x > 0) push(k - 1);
+      if (x + 1 < w) push(k + 1);
+      if (y > 0) push(k - w);
+      if (y + 1 < h) push(k + w);
+    }
+    if (member.length < minArea) continue;
+    const m = member.length;
+    out.push({
+      area: m,
+      cx: sx / m,
+      cy: sy / m,
+      lab: { L: sL / m, a: sA / m, b: sB / m },
+      x0,
+      y0,
+      x1,
+      y1,
+    });
+  }
+  return out;
+}
+
+const oklabDist = (p: Oklab, c: Oklab): number => {
+  const dL = p.L - c.L;
+  const dA = p.a - c.a;
+  const dB = p.b - c.b;
+  return Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
+};
+
+/**
+ * 在源图上提取"必须在成品里存在"的结构特征。
+ *
+ * `mask` 可选（不透明图的外景遮罩），与 alpha 相乘。返回值坐标全部是
+ * **源图像素**，调用方负责按 supersample 的同一套映射投影到网格。
+ */
+export function detectStructuralFeatures(
+  img: ImageData,
+  mask?: Float32Array | null,
+  opts: DetectOptions = {},
+): StructuralFeature[] {
+  const maxEdge = opts.maxEdge ?? 512;
+  const minAreaFrac = opts.minAreaFrac ?? 5e-5;
+  const maxAreaFrac = opts.maxAreaFrac ?? 6e-3;
+  const minContrast = opts.minContrast ?? 0.3;
+  const pairRadius = opts.pairRadius ?? 16;
+  const pairMinDeltaL = opts.pairMinDeltaL ?? 0.35;
+  const pairMaxAreaRatio = opts.pairMaxAreaRatio ?? 8;
+
+  const sw = img.width;
+  const sh = img.height;
+  const data = img.data;
+  const f = Math.max(1, Math.ceil(Math.max(sw, sh) / maxEdge));
+  const dw = Math.max(2, Math.round(sw / f));
+  const dh = Math.max(2, Math.round(sh / f));
+
+  /* ---- 1. 降采样到检测副本（线性光下箱式平均）---- */
+  const lab = new Float32Array(dw * dh * 3);
+  const alpha = new Float32Array(dw * dh);
+  const accL = new Float64Array(dw * dh * 3);
+  const accA = new Float64Array(dw * dh);
+  for (let sy = 0; sy < sh; sy++) {
+    const dy = Math.min(dh - 1, (sy / f) | 0);
+    for (let sx = 0; sx < sw; sx++) {
+      const dx = Math.min(dw - 1, (sx / f) | 0);
+      const si = (sy * sw + sx) * 4;
+      let a = data[si + 3] / 255;
+      if (a <= 0.004) continue;
+      if (mask) a *= mask[sy * sw + sx];
+      if (a <= 0.002) continue;
+      const di = dy * dw + dx;
+      accL[di * 3] += srgbToLinear(data[si]) * a;
+      accL[di * 3 + 1] += srgbToLinear(data[si + 1]) * a;
+      accL[di * 3 + 2] += srgbToLinear(data[si + 2]) * a;
+      accA[di] += a;
+    }
+  }
+  for (let i = 0; i < dw * dh; i++) {
+    const a = accA[i];
+    if (a <= 1e-9) continue;
+    const o = linearToOklabComponent(accL[i * 3] / a, accL[i * 3 + 1] / a, accL[i * 3 + 2] / a);
+    lab[i * 3] = o[0];
+    lab[i * 3 + 1] = o[1];
+    lab[i * 3 + 2] = o[2];
+    alpha[i] = clamp01(a / (f * f));
+  }
+
+  /* ---- 2. 多尺度连通域 ---- */
+  const sigmas = [0, 0.6 / f, 1.2 / f];
+  const minAreaDet = Math.max(3, Math.round(8 / (f * f)));
+  const perScale: { light: RawComp[]; dark: RawComp[] }[] = [];
+  for (const sg of sigmas) {
+    const blurred = blur3(lab, dw, dh, sg);
+    perScale.push({
+      light: components(blurred, alpha, dw, dh, NEAR_WHITE, minAreaDet),
+      dark: components(blurred, alpha, dw, dh, NEAR_DARK, minAreaDet),
+    });
+  }
+
+  /* ---- 3. 跨尺度聚类 + 过滤 ---- */
+  const imgArea = sw * sh;
+  const features: StructuralFeature[] = [];
+  const take = (role: FeatureRole, idx: number): number => {
+    // 以 sigma=0 的形状为准，其余尺度只用来验证稳定性
+    const base = perScale[0][role][idx];
+    if (!base) return -1;
+    const areaSrc = base.area * f * f;
+    const areaFrac = areaSrc / imgArea;
+    if (areaFrac < minAreaFrac || areaFrac > maxAreaFrac) return -1;
+
+    /*
+     * 环对比：统计组件包围盒外 2px 环里、**不属于本极性**的像素平均色，
+     * 再算核心色与它之间的感知距离。不建精确像素集合，用 bbox 近似足够
+     * —— 环只需要邻域统计量，不需要知道"哪些像素属于本组件"。
+     */
+    const contrast = ringContrastBBox(lab, dw, dh, base, (L, C) =>
+      role === 'light' ? NEAR_WHITE(L, C) : NEAR_DARK(L, C),
+    );
+    if (contrast < minContrast) return -1;
+
+    // 多尺度稳定：另两个尺度里存在质心接近的组件
+    let hits = 1;
+    for (let s = 1; s < perScale.length; s++) {
+      const list = perScale[s][role];
+      for (const c of list) {
+        if (Math.hypot(c.cx - base.cx, c.cy - base.cy) <= 2 / f + 1.5) {
+          hits++;
+          break;
+        }
+      }
+    }
+    const stability = hits / perScale.length;
+
+    const confidence =
+      clamp01(Math.min(1, base.area / 40)) * clamp01((contrast - minContrast) / 0.25) * stability;
+
+    features.push({
+      role,
+      lab: base.lab,
+      x0: base.x0 * f,
+      y0: base.y0 * f,
+      x1: Math.min(sw - 1, base.x1 * f + f - 1),
+      y1: Math.min(sh - 1, base.y1 * f + f - 1),
+      cx: base.cx * f,
+      cy: base.cy * f,
+      area: areaSrc,
+      contrast,
+      stability,
+      confidence,
+      partner: -1,
+    });
+    return features.length - 1;
+  };
+  for (let i = 0; i < perScale[0].light.length; i++) take('light', i);
+  for (let i = 0; i < perScale[0].dark.length; i++) take('dark', i);
+
+  /* ---- 4. 配对：亮结构 + 邻近暗结构 ---- */
+  for (let i = 0; i < features.length; i++) {
+    if (features[i].role !== 'light') continue;
+    let best = -1;
+    let bestD = Infinity;
+    for (let j = 0; j < features.length; j++) {
+      if (features[j].role !== 'dark') continue;
+      const d = Math.hypot(features[j].cx - features[i].cx, features[j].cy - features[i].cy);
+      if (d > pairRadius) continue;
+      if (Math.abs(features[i].lab.L - features[j].lab.L) < pairMinDeltaL) continue;
+      /*
+       * 面积要**可比**（相差 ≤8 倍）。
+       *
+       * 一只瞳孔和它的眼白是同一量级的两块；而"猫身上一大片深色毛
+       * + 旁边一颗浅色高光"面积能差 30 倍，那不是眼的复合结构。
+       * 实测洛克猫两个深色块 901px / 474px 各自配上了一颗 27px 白点，
+       * 于是被误判成 2 只眼、白拿 58 颗配额 —— cat balanced 的
+       * blocks 从 51 涨到 60。鸭吉吉的真眼是 306:106、158:50，都在
+       * 3-7 倍内，这条判据不伤它。
+       */
+      const ratio = features[i].area > features[j].area
+        ? features[i].area / features[j].area
+        : features[j].area / features[i].area;
+      if (ratio > pairMaxAreaRatio) continue;
+      /*
+       * 太弱的配不上"结构"二字，两端都要够硬。
+       *
+       * 门槛 0.30 是实测标定的：鸭吉吉三对复合特征的置信度是
+       * (0.84,1.00) / (1.00,1.00) / (0.50,0.47)，全都过；而龟壳上
+       * "一块亮反光 (0.69) + 一条深色纹路 (0.17)"这种误配对会被挡掉 ——
+       * 它不是眼睛，给它配额反而把龟的 blocks 从 60 顶到 62。
+       */
+      if (features[i].confidence < 0.30 || features[j].confidence < 0.30) continue;
+      if (d < bestD) {
+        bestD = d;
+        best = j;
+      }
+    }
+    if (best >= 0) {
+      features[i].partner = best;
+      features[best].partner = i;
+    }
+  }
+
+  return features;
+}
+
+function ringContrastBBox(
+  lab: Float32Array,
+  w: number,
+  h: number,
+  comp: RawComp,
+  isSamePolarity: (L: number, C: number) => boolean,
+): number {
+  let sL = 0;
+  let sA = 0;
+  let sB = 0;
+  let cnt = 0;
+  for (let y = comp.y0 - 2; y <= comp.y1 + 2; y++) {
+    if (y < 0 || y >= h) continue;
+    for (let x = comp.x0 - 2; x <= comp.x1 + 2; x++) {
+      if (x < 0 || x >= w) continue;
+      const inside = x >= comp.x0 && x <= comp.x1 && y >= comp.y0 && y <= comp.y1;
+      if (inside) continue;
+      const o = (y * w + x) * 3;
+      // 环里只统计"不属于本极性"的像素，避免把同一条亮带的像素算成外围
+      if (isSamePolarity(lab[o], Math.hypot(lab[o + 1], lab[o + 2]))) continue;
+      sL += lab[o];
+      sA += lab[o + 1];
+      sB += lab[o + 2];
+      cnt++;
+    }
+  }
+  if (!cnt) return 0;
+  const dL = comp.lab.L - sL / cnt;
+  const dA = comp.lab.a - sA / cnt;
+  const dB = comp.lab.b - sB / cnt;
+  return Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
+}
+
+/** 线性光 RGB(0..1) → OKLab，避免为了降采样再导入一次转换 */
+function linearToOklabComponent(r: number, g: number, b: number): [number, number, number] {
+  const l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
+  const m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
+  const s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
+  const l_ = Math.cbrt(l);
+  const m_ = Math.cbrt(m);
+  const s_ = Math.cbrt(s);
+  return [
+    0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_,
+  ];
+}
+
+/**
+ * 源图像素坐标 → 网格坐标的映射，与 `supersample(fit='contain')` 完全一致。
+ *
+ * 返回闭区间 [c0,c1]×[r0,r1] 的格子范围，供配额落位时圈定候选格。
+ */
+export function projectFeatureToGrid(
+  feat: StructuralFeature,
+  srcW: number,
+  srcH: number,
+  cols: number,
+  rows: number,
+): { c0: number; c1: number; r0: number; r1: number } {
+  const k = Math.min(cols / srcW, rows / srcH);
+  const cellX = (sx: number) => (cols - srcW * k) / 2 + sx * k;
+  const cellY = (sy: number) => (rows - srcH * k) / 2 + sy * k;
+  const clamp = (v: number, hi: number) => (v < 0 ? 0 : v > hi ? hi : v);
+  return {
+    c0: clamp(Math.floor(cellX(feat.x0)), cols - 1),
+    c1: clamp(Math.ceil(cellX(feat.x1)), cols - 1),
+    r0: clamp(Math.floor(cellY(feat.y0)), rows - 1),
+    r1: clamp(Math.ceil(cellY(feat.y1)), rows - 1),
+  };
+}
+
+export { oklabDist };
+
+// ---------------------------------------------------------------------------
+// 特征 → 豆子配额 → 网格落位
+// ---------------------------------------------------------------------------
+
+/**
+ * 一个源图特征在目标网格上的"占位计划"。
+ *
+ * 这是整条特征链路的交付物：不是一个"要救的色 hex"，而是
+ * "这块结构占哪几格、每格该是亮还是暗、至少几颗"。下游的清理
+ * （剪枝/去碎块/混色消除）只看这份计划，不再各自理解
+ * `protectedCells` / `protectedHexes` / `protectedUse` 三套概念。
+ */
+export interface FeaturePlan {
+  role: FeatureRole;
+  /** 亮/暗两极里应该用的豆色（由调用方按 brand 提供） */
+  bead: BeadColor;
+  /** 允许用的候选豆色（近重复色都在里面，避免下标分桶凑不够数） */
+  allowed: BeadColor[];
+  /** 覆盖到的格子（长边顺序扁平下标，去重） */
+  cells: number[];
+  /** 配额：至少要有几颗豆 */
+  minBeads: number;
+  /** 已实际落下的豆数 */
+  placed: number;
+  /** 采信度 */
+  confidence: number;
+  /** 复合特征 id：同一只眼的亮+暗共享同一个 groupId */
+  groupId: number;
+}
+
+export interface PlanOptions {
+  cols: number;
+  rows: number;
+  /** 目标网格覆盖的源图区域（与 supersample 的 fit 一致） */
+  srcW: number;
+  srcH: number;
+  fit: 'contain' | 'cover';
+  /** 亮极候选（全部近白豆色） */
+  lightCandidates: BeadColor[];
+  /** 暗极候选（全部近深豆色） */
+  darkCandidates: BeadColor[];
+  /** 该极性至少几颗 —— 由面积预算算出，小于 1 按 1 算 */
+  minBeadsFor?: (f: StructuralFeature, cellArea: number) => number;
+}
+
+/**
+ * 源图像素 → 网格格子的映射，与 `resample.ts` 的 `supersample` 严格一致。
+ *
+ * `contain` 时源图等比缩进网格并居中（左右/上下留边），`cover` 时铺满
+ * 并裁掉溢出。这里只算"某源点落在哪一格"，用于把特征投影成格集合。
+ */
+function mapper(srcW: number, srcH: number, cols: number, rows: number, fit: 'contain' | 'cover') {
+  const scale = fit === 'cover' ? Math.max(cols / srcW, rows / srcH) : Math.min(cols / srcW, rows / srcH);
+  const offX = (cols - srcW * scale) / 2;
+  const offY = (rows - srcH * scale) / 2;
+  return { scale, offX, offY };
+}
+
+/**
+ * 把源图特征投影成网格上的「占位计划」。
+ *
+ * 关键点（这是与旧 `rescueCoherentFeatures` 的本质区别）：
+ *   - 旧实现是网格池化完之后，逐格问"你委不委屈"，再按候选色分桶。
+ *     采样相位一变（64/80/96），同一只眼走的路径完全不同，于是出现
+ *     "64 有白无黑、80 有黑无白"这种荒诞结果。
+ *   - 这里先把**源图上这块结构占了多少面积**算成配额，落到网格上时
+ *     只解决"摆在哪"。取样相位只影响形状细节，不影响"它是否存在"。
+ *
+ * 还返回一份按格的极性标记 `polarity`（0=无、1=亮、2=暗），下游的
+ * 约束求解和清理阶段直接读它，不需要再按下标去猜。
+ */
+export function planFeaturePlacement(
+  features: StructuralFeature[],
+  opts: PlanOptions,
+): { plans: FeaturePlan[]; polarity: Uint8Array; groupOf: Int16Array } {
+  const { cols, rows, srcW, srcH, fit, lightCandidates, darkCandidates } = opts;
+  const n = cols * rows;
+  const polarity = new Uint8Array(n);
+  const groupOf = new Int16Array(n).fill(-1);
+  const plans: FeaturePlan[] = [];
+  if (!features.length) return { plans, polarity, groupOf };
+
+  const { scale, offX, offY } = mapper(srcW, srcH, cols, rows, fit);
+  /*
+   * 单格覆盖的源图像素面积 = (1/scale)²。
+   * `scale` 是"源图 1px 占多少格"，所以一格边长覆盖 1/scale 个源像素。
+   * 面积预算是这套方案的核心：`k_f ≈ 特征面积 / cellSrcArea`。
+   */
+  const cellSrcArea = 1 / (scale * scale);
+
+  // 亮/暗按对分组，一只眼 = 一个 group，共享 groupId
+  const groupIdOf = new Int16Array(features.length).fill(-1);
+  let nextGroup = 0;
+  for (let i = 0; i < features.length; i++) {
+    if (groupIdOf[i] >= 0) continue;
+    groupIdOf[i] = nextGroup;
+    const p = features[i].partner;
+    if (p >= 0 && groupIdOf[p] < 0) groupIdOf[p] = nextGroup;
+    nextGroup++;
+  }
+
+  for (let fi = 0; fi < features.length; fi++) {
+    const f = features[fi];
+    /*
+     * **只给"成对"的特征分配配额。**
+     *
+     * 这是整套方案能否不伤回归门禁的关键。单个孤立的高光不是眼睛 ——
+     * 龟壳上的反光（实测 17 个亮特征、面积 142-257px、对比 0.41-0.52）
+     * 全部通过面积/对比/稳定三重检验，但它们本来就被大面积色很好地
+     * 表达了，不需要配额。给它们配额反而会把大色块切碎。
+     *
+     * 而"亮紧邻暗、且明度差 ≥0.35"正是眼睛/牙齿/高光的结构定义 ——
+     * 用户原话要的就是这个：「如果鸭吉吉的眼睛你能保持细节很充分，
+     * 那么这个算法也能过关」。实测鸭吉吉两只眼各是 (白,黑) 复合对，
+     * 猫有 2 对，叶/龟 0 对 —— 判据自动把"不该救的"排除掉了。
+     */
+    if (f.partner < 0) continue;
+    const isLight = f.role === 'light';
+    const cands = isLight ? lightCandidates : darkCandidates;
+    if (!cands.length) continue;
+    const bead = nearestOf(f.lab, cands);
+
+    /*
+     * 配额：`k_f ≈ 面积 / 单格面积`。
+     *
+     * 这是整套方案最值钱的一步 —— 一只眼该分几颗白豆是**先算出来的**，
+     * 然后再解决摆在哪。实测鸭吉吉白核心 156px：gs=64 (53.8px²/格) → 2.9 颗、
+     * gs=80 → 4.5 颗、gs=96 → 6.5 颗。三档都 ≥2，所以三档都该有白。
+     * 旧实现里 64/80 全丢，纯粹是因为它没算过这个预算。
+     *
+     * 下限 1：只要特征通过了检测（面积/对比/稳定三重检验），它就值得
+     * 占一颗豆。上限 48：再大的特征已经是主体色的事，配额再多没意义。
+     */
+    const kRaw = f.area * f.confidence / Math.max(1e-6, cellSrcArea);
+    let minBeads = opts.minBeadsFor
+      ? opts.minBeadsFor(f, cellSrcArea)
+      : Math.round(kRaw);
+    if (minBeads < 1) minBeads = 1;
+    if (minBeads > 48) minBeads = 48;
+
+    /* 投影：遍历 bbox 内的源像素，把通过极性判据的落到格子上 */
+    const x0 = Math.max(0, f.x0 - 1);
+    const y0 = Math.max(0, f.y0 - 1);
+    const x1 = Math.min(srcW - 1, f.x1 + 1);
+    const y1 = Math.min(srcH - 1, f.y1 + 1);
+    const tally = new Map<number, number>();
+    for (let sy = y0; sy <= y1; sy++) {
+      const cy = Math.floor(offY + sy * scale);
+      if (cy < 0 || cy >= rows) continue;
+      for (let sx = x0; sx <= x1; sx++) {
+        const cx = Math.floor(offX + sx * scale);
+        if (cx < 0 || cx >= cols) continue;
+        const key = cy * cols + cx;
+        tally.set(key, (tally.get(key) ?? 0) + 1);
+      }
+    }
+    /*
+     * 只保留"被这块特征实质覆盖"的格子。
+     *
+     * 阈值 0.12 格面积：特征 bbox 里往往还混着主体色，若把 bbox 全部
+     * 算进去，一个 3px 的眼白会被摊成 20 格"候选"，配额就失去意义了。
+     * 0.12 是实测标定 —— 鸭吉吉的眼白在 gs=64 时刚好留下 3-4 格，
+     * gs=96 时 7-8 格，与理论配额同量级。
+     */
+    const cells: number[] = [];
+    const needPix = cellSrcArea * 0.12;
+    for (const [key, cnt] of tally) {
+      if (cnt >= needPix) cells.push(key);
+    }
+    /*
+     * 按"被该特征覆盖的源像素数"降序排。落位时从前往后取，于是豆子
+     * 优先落在特征最实质覆盖的格子上 —— 一只只有 2-3 颗配额的眼白，
+     * 就应该落在亮带的正中，而不是 bbox 边缘的过渡格。
+     */
+    cells.sort((a, b) => (tally.get(b) ?? 0) - (tally.get(a) ?? 0));
+
+    const plan: FeaturePlan = {
+      role: f.role,
+      bead,
+      allowed: cands,
+      cells,
+      minBeads,
+      placed: 0,
+      confidence: f.confidence,
+      groupId: groupIdOf[fi],
+    };
+    const pi = plans.length;
+    plans.push(plan);
+    /*
+     * polarity 按"置信度优先"落标记：高置信度的特征先占格，
+     * 低置信度的不许覆盖它。这样细亮带与相邻黑区不会互相抢同一格。
+     */
+    for (const key of cells) {
+      const want = isLight ? 1 : 2;
+      const have = polarity[key];
+      if (have === 0) {
+        polarity[key] = want;
+        groupOf[key] = plan.groupId;
+      } else if (have === want) {
+        if (groupOf[key] < 0) groupOf[key] = plan.groupId;
+      } else {
+        // 冲突：保留置信度更高的那个
+        const prev = plans.findIndex((p) => p.groupId === groupOf[key] && ((p.role === 'light') === (have === 1)));
+        if (prev >= 0 && plan.confidence > plans[prev].confidence) {
+          polarity[key] = want;
+          groupOf[key] = plan.groupId;
+        }
+      }
+    }
+    void pi;
+  }
+
+  return { plans, polarity, groupOf };
+}
+
+/** 在一组候选里找与 `lab` 最近的（候选含近重复色，避免下标分桶） */
+function nearestOf(lab: Oklab, cands: BeadColor[]): BeadColor {
+  let best = cands[0];
+  let bd = Infinity;
+  for (const c of cands) {
+    const d = oklabDist(lab, c.lab);
+    if (d < bd) {
+      bd = d;
+      best = c;
+    }
+  }
+  return best;
+}

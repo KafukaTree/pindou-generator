@@ -599,7 +599,21 @@ export function PatternCanvas({
       className={['relative flex flex-col gap-2', className].filter(Boolean).join(' ')}
       style={
         fill
-          ? { height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }
+          ? {
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
+              /*
+               * 移动端/窄高容器里，工具条（尤其刷区域那一整块）可能比可用高度
+               * 还高，把下面的画布区挤成一条缝 —— 实测 390×844 进刷子模式后
+               * 画布可视区只剩 4px，手指在上面拖，屏幕上什么都看不到。
+               * 这里让外层自己滚：画布区留着最小可用高度（见 scrollRef 的
+               * minHeight），超出的部分由 host 内部滚动消化，不改页面的总高。
+               */
+              overflowY: 'auto',
+              overscrollBehavior: 'contain',
+            }
           : undefined
       }
     >
@@ -675,6 +689,20 @@ export function PatternCanvas({
           {toggleBtn(showCodes, '色号', () => setShowCodes((v) => !v), '显示/隐藏每颗豆子的色号')}
           {toggleBtn(showGrid, '网格', () => setShowGrid((v) => !v), '显示/隐藏网格线')}
           {toggleBtn(showRulers, '标尺', () => setShowRulers((v) => !v), '显示/隐藏行列标尺')}
+          {/*
+            「区域标记」必须常驻这一排。
+            早先它挂在刷子工具条里，退出刷子模式后按钮消失，而遮罩还在图上
+            —— 用户再也关不掉那块覆盖层（实测：退出后 mask 仍有 56,689 像素
+            在显示，但按钮已经不存在了）。现在和色号/网格/标尺同排，任何时候
+            都能关。pending/live 不受它影响，见 drawRegionMask 的注释。
+          */}
+          {appliedCount > 0 &&
+            toggleBtn(
+              showRegionOverlay,
+              '区域标记',
+              () => setShowRegionOverlay((v) => !v),
+              '显示/隐藏已应用区域的标记（陶土色底纹+虚线轮廓）。待应用草稿与拖动预览不受此开关影响',
+            )}
         </div>
       </div>
 
@@ -970,12 +998,6 @@ export function PatternCanvas({
             >
               清空
             </button>
-            {toggleBtn(
-              showRegionOverlay,
-              '区域标记',
-              () => setShowRegionOverlay((v) => !v),
-              '显示/隐藏区域标记层（已应用=陶土，待应用=蓝色）',
-            )}
           </div>
 
           {/* 两段摘要：已应用（陶土）/ 待应用（天空蓝），状态一眼分得开 */}
@@ -1097,7 +1119,8 @@ export function PatternCanvas({
           // useFill 时由 flex 吃掉父容器剩余高度；否则沿用原来的限高行为
           maxHeight: useFill ? 'none' : 'min(70vh, 780px)',
           flex: useFill ? '1 1 auto' : undefined,
-          minHeight: useFill ? 0 : undefined,
+          // 给画布区留一块**能用手指画**的高度下限（0 会被工具条挤成 4px）
+          minHeight: useFill ? 200 : undefined,
           overflow: 'auto',
           overscrollBehavior: 'contain',
           display: 'flex',
@@ -1349,7 +1372,9 @@ export function PatternCanvas({
                 height: cssH,
                 display: 'block',
                 pointerEvents: 'none',
-                opacity: showRegionOverlay && brushEnabled ? 1 : 0,
+                // 不按 showRegionOverlay 一刀切：那个开关只管"已应用"的历史标记，
+                // 待应用草稿与拖动预览是"正在进行的操作"，必须始终可见
+                opacity: 1,
                 transition: 'opacity 0.12s linear',
               }}
             />
