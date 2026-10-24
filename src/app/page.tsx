@@ -1230,7 +1230,29 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={toggleFocus}
-                    className="px-btn px-btn-ghost"
+                    /*
+                     * `hidden lg:inline-flex` —— 窄屏不显示这个按钮。
+                     *
+                     * 用户反馈：「如果是瘦版本的，那个收回侧边栏还在，点击却
+                     * 没有，这就有点不和谐了」。根因是 `.wb-focus` 那套规则全
+                     * 写在 `@media (min-width:64rem)` 里，而窄屏下 `.wb` 是单列
+                     * flex（不是 grid）、`.wb-left` 是 `display:contents` ——
+                     * 点下去只给 `.wb` 加了 `wb-focus` 类，`grid-template-columns: 0`
+                     * 对 flex 容器没有任何作用，左栏宽度也不归它管，于是就成了
+                     * "按钮在、按了没反应"。
+                     *
+                     * 选择"藏掉"而不是"给窄屏另做一套折叠"：窄屏下三块
+                     * （01 放一张图 / 04 图纸 / 02 参数）本来就是竖着堆的，图纸
+                     * 已经 `order:0` 排在最前、且吃满整宽 —— 收起左栏既不能让
+                     * 画板变大，也没有一个像样的"还原"入口（那条 24px 的竖边条
+                     * 也是 `hidden lg:flex`）。多做一套容易让用户收起来之后找不
+                     * 着路，而这个动作本身在窄屏上没有收益。
+                     *
+                     * 放在 class 里而不是 CSS 的 `[data-testid=...]` 规则：实测
+                     * 那条属性选择器没被编译进产物（dev 的 CSS 逐字节没变），
+                     * 而 Tailwind 工具类一直可靠。
+                     */
+                    className="px-btn px-btn-ghost hidden lg:inline-flex"
                     style={{ width: 32, height: 32, padding: 0, flex: 'none' }}
                     aria-pressed={leftCollapsed}
                     title="收起左侧面板，让图纸占满整行"
