@@ -64,6 +64,14 @@ import {
 } from '@/lib/pattern/blank';
 import { BRANDS, BRAND_META, type Brand } from '@/lib/color/palette';
 import { readStorage, writeStorage } from '@/hooks/useLocalStorage';
+import {
+  clearWorkspaceSession,
+  decodePatternSnapshot,
+  encodePatternSnapshot,
+  readWorkspaceSession,
+  writeWorkspaceSession,
+} from '@/hooks/useWorkspaceSession';
+import { parseHex } from '@/lib/color/oklab';
 import { cn } from '@/lib/utils';
 
 /* ============================================================
@@ -256,18 +264,22 @@ export default function Home() {
    *
    * 状态持久化到 localStorage：折叠是个"工作姿态"，关掉页面再回来应该
    * 还是那个姿势，不该每都会话都重新点一次。
-   */
-  /*
-   * 初始值直接同步读 localStorage，不要放进 useEffect。
    *
-   * 放 effect 里的话首帧渲染的是"展开"，第二帧才收起来 —— 用户会看到
-   * 左栏闪一下再消失。readStorage 内部已处理 SSR（window 不存在时返回
-   * 默认值），所以这里可以同步读。useState 的惰性初始化函数只跑一次，
-   * 也不会每次渲染都碰 localStorage。
+   * ⚠️ 惰性初始化 + SSR 有一个必踩的坑：服务端渲染时 `readStorage` 返回
+   * 默认值 `false`（渲染出"展开"），客户端首次渲染读到 `true`（渲染出
+   * "收起"）—— 两边 HTML 结构不同，React 直接抛
+   * "A tree hydrated but some attributes ... didn't match"。实测只要
+   * localStorage 里存过 `true`，每次刷新都报这条错（控制台红字）。
+   *
+   * 解法是**首次渲染强制与服务端一致**，挂载后再一次性同步到磁盘值：
+   * 代价是多一帧"展开态"，换来不红屏。这不等于回到"放 effect 里"那个
+   * 被否掉的方案 —— 那个是每次渲染都碰磁盘，这里只在挂载跑一次。
    */
-  const [leftCollapsed, setLeftCollapsed] = useState<boolean>(
-    () => readStorage<boolean>(FOCUS_KEY, false) === true,
-  );
+  const [leftCollapsed, setLeftCollapsed] = useState<boolean>(false);
+  useEffect(() => {
+    const saved = readStorage<boolean>(FOCUS_KEY, false) === true;
+    if (saved) setLeftCollapsed(true);
+  }, []);
 
   const toggleFocus = useCallback(() => {
     setLeftCollapsed((prev) => {
@@ -343,6 +355,191 @@ export default function Home() {
     [],
   );
 
+  /* ---------------------------------------------------------------
+   * 工作区会话：刷新后回到刚才那一屏
+   * --------------------------------------------------------------- */
+  /*
+   * 用户原话：「现在刷新就把工作区的东西清除了，没保存状态，不太对，虽然
+   * 能看到历史记录」。
+   *
+   * 这里补的就是"当前这一屏"：图片/空白画布 + 手绘覆盖层 + 区域笔刷。
+   * 参数和主题本来就有各自的键，不重复存（理由见 useWorkspaceSession
+   * 的注释：同一份真相两个副本，一边写失败就会拼出谁都没见过的组合）。
+   *
+   * 为什么用 ref 守"只恢复一次"：这个 effect 的依赖里会有 sourceDataUrl，
+   * 而它自己又 setSourceDataUrl —— 不守就会无限循环。用 ref 而不是 state
+   * 是因为它不需要触发重渲染。
+   */
+  const sessionRestoredRef = useRef(false);
+  /* 恢复时记下当时图纸的行列数，等 pattern 算出来再核对 edits 能不能用 */
+  const sessionDimsRef = useRef<{ cols: number; rows: number } | null>(null);
+
+  /*
+   * 「首帧还没补上状态」的标记。
+   *
+   * 恢复是在 effect 里做的，而 effect 排在首帧绘制之后 —— 所以第一帧
+   * `sourceDataUrl` 还是 null、`hasImage` 是 false，04 面板会闪一下
+   * 「还没有图纸」。用这个标记在那一帧改成不渲染空态（见 mid 面板），
+   * 避免"刷新先闪一句空话再出图"。restore effect 一跑完就置 false。
+   */
+  const [sessionBooting, setSessionBooting] = useState(true);
+  /* restore effect 刚把 sourceDataUrl/blankCanvas 补上（首帧它们还是 null） */
+  const restoredThisTickRef = useRef(false);
+
+  useEffect(() => {
+    if (sessionRestoredRef.current) return;
+    sessionRestoredRef.current = true;
+    const session = readWorkspaceSession();
+    if (!session) {
+      setSessionBooting(false);
+      return;
+    }
+    restoredThisTickRef.current = true;
+    setSessionBooting(false);
+
+    if (session.blankCanvas) {
+      setBlankCanvas(session.blankCanvas);
+      setSourceDataUrl(null);
+      setImageInfo(null);
+    } else if (session.sourceDataUrl) {
+      setBlankCanvas(null);
+      setSourceDataUrl(session.sourceDataUrl);
+      setImageInfo(session.imageInfo);
+    }
+    if (session.regionFeather) setRegionFeather(session.regionFeather);
+    setBrushes(session.brushes);
+    /*
+     * 覆盖层先设上，行列数核对放到 pattern 出来之后（那时才知道引擎
+     * 这次算的是多少行多少列）。空对象直接跳过，避免无谓的重渲染。
+     */
+    if (Object.keys(session.edits).length > 0) {
+      setEdits(session.edits);
+      sessionDimsRef.current =
+        session.patternCols && session.patternRows
+          ? { cols: session.patternCols, rows: session.patternRows }
+          : null;
+    }
+
+    /*
+     * ---- 用快照垫上第一帧 ------------------------------------------
+     *
+     * 这是"刷新后那段动画"的解药：没有快照时，画布要等
+     * 180ms 防抖 + 340ms 引擎 ≈ 500ms 才有东西，中间先显示「还没有图纸」
+     * 再显示「还没有生成图案」。有快照就直接画出来，引擎算完再无缝换掉。
+     *
+     * 只有空白画布**不**用快照：它的 cells 全是 -1，`makeBlankPattern`
+     * 是同步纯函数，本来第一帧就有，走快照反而多一次解码。
+     */
+    if (!session.blankCanvas && session.snapshot) {
+      const decoded = decodePatternSnapshot(session.snapshot, parseHex);
+      /*
+       * 只认行列数一致的快照。参数变了（比如上次是在 96 格算的，
+       * 现在 options 里是 64）时快照就是过期的，画上去会"闪一下旧图
+       * 再跳成新图"。用会话里记的 patternCols/rows 判不了这个 ——
+       * 那俩就是快照自己的尺寸，得跟当前 options 估出来的期望尺寸比。
+       */
+      if (decoded) {
+        setPattern(decoded);
+        sessionDimsRef.current = { cols: decoded.cols, rows: decoded.rows };
+      }
+    }
+  }, []);
+
+  /*
+   * 会话写入：压缩后的图 **算一次就够**。
+   *
+   * 不能把 "压缩" 放进写入 effect：拖一笔改一次 edits 就要重编码一次
+   * canvas（640px PNG 约 30–50ms），编辑模式下会明显卡手。而且压缩结果
+   * 只跟源图有关，跟 edits 无关。
+   */
+  const [compactSource, setCompactSource] = useState<string | null>(null);
+  useEffect(() => {
+    if (!sourceDataUrl) {
+      setCompactSource(null);
+      return;
+    }
+    let cancelled = false;
+    void compressSourceDataUrl(sourceDataUrl)
+      .then((compact) => {
+        if (!cancelled) setCompactSource(compact);
+      })
+      .catch(() => {
+        // 压缩失败（极罕见的解码异常）：退回原图，总比什么都不存强
+        if (!cancelled) setCompactSource(sourceDataUrl);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceDataUrl]);
+
+  /*
+   * 快照编码只在 pattern 变时做一次（不在写入 effect 里现编）。
+   * 320 格图是 8.7 万个格子，每次拖滑杆都编一遍纯属浪费；而 pattern
+   * 变一次本来就意味着引擎刚跑完一轮（几百毫秒），这里几十毫秒不算事。
+   */
+  const patternSnapshot = useMemo(
+    () => (pattern ? encodePatternSnapshot(pattern) : null),
+    [pattern],
+  );
+
+  useEffect(() => {
+    /*
+     * 空态不写：用户点「清空」之后，磁盘上不该还留着上一次的会话，
+     * 否则刷新一下刚才清掉的东西又冒出来。null 直接删键。
+     */
+    if (!blankCanvas && !compactSource) {
+      clearWorkspaceSession();
+      return;
+    }
+    /*
+     * 240ms debounce：编辑模式下每一笔都会改 edits，逐笔写 localStorage
+     * 是同步阻塞（比画一格的耗时还长）。用户松手 240ms 后再落盘，
+     * 刷新前那一下也来得及 —— 而且真正的风险窗口只有"最后一笔之后
+     * 立刻按 F5"，240ms 足够覆盖。
+     */
+    const timer = window.setTimeout(() => {
+      writeWorkspaceSession({
+        version: 1,
+        savedAt: Date.now(),
+        sourceDataUrl: blankCanvas ? null : compactSource,
+        imageInfo: blankCanvas ? null : imageInfo,
+        blankCanvas,
+        edits,
+        patternCols: pattern?.cols ?? null,
+        patternRows: pattern?.rows ?? null,
+        brushes,
+        regionFeather,
+        snapshot: patternSnapshot,
+      });
+    }, 240);
+    return () => window.clearTimeout(timer);
+  }, [
+    blankCanvas,
+    compactSource,
+    imageInfo,
+    edits,
+    pattern,
+    patternSnapshot,
+    brushes,
+    regionFeather,
+  ]);
+
+  /*
+   * 覆盖层与图纸行列数核对。
+   *
+   * edits 是按格子下标存的。如果会话里的图和实际算出来的图行列数不同
+   * （理论上不会，但存储被外部改过、或引擎某天改了网格算法就会出现），
+   * 套上去会得到一堆错位色块 —— 那比"恢复成没涂过的样子"糟得多。
+   */
+  useEffect(() => {
+    const expect = sessionDimsRef.current;
+    if (!expect || !pattern) return;
+    sessionDimsRef.current = null;
+    if (pattern.cols === expect.cols && pattern.rows === expect.rows) return;
+    setEdits(EMPTY_EDITS);
+    toast.warning('图纸尺寸和保存时不一致，手绘的那几笔没法套用，已跳过');
+  }, [pattern]);
+
   // 源图变化 → 解码
   useEffect(() => {
     /*
@@ -352,6 +549,16 @@ export default function Home() {
      * 表现就是"点了新建，中间一片空白，还以为没生效"。
      */
     if (!sourceDataUrl && blankCanvas) return;
+    /*
+     * 首帧的 `sourceDataUrl` 还是 null（恢复是在 effect 里补的），
+     * 这时**不能**清 pattern —— 会把刚解码出来的快照抹掉，
+     * 表现就是"明明存了快照，刷新还是要等引擎算完"。
+     * 只忽略这一轮，下一轮 sourceDataUrl 就有值了。
+     */
+    if (restoredThisTickRef.current && !sourceDataUrl) {
+      restoredThisTickRef.current = false;
+      return;
+    }
     if (!sourceDataUrl) {
       sourceRef.current = null;
       imageDataRef.current = null;
@@ -741,6 +948,12 @@ export default function Home() {
     setError(null);
     setBrushes([]);
     setEdits(EMPTY_EDITS);
+    /*
+     * 清空要**立刻**删会话，不能等下面那个 effect 的 240ms debounce。
+     * 用户点完清空马上关标签页时，debounce 的 timer 还没到就被卸载，
+     * 磁盘上那份会话还在 —— 下次打开又冒出刚才清掉的图。
+     */
+    clearWorkspaceSession();
   }, []);
 
   const hasImage = Boolean(sourceDataUrl) || blankCanvas !== null;
@@ -1183,7 +1396,14 @@ export default function Home() {
               </div>
 
               <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
-                {error ? (
+                {/*
+                 * sessionBooting：会话恢复在 effect 里，首帧还看不到
+                 * sourceDataUrl。这一帧如果照常渲染空态，用户会先看到
+                 * 「还没有图纸」再看到图纸 —— 那正是"刷新像在放动画"的
+                 * 观感来源之一。这一帧宁可什么都不画（背景是纸色，
+                 * 视觉上就是"正在出图"）。
+                 */}
+                {sessionBooting ? null : error ? (
                   <ErrorBlock message={error} onRetry={handleClear} />
                 ) : !hasImage ? (
                   <EmptyStage
