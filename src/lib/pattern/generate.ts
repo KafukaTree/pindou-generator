@@ -311,38 +311,11 @@ export function selectPalette(
   }
 
   /*
-   * Lloyd 精修 —— **按"有效覆盖"评价，而不是按纯误差**。
-   *
-   * 踩到的坑（这是"鸭嘴在 colorLimit=16 时整块糊掉"的真凶）：
-   * 标准 Lloyd 每轮把中心挪到簇质心再吸附到最近候选色。这里的"吸附"
-   * 是离散的，**单步能量不保证下降**，多个中心还在同一轮里互相不知道
-   * 对方去了哪。
-   *
-   * 实测鸭吉吉 cl=16（mainSlots=13）：
-   *   greedy：G10 A05 F06 H16 G13 G05 **F23** A21 F19 F11 P22 B26 H10
-   *   Lloyd ：G10 A05 F06 H16 **R21** G05 **G19** A21 F19 F11 P22 B26 H10
-   * 一次迭代做了两件坏事：
-   *   1. G13#B7714A → R21#AD6F3C，感知距离只有 **0.027**（肉眼同色），
-   *      换了个名字却不改变覆盖 —— 纯粹浪费预算。
-   *   2. F23#F67E66（珊瑚 = 鸭嘴）被 G19#E07935（橙）顶掉，距离 0.072。
-   *      因为 F23 的簇里混进了身体橙，质心被拉向橙色，于是"最接近质心
-   *      的候选色"变成橙色。**鸭嘴就此从调色板消失**，嘴糊成一坨棕。
-   *
-   * 只加"整轮回滚"还不够：那次 F23→G19 的替换**确实降低了总误差**
-   * （橙色点很多，代价小；珊瑚点少，丢失的代价在总误差里微不足道），
-   * 所以纯能量守卫会放行它。总误差这个指标根本不知道"一片独立色域的
-   * 存在价值"高于"渐变区少一点残差"。
-   *
-   * 所以评价函数改成两项：
-   *   1. 加权误差（原有项，权重 1）—— 保整体保真度；
-   *   2. **零覆盖惩罚**：权重占比 < `ZERO_OWN` 的中心视为"白占名额"，
-   *      每个罚 `EMPTY_PENALTY`。一个色号名额本身是稀缺资源，占着却
-   *      一颗豆都落不上，等价于把名额扔了 —— cl=16 的 R21、cl=24 的
-   *      B17/B23/R24/B11/G07 全是 0 命中（G13→R21 那次替换后 R21 的
-   *      簇被 G10/G05 分光，它自己 0 格）。
-   *
-   * 这样"把独立色域换成近邻渐变色"会因为可能制造零覆盖而不再被接受，
-   * 而真正让误差显著下降的替换照常放行。
+   * Lloyd 仍按总误差精修；额外保留有直接源色支持的彩色核心。
+   * 当一个中心匹配的源色核心占总权重 ≥1%、占本簇 ≥20% 时，不允许
+   * 一次精修把它旋转到相差 >15° 的色系。否则小块珊瑚色会被大面积
+   * 橙色梯度拖走，出现中间色数档反而偏色的问题。
+   * 每次移动不加 MIN_SEP；近重复中心仍由末尾的去重补位统一处理。
    */
   /** 每个中心的加权占比（用于识别"白占名额"） */
   const ownership = (sel: number[], own: Float64Array): number => {
@@ -378,6 +351,8 @@ export function selectPalette(
   const score = (sel: number[]): number => totalError(sel);
 
   const own = new Float64Array(chosen.length);
+  const totalWeight = points.reduce((sum, point) => sum + point.weight, 0);
+  const maxHueRotationCos = Math.cos(Math.PI / 12);
   let bestScore = score(chosen);
   const assign = new Int32Array(nP);
   for (let iter = 0; iter < 5; iter++) {
@@ -399,6 +374,7 @@ export function selectPalette(
     let changed = false;
     for (let ci = 0; ci < chosen.length; ci++) {
       let w = 0;
+      let coreWeight = 0;
       let sL = 0;
       let sA = 0;
       let sB = 0;
@@ -406,6 +382,7 @@ export function selectPalette(
         if (assign[i] !== chosen[ci]) continue;
         const pw = points[i].weight;
         w += pw;
+        if (dist[i * nC + chosen[ci]] < 0.035 ** 2) coreWeight += pw;
         sL += points[i].lab.L * pw;
         sA += points[i].lab.a * pw;
         sB += points[i].lab.b * pw;
@@ -415,28 +392,13 @@ export function selectPalette(
       const nb = nearestBead(centroid, cand).bead;
       const nj = cand.indexOf(nb);
       if (nj < 0 || nj === chosen[ci] || chosen.includes(nj)) continue;
-      /*
-       * **Lloyd 也必须遵守 MIN_SEP** —— 这是"鸭嘴消失"的最后一块拼图。
-       *
-       * greedy 阶段有最小间隔约束（新色必须离所有已选色 ≥0.085），但
-       * Lloyd 的中心吸附**没有**。于是 Lloyd 可以把一个中心挪到紧贴
-       * 另一个中心的近重复色上，而这一步照样"降低总误差"（两条几乎
-       * 同色的色平分一片点，每个点的最近距离都略降一点点）。
-       *
-       * 实测鸭吉吉 cl=16 的两处违规：
-       *   G19#E07935 vs G10#D98C39 = **0.052**（肉眼同色，白占一个名额）
-       *   R21#AD6F3C vs B26#8D7A35 = **0.078**
-       * 这两次"横向挪动"没换来任何覆盖，却把独立色域挤出了名额：
-       * F23#F67E66（珊瑚鸭嘴）就是这样被 G19 顶掉的。
-       *
-       * 也就是说 —— 色少时贪心阶段还没来得及走到珊瑚色，Lloyd 也没机会
-       * 破坏它；色多到 13 个名额时两者都发生了，于是"色数越多嘴越糊"
-       * 这个非单调现象出现。
-       *
-       * 修法：候选色必须与**其他所有中心**保持 ≥ MIN_SEP。这条约束与
-       * greedy 完全一致，因此 Lloyd 只会在 greedy 允许的解空间里精修，
-       * 不可能引入 greedy 明确排除的近重复色。
-       */
+      const previous = cand[chosen[ci]].lab;
+      const next = cand[nj].lab;
+      const prevChroma = Math.hypot(previous.a, previous.b);
+      const nextChroma = Math.hypot(next.a, next.b);
+      const hueCos = (previous.a * next.a + previous.b * next.b) / Math.max(1e-9, prevChroma * nextChroma);
+      if (prevChroma > 0.08 && nextChroma > 0.08 && hueCos < maxHueRotationCos &&
+        coreWeight >= totalWeight * 0.01 && coreWeight >= w * 0.2) continue;
       chosen[ci] = nj;
       changed = true;
     }
@@ -1119,25 +1081,23 @@ export function generatePattern(
     fit,
     lightCandidates,
     darkCandidates,
+    strokeCandidates: candidates,
   });
   const rescuedHexes = placeStructuralFeatures(
-    cells, palette, placement.plans, cols, rows, colorLimit, protectedCellsEarly,
+    cells, palette, placement.plans.filter((plan) => plan.strokeFringe === undefined), cols, rows, colorLimit, protectedCellsEarly,
     lightCandidates, darkCandidates,
   );
+
+  const strokeMeans = new Map<number, Oklab>();
+  for (const plan of placement.plans) for (const key of plan.strokeFringe ?? []) {
+    strokeMeans.set(key, { L: pooled[key * 3], a: pooled[key * 3 + 1], b: pooled[key * 3 + 2] });
+  }
 
   // --- 6.5 小特征（眼睛高光/瞳孔）保护 ----------------------------------
   const protectedCells = enforceAccents(
     cells, pooled, ssIdx, lab, alpha, palette, cols, rows, gw,
-    SS, AA_MIN, profile.accentVoteMax, profile.accentMinD, regionField,
+    SS, AA_MIN, profile.accentVoteMax, profile.accentMinD, regionField, protectedCellsEarly,
   );
-  // 窄线已按真实路径落位；同一源线跨格的混色残影继续由 ICM/碎片清理判断，
-  // 不再被少数票强调色重复钉住。其他已确认的结构格仍保留保护。
-  for (const plan of placement.plans) {
-    for (const key of plan.strokeFringe ?? []) {
-      if (!protectedCellsEarly[key]) protectedCells[key] = 0;
-    }
-  }
-
   // --- 7. 边缘感知 ICM ---------------------------------------------------
   /*
    * 注意传的是 `protectedCellsEarly`（救援色保护区），不是后面那个
@@ -1212,6 +1172,31 @@ export function generatePattern(
    * 说明超员的正是被保护的特征色 —— 优先保留它们，裁掉用量最小的
    * 非保护色。
    */
+  // 细线在常规清理后按实际缺失情况落位，优先复用仍在成品中的墨色。
+  // 只处理同一源线的边界混色，并要求相邻替换不增加原始源均值误差。
+  const strokePlans = placement.plans.filter((plan) => plan.strokeFringe !== undefined);
+  placeStructuralFeatures(deblended.cells, deblended.palette, strokePlans, cols, rows, colorLimit,
+    protectedCells, lightCandidates, darkCandidates, protectedCellsEarly);
+  const strokeFixed = new Set(strokePlans.filter((plan) => plan.placed > 0).flatMap((plan) => plan.cells));
+  for (const plan of strokePlans) {
+    if (!plan.placed) continue;
+    for (const key of plan.strokeFringe ?? []) {
+      if (protectedCellsEarly[key] || strokeFixed.has(key) || deblended.cells[key] < 0) continue;
+      protectedCells[key] = 0;
+      const source = strokeMeans.get(key)!;
+      let best = deblended.cells[key];
+      let error = beadDist2(source, deblended.palette[best].lab);
+      const x = key % cols, y = (key / cols) | 0;
+      for (const next of [x>0?key-1:-1,x+1<cols?key+1:-1,y>0?key-cols:-1,y+1<rows?key+cols:-1]) {
+        if (next < 0 || protectedCellsEarly[next] || strokeFixed.has(next)) continue;
+        const color = deblended.cells[next];
+        if (color < 0) continue;
+        const cost = beadDist2(source, deblended.palette[color].lab);
+        if (cost < error) { error = cost; best = color; }
+      }
+      deblended.cells[key] = best;
+    }
+  }
   const clipped = enforceColorLimit(
     deblended.cells, deblended.palette, cols,
     rows, colorLimit, protectedCells,
@@ -1448,10 +1433,17 @@ function placeStructuralFeatures(
   protectedCells: Uint8Array,
   lightCandidates: BeadColor[],
   darkCandidates: BeadColor[],
+  reservedCells = protectedCells,
 ): Set<string> {
   const placedHexes = new Set<string>();
   if (!plans.length) return placedHexes;
   const n = cols * rows;
+  const usage = new Map<BeadColor, number>();
+  for (const cell of cells) {
+    if (cell < 0) continue;
+    const color = palette[cell];
+    usage.set(color, (usage.get(color) ?? 0) + 1);
+  }
 
   /*
    * 超员上限：`colorLimit + max(2, 20%)`。
@@ -1495,7 +1487,7 @@ function placeStructuralFeatures(
    */
   const repOf: BeadColor[] = [];
   for (const role of ['light', 'dark'] as const) {
-    const same = plans.filter((p) => p.role === role);
+    const same = plans.filter((p) => p.role === role && p.strokeFringe === undefined);
     if (!same.length) continue;
     let sL = 0;
     let sA = 0;
@@ -1532,9 +1524,26 @@ function placeStructuralFeatures(
 
   for (const { p } of order) {
     if (!p.cells.length) continue;
+    if (p.strokeFringe !== undefined) {
+      let expressed = 0;
+      for (const key of p.cells) {
+        if (cells[key] >= 0 && palette[cells[key]].lab.L <= p.bead.lab.L + 0.12) expressed++;
+      }
+      // 已完整表达的线不重复加粗；有缺口时仍按源路径补齐。
+      if (expressed === p.cells.length) continue;
+    }
 
     /* 该极性的代表色，全极性共用 */
-    const roleRep = repOf[p.role === 'light' ? 0 : 1];
+    let roleRep = repOf[p.role === 'light' ? 0 : 1];
+    if (p.strokeFringe !== undefined) {
+      roleRep = p.bead;
+      let closest = Infinity;
+      for (const color of palette) {
+        if (!(usage.get(color) ?? 0) || color.lab.L > p.bead.lab.L + 0.20) continue;
+        const distance = beadDist2(p.bead.lab, color.lab);
+        if (distance < closest) { closest = distance; roleRep = color; }
+      }
+    }
     if (!roleRep) continue;
     let idx = palette.findIndex((c) => c.hex === roleRep.hex);
     if (idx < 0) {
@@ -1568,10 +1577,12 @@ function placeStructuralFeatures(
      * 实际做法是贪心：先落第一格（最实质），之后每轮选"有已落种子邻居"
      * 的格子里最实质的那个；没有可邻接的再退回纯实质序。
      */
-    const target = Math.min(p.minBeads, p.cells.length);
+    // 旧逐格强调色只是软提示；已确认的源图亮暗结构才有占位优先权。
+    const cand = p.cells.filter((key) => !reservedCells[key] || (cells[key] >= 0 &&
+      (p.role === 'light' ? isNeutralLight(palette[cells[key]]) : isNeutralDark(palette[cells[key]]))));
+    const target = Math.min(p.minBeads, cand.length);
     const chosen: number[] = [];
     const chosenSet = new Set<number>();
-    const cand = [...p.cells];
     for (let step = 0; step < target; step++) {
       let pick = -1;
       if (step === 0) {
@@ -1611,7 +1622,10 @@ function placeStructuralFeatures(
       protectedCells[key] = 1;
       p.placed++;
     }
-    if (p.placed > 0) placedHexes.add(palette[idx].hex);
+    if (p.placed > 0) {
+      usage.set(palette[idx], (usage.get(palette[idx]) ?? 0) + p.placed);
+      placedHexes.add(palette[idx].hex);
+    }
   }
 
   void n;
@@ -1764,6 +1778,7 @@ function enforceAccents(
   voteMax: number,
   minContrast: number,
   regionField: RegionField,
+  fixedCells?: Uint8Array,
 ): Uint8Array {
   const protectedCells = new Uint8Array(cols * rows);
   const rej: Record<string, number> = { vote: 0, nbr: 0, win: 0, winSame: 0, noCand: 0, lowContrast: 0, cluster: 0, budget: 0, ok: 0 };
@@ -1782,7 +1797,7 @@ function enforceAccents(
     for (let tx = 0; tx < cols; tx++) {
       const ti = ty * cols + tx;
       const main = cells[ti];
-      if (main < 0) continue;
+      if (main < 0 || fixedCells?.[ti]) continue;
 
       votes.fill(0);
       lumSum.fill(0);

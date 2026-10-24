@@ -19,17 +19,17 @@
  * "摆在哪"。这样"某一档整块丢失"从设计上就不可能发生 —— 配额是先算的。
  *
  * 判据（全部实测标定）：
- *   1. 中性色：近白 L>0.925 且 C<0.055；近深 L<0.35 且 C<0.075。
+ *   1. 中性色：近白 L>0.86 且 C<0.055；近深 L<0.35 且 C<0.075。
  *      高彩度色（荧光绿 B02 C=0.242、纯黄 Q03 C=0.211）永远不是高光/瞳孔，
  *      它们是造型色 —— 这是旧实现最大的漏洞（L>0.82 会放行 120 个色，
  *      其中 38 个高彩度）。
  *   2. 面积小：占画面 5e-5 ～ 6e-3。太大的是主体（猫的白脸 12905px、
  *      龟壳亮面 5782px），它们本来就由大面积色承担，不需要配额保护。
- *   3. 与外围强对比：2px 环平均色差 ≥ 0.30。实测鸭吉吉白眼球 0.478-0.595、
+ *   3. 与实际连通区边界强对比：2px 邻域色差的 75% 分位 ≥ 0.30。实测鸭吉吉白眼球 0.478-0.595、
  *      瞳孔 0.562-0.623；而猫白脸只有 0.088-0.201，自动排除。
- *   4. 多尺度稳定：sigma=0 / 0.6 / 1.2 至少两个尺度检出，质心偏移 ≤2px
- *      （原图像素）。单尺度才有的多半是抗锯齿/JPEG 噪点。
- *   5. 配对：亮结构与暗结构的质心距离 ≤16px 且 |L̄亮 − L̄暗| ≥ 0.35
+ *   4. 多尺度稳定：在规范副本上使用 sigma=0 / 0.6 / 1.2，以质心漂移
+ *      检查支持度，避免输入尺寸改变就使用不同的物理尺度。
+ *   5. 配对：亮暗质心距离默认 ≤16 个检测像素且 |L̄亮 − L̄暗| ≥ 0.35
  *      —— 显式表达"亮色紧邻深色"这个眼睛的结构定义。
  *
  * 性能：检测在长边 ≤512 的副本上做（512×512 的样图完全不降采样），
@@ -54,7 +54,7 @@ export interface StructuralFeature {
   cy: number;
   /** 面积（源图像素） */
   area: number;
-  /** 与外围 2px 环的平均感知对比（OKLab 距离） */
+  /** 实际连通区边界邻域的稳健反差（OKLab 距离） */
   contrast: number;
   /** 多尺度稳定度；连续窄线改用双侧前景支持率，范围 0..1。 */
   stability: number;
@@ -62,10 +62,12 @@ export interface StructuralFeature {
   confidence: number;
   /** 配对的反极性特征下标，-1 = 无 */
   partner: number;
-  /** 连续窄线的实际源像素中心，交错存放 x/y；不用 bbox 填满内部。 */
-  strokePixels?: Float32Array;
-  /** 检测副本一个像素在源图上的边长。 */
-  strokePixelSize?: number;
+  /** 连通区实际像素中心（交错 x/y，源图坐标）；缺省时兼容 bbox 投影。 */
+  sourcePixels?: Float32Array;
+  /** 一个检测像素在源图上的边长。 */
+  sourcePixelSize?: number;
+  /** 窄线采用一格宽的路径预算，普通亮暗块仍用面积预算。 */
+  stroke?: boolean;
 }
 
 export interface DetectOptions {
@@ -77,7 +79,7 @@ export interface DetectOptions {
   maxAreaFrac?: number;
   /** 与外围环的最小对比 */
   minContrast?: number;
-  /** 配对的最大质心距离（源图像素） */
+  /** 显式值按源图像素；缺省按检测副本 16px 换算，保持尺度一致。 */
   pairRadius?: number;
   /** 配对要求的最小明度差 */
   pairMinDeltaL?: number;
@@ -85,7 +87,7 @@ export interface DetectOptions {
   pairMaxAreaRatio?: number;
 }
 
-const NEAR_WHITE = (L: number, C: number) => L > 0.925 && C < 0.055;
+const NEAR_WHITE = (L: number, C: number) => L > 0.86 && C < 0.055;
 const NEAR_DARK = (L: number, C: number) => L < 0.35 && C < 0.075;
 
 const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
@@ -177,7 +179,7 @@ function components(
   alpha: Float32Array,
   w: number,
   h: number,
-  test: (L: number, C: number) => boolean,
+  test: (L: number, C: number, index: number) => boolean,
   minArea: number,
   retainPixels = false,
   diagonal = false,
@@ -192,7 +194,7 @@ function components(
     const L0 = lab[i * 3];
     const A0 = lab[i * 3 + 1];
     const B0 = lab[i * 3 + 2];
-    if (!test(L0, Math.hypot(A0, B0))) continue;
+    if (!test(L0, Math.hypot(A0, B0), i)) continue;
     member.length = 0;
     stack.length = 0;
     stack.push(i);
@@ -225,7 +227,7 @@ function components(
         const L = lab[kk * 3];
         const A = lab[kk * 3 + 1];
         const B = lab[kk * 3 + 2];
-        if (!test(L, Math.hypot(A, B))) return;
+        if (!test(L, Math.hypot(A, B), kk)) return;
         seen[kk] = 1;
         stack.push(kk);
       };
@@ -279,7 +281,7 @@ export function detectStructuralFeatures(
   const minAreaFrac = opts.minAreaFrac ?? 5e-5;
   const maxAreaFrac = opts.maxAreaFrac ?? 6e-3;
   const minContrast = opts.minContrast ?? 0.3;
-  const pairRadius = opts.pairRadius ?? 16;
+  const pairRadius = opts.pairRadius;
   const pairMinDeltaL = opts.pairMinDeltaL ?? 0.35;
   const pairMaxAreaRatio = opts.pairMaxAreaRatio ?? 8;
 
@@ -322,14 +324,14 @@ export function detectStructuralFeatures(
   }
 
   /* ---- 2. 多尺度连通域 ---- */
-  const sigmas = [0, 0.6 / f, 1.2 / f];
-  const minAreaDet = Math.max(3, Math.round(8 / (f * f)));
+  const sigmas = [0, 0.6, 1.2];
+  const minAreaDet = 8;
   const perScale: { light: RawComp[]; dark: RawComp[] }[] = [];
   for (const sg of sigmas) {
     const blurred = blur3(lab, dw, dh, sg);
     perScale.push({
-      light: components(blurred, alpha, dw, dh, NEAR_WHITE, minAreaDet),
-      dark: components(blurred, alpha, dw, dh, NEAR_DARK, minAreaDet),
+      light: components(blurred, alpha, dw, dh, NEAR_WHITE, minAreaDet, sg === 0),
+      dark: components(blurred, alpha, dw, dh, NEAR_DARK, minAreaDet, sg === 0),
     });
   }
 
@@ -344,12 +346,8 @@ export function detectStructuralFeatures(
     const areaFrac = areaSrc / imgArea;
     if (areaFrac < minAreaFrac || areaFrac > maxAreaFrac) return -1;
 
-    /*
-     * 环对比：统计组件包围盒外 2px 环里、**不属于本极性**的像素平均色，
-     * 再算核心色与它之间的感知距离。不建精确像素集合，用 bbox 近似足够
-     * —— 环只需要邻域统计量，不需要知道"哪些像素属于本组件"。
-     */
-    const contrast = ringContrastBBox(lab, dw, dh, base, (L, C) =>
+    // 使用真实连通区周围的反差，眼白包围盒内部的黑瞳也计入邻域。
+    const contrast = ringContrastComponent(lab, alpha, dw, dh, base, (L, C) =>
       role === 'light' ? NEAR_WHITE(L, C) : NEAR_DARK(L, C),
     );
     if (contrast < minContrast) return -1;
@@ -359,7 +357,7 @@ export function detectStructuralFeatures(
     for (let s = 1; s < perScale.length; s++) {
       const list = perScale[s][role];
       for (const c of list) {
-        if (Math.hypot(c.cx - base.cx, c.cy - base.cy) <= 2 / f + 1.5) {
+        if (Math.hypot(c.cx - base.cx, c.cy - base.cy) <= 3.5) {
           hits++;
           break;
         }
@@ -370,7 +368,14 @@ export function detectStructuralFeatures(
     const confidence =
       clamp01(Math.min(1, base.area / 40)) * clamp01((contrast - minContrast) / 0.25) * stability;
 
+    const sourcePixels = new Float32Array((base.pixels?.length ?? 0) * 2);
+    for (let i = 0; i < (base.pixels?.length ?? 0); i++) {
+      const p = base.pixels![i];
+      sourcePixels[i * 2] = (p % dw + 0.5) * f;
+      sourcePixels[i * 2 + 1] = (((p / dw) | 0) + 0.5) * f;
+    }
     features.push({
+      sourcePixels, sourcePixelSize: f,
       role,
       lab: base.lab,
       x0: base.x0 * f,
@@ -398,7 +403,7 @@ export function detectStructuralFeatures(
     for (let j = 0; j < features.length; j++) {
       if (features[j].role !== 'dark') continue;
       const d = Math.hypot(features[j].cx - features[i].cx, features[j].cy - features[i].cy);
-      if (d > pairRadius) continue;
+      if (d > (pairRadius ?? 16 * f)) continue;
       if (Math.abs(features[i].lab.L - features[j].lab.L) < pairMinDeltaL) continue;
       /*
        * 面积要**可比**（相差 ≤8 倍）。
@@ -436,6 +441,7 @@ export function detectStructuralFeatures(
 
   // 单独的细线没有亮暗配对，模糊后也可能消失；改用连续性和双侧对比验证。
   features.push(...detectThinDarkStrokes(lab, alpha, dw, dh, f, maxAreaFrac, minContrast, features));
+  features.push(...detectMidtoneStrokes(lab, alpha, dw, dh, f, maxAreaFrac, minContrast, features));
   return features;
 }
 
@@ -509,43 +515,140 @@ function detectThinDarkStrokes(
       x1: (c.x1 + 1) * sourceScale - 1, y1: (c.y1 + 1) * sourceScale - 1,
       cx: c.cx * sourceScale, cy: c.cy * sourceScale, area: c.area * sourceScale * sourceScale,
       contrast, stability: support, confidence: support * clamp01((contrast - minContrast) / 0.25),
-      partner: -1, strokePixels, strokePixelSize: sourceScale,
+      partner: -1, sourcePixels: strokePixels, sourcePixelSize: sourceScale, stroke: true,
     });
   }
   return out;
 }
 
-function ringContrastBBox(
+/**
+ * 中间调的细长凹线（嘴线、衣褶）：两侧都必须更亮，并以局部谷底确定中心。
+ * 这类信号允许低于黑墨线的反差，因此另要求长宽比 ≥6，排除弯曲色块边缘。
+ */
+function detectMidtoneStrokes(
   lab: Float32Array,
+  alpha: Float32Array,
+  w: number,
+  h: number,
+  sourceScale: number,
+  maxAreaFrac: number,
+  minContrast: number,
+  paired: StructuralFeature[],
+): StructuralFeature[] {
+  const ridge = new Uint8Array(w * h);
+  const contrasts = new Float32Array(w * h);
+  const axes = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const L = lab[i * 3];
+      if (alpha[i] < 0.9 || L < 0.30 || L > 0.65 || Math.hypot(lab[i * 3 + 1], lab[i * 3 + 2]) > 0.13) continue;
+      const center = { L, a: lab[i * 3 + 1], b: lab[i * 3 + 2] };
+      let best = 0;
+      for (const [dx, dy] of axes) {
+        const sides: { distance: number; contrast: number }[] = [];
+        for (const sign of [-1, 1]) {
+          let distance = 0;
+          let contrast = 0;
+          for (let d = 1; d <= 6; d++) {
+            const xx = x + dx * d * sign;
+            const yy = y + dy * d * sign;
+            if (xx < 0 || xx >= w || yy < 0 || yy >= h || alpha[yy * w + xx] < 0.9) break;
+            const j = yy * w + xx;
+            const delta = oklabDist(center, { L: lab[j * 3], a: lab[j * 3 + 1], b: lab[j * 3 + 2] });
+            if (!distance && lab[j * 3] - L > 0.10 && delta > 0.16) distance = d;
+            if (distance) contrast = Math.max(contrast, delta);
+          }
+          sides.push({ distance, contrast });
+        }
+        const [left, right] = sides;
+        if (left.distance && right.distance && left.distance <= right.distance &&
+          right.distance - left.distance <= 1 && left.distance + right.distance <= 12) {
+          best = Math.max(best, Math.min(left.contrast, right.contrast));
+        }
+      }
+      if (best >= 0.22) {
+        ridge[i] = 1;
+        contrasts[i] = best;
+      }
+    }
+  }
+
+  const out: StructuralFeature[] = [];
+  for (const c of components(lab, alpha, w, h, (_L, _C, i) => ridge[i] === 1, 16, true, true)) {
+    const spanX = c.x1 - c.x0 + 1;
+    const spanY = c.y1 - c.y0 + 1;
+    if (Math.max(spanX, spanY) < 24 || c.area > w * h * maxAreaFrac || c.lab.L < 0.35 ||
+      Math.hypot(c.lab.a, c.lab.b) > 0.10 || Math.max(spanX, spanY) / Math.min(spanX, spanY) < 6) continue;
+    if (paired.some((p) => p.partner >= 0 && p.role === 'dark' &&
+      p.x0 <= c.x1 * sourceScale && p.x1 >= c.x0 * sourceScale &&
+      p.y0 <= c.y1 * sourceScale && p.y1 >= c.y0 * sourceScale)) continue;
+
+    let endpoints = 0;
+    let degreeSum = 0;
+    let contrast = 0;
+    for (const i of c.pixels!) {
+      const x = i % w;
+      const y = (i / w) | 0;
+      let degree = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if ((!dx && !dy) || x + dx < 0 || x + dx >= w || y + dy < 0 || y + dy >= h) continue;
+          degree += ridge[(y + dy) * w + x + dx];
+        }
+      }
+      if (degree === 1) endpoints++;
+      degreeSum += degree;
+      contrast += contrasts[i];
+    }
+    contrast /= c.area;
+    if (endpoints < 2 || endpoints > 8 || degreeSum / c.area > 3.2 || contrast < Math.max(0.24, minContrast * 0.8)) continue;
+
+    const strokePixels = new Float32Array(c.area * 2);
+    for (let i = 0; i < c.pixels!.length; i++) {
+      const p = c.pixels![i];
+      strokePixels[i * 2] = (p % w + 0.5) * sourceScale;
+      strokePixels[i * 2 + 1] = (((p / w) | 0) + 0.5) * sourceScale;
+    }
+    out.push({
+      role: 'dark', lab: c.lab,
+      x0: c.x0 * sourceScale, y0: c.y0 * sourceScale,
+      x1: (c.x1 + 1) * sourceScale - 1, y1: (c.y1 + 1) * sourceScale - 1,
+      cx: c.cx * sourceScale, cy: c.cy * sourceScale,
+      area: c.area * sourceScale * sourceScale,
+      contrast, stability: 1, confidence: clamp01((contrast - 0.16) / 0.3),
+      partner: -1, sourcePixels: strokePixels, sourcePixelSize: sourceScale, stroke: true,
+    });
+  }
+  return out;
+}
+
+function ringContrastComponent(
+  lab: Float32Array,
+  alpha: Float32Array,
   w: number,
   h: number,
   comp: RawComp,
   isSamePolarity: (L: number, C: number) => boolean,
 ): number {
-  let sL = 0;
-  let sA = 0;
-  let sB = 0;
-  let cnt = 0;
-  for (let y = comp.y0 - 2; y <= comp.y1 + 2; y++) {
-    if (y < 0 || y >= h) continue;
-    for (let x = comp.x0 - 2; x <= comp.x1 + 2; x++) {
-      if (x < 0 || x >= w) continue;
-      const inside = x >= comp.x0 && x <= comp.x1 && y >= comp.y0 && y <= comp.y1;
-      if (inside) continue;
-      const o = (y * w + x) * 3;
-      // 环里只统计"不属于本极性"的像素，避免把同一条亮带的像素算成外围
-      if (isSamePolarity(lab[o], Math.hypot(lab[o + 1], lab[o + 2]))) continue;
-      sL += lab[o];
-      sA += lab[o + 1];
-      sB += lab[o + 2];
-      cnt++;
+  const band = new Set<number>();
+  for (const i of comp.pixels ?? []) {
+    const x = i % w;
+    const y = (i / w) | 0;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const xx = x + dx;
+      const yy = y + dy;
+      if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+      const j = yy * w + xx;
+      if (alpha[j] < 0.9 || isSamePolarity(lab[j * 3], Math.hypot(lab[j * 3 + 1], lab[j * 3 + 2]))) continue;
+      band.add(j);
     }
   }
-  if (!cnt) return 0;
-  const dL = comp.lab.L - sL / cnt;
-  const dA = comp.lab.a - sA / cnt;
-  const dB = comp.lab.b - sB / cnt;
-  return Math.sqrt(0.85 * dL * dL + 1.6 * (dA * dA + dB * dB));
+  const distances = [...band].map((j) => oklabDist(comp.lab, {
+    L: lab[j * 3], a: lab[j * 3 + 1], b: lab[j * 3 + 2],
+  }));
+  distances.sort((a, b) => a - b);
+  return distances.length ? distances[Math.floor(distances.length * 0.75)] : 0;
 }
 
 /** 线性光 RGB(0..1) → OKLab，避免为了降采样再导入一次转换 */
@@ -632,6 +735,7 @@ export interface PlanOptions {
   lightCandidates: BeadColor[];
   /** 暗极候选（全部近深豆色） */
   darkCandidates: BeadColor[];
+  strokeCandidates?: BeadColor[];
   /** 该极性至少几颗 —— 由面积预算算出，小于 1 按 1 算 */
   minBeadsFor?: (f: StructuralFeature, cellArea: number) => number;
 }
@@ -707,9 +811,9 @@ export function planFeaturePlacement(
      * 那么这个算法也能过关」。实测鸭吉吉两只眼各是 (白,黑) 复合对，
      * 猫有 2 对，叶/龟 0 对 —— 判据自动把"不该救的"排除掉了。
      */
-    if (f.partner < 0 && !f.strokePixels) continue;
+    if (f.partner < 0 && !f.stroke) continue;
     const isLight = f.role === 'light';
-    const cands = isLight ? lightCandidates : darkCandidates;
+    const cands = f.stroke ? opts.strokeCandidates ?? darkCandidates : isLight ? lightCandidates : darkCandidates;
     if (!cands.length) continue;
     const bead = nearestOf(f.lab, cands);
 
@@ -731,23 +835,25 @@ export function planFeaturePlacement(
     if (minBeads < 1) minBeads = 1;
     if (minBeads > 48) minBeads = 48;
 
-    /* 投影：遍历 bbox 内的源像素，把通过极性判据的落到格子上 */
+    // 优先投影实际支持像素；仅对没有支持集的旧调用者使用 bbox。
     const x0 = Math.max(0, f.x0 - 1);
     const y0 = Math.max(0, f.y0 - 1);
     const x1 = Math.min(srcW - 1, f.x1 + 1);
     const y1 = Math.min(srcH - 1, f.y1 + 1);
     const tally = new Map<number, number>();
     const strokeTouched = new Set<number>();
-    if (f.strokePixels) {
-      for (let i = 0; i < f.strokePixels.length; i += 2) {
-        const gx = offX + f.strokePixels[i] * scale;
-        const gy = offY + f.strokePixels[i + 1] * scale;
+    const supportPixels = f.sourcePixels;
+    if (supportPixels) {
+      for (let i = 0; i < supportPixels.length; i += 2) {
+        const gx = offX + supportPixels[i] * scale;
+        const gy = offY + supportPixels[i + 1] * scale;
         const cx = Math.floor(gx);
         const cy = Math.floor(gy);
         if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
         const key = cy * cols + cx;
-        tally.set(key, (tally.get(key) ?? 0) + 1);
-        const half = (f.strokePixelSize ?? 1) * scale / 2;
+        tally.set(key, (tally.get(key) ?? 0) + (f.sourcePixelSize ?? 1) ** 2);
+        if (!f.stroke) continue;
+        const half = (f.sourcePixelSize ?? 1) * scale / 2;
         for (let r = Math.max(0, Math.floor(gy - half)); r <= Math.min(rows - 1, Math.ceil(gy + half) - 1); r++) {
           for (let c = Math.max(0, Math.floor(gx - half)); c <= Math.min(cols - 1, Math.ceil(gx + half) - 1); c++) {
             strokeTouched.add(r * cols + c);
@@ -777,24 +883,25 @@ export function planFeaturePlacement(
     const cells: number[] = [];
     const needPix = cellSrcArea * 0.12;
     for (const [key, cnt] of tally) {
-      if (f.strokePixels || cnt >= needPix) cells.push(key);
+      if (f.stroke || cnt >= needPix) cells.push(key);
     }
     /*
      * 按"被该特征覆盖的源像素数"降序排。落位时从前往后取，于是豆子
      * 优先落在特征最实质覆盖的格子上 —— 一只只有 2-3 颗配额的眼白，
      * 就应该落在亮带的正中，而不是 bbox 边缘的过渡格。
      */
+    if (!cells.length && tally.size) cells.push([...tally].sort((a,b)=>b[1]-a[1])[0][0]);
     cells.sort((a, b) => (tally.get(b) ?? 0) - (tally.get(a) ?? 0));
     // 一像素线缩小后面积预算往往不足一整条线；以投影路径的一格宽覆盖作为
     // 几何下限。只落真实支持格，绝不把交叉线的整个 bbox 涂成黑块。
-    if (f.strokePixels) minBeads = cells.length;
+    if (f.stroke) minBeads = cells.length;
 
     const plan: FeaturePlan = {
       role: f.role,
       bead,
       allowed: cands,
       cells,
-      ...(f.strokePixels ? { strokeFringe: [...strokeTouched].filter((key) => !tally.has(key)) } : {}),
+      ...(f.stroke ? { strokeFringe: [...strokeTouched].filter((key) => !tally.has(key)) } : {}),
       minBeads,
       placed: 0,
       confidence: f.confidence,
