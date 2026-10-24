@@ -3,123 +3,750 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* ==========================================================================
+   PinDou — 温暖像素手作工坊
+   设计语言：奶油纸底 + 陶土/苔绿/花色；硬边像素框 + 硬投影；无模糊阴影。
+   两种主题：日间工作台（默认）/ 夜灯工作台（.dark）。
+   ========================================================================== */
+
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar: var(--sidebar);
-  --color-chart-5: var(--chart-5);
-  --color-chart-4: var(--chart-4);
-  --color-chart-3: var(--chart-3);
-  --color-chart-2: var(--chart-2);
-  --color-chart-1: var(--chart-1);
-  --color-ring: var(--ring);
-  --color-input: var(--input);
-  --color-border: var(--border);
-  --color-destructive: var(--destructive);
-  --color-accent-foreground: var(--accent-foreground);
-  --color-accent: var(--accent);
-  --color-muted-foreground: var(--muted-foreground);
-  --color-muted: var(--muted);
-  --color-secondary-foreground: var(--secondary-foreground);
-  --color-secondary: var(--secondary);
-  --color-primary-foreground: var(--primary-foreground);
-  --color-primary: var(--primary);
-  --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--popover);
-  --color-card-foreground: var(--card-foreground);
-  --color-card: var(--card);
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
-  --radius-2xl: calc(var(--radius) + 8px);
-  --radius-3xl: calc(var(--radius) + 12px);
-  --radius-4xl: calc(var(--radius) + 16px);
+  /* shadcn 语义色映射到本设计系统 */
+  --color-background: var(--paper);
+  --color-foreground: var(--ink);
+  --color-card: var(--paper-raised);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--paper-raised);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--clay);
+  --color-primary-foreground: var(--on-clay);
+  --color-secondary: var(--paper-sunken);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--paper-sunken);
+  --color-muted-foreground: var(--ink-2);
+  --color-accent: var(--paper-sunken);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--berry);
+  --color-destructive-foreground: #fffaf2;
+  --color-border: var(--line);
+  --color-input: var(--line);
+  --color-ring: var(--clay);
+
+  --font-sans: var(--font-ui);
+  --font-mono: var(--font-pixel);
+  /* 注意：不要在这里写 --font-pixel: var(--font-pixel) —— 那是自引用，
+     计算值无效，会让所有 .px-code/.px-label 悄悄退化成系统无衬线字体。
+     三个字体族统一在 :root 里定义一次。 */
+
+  --radius-sm: 0px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+  --radius-xl: 3px;
+  --radius-2xl: 4px;
+  --radius-3xl: 4px;
+  --radius-4xl: 4px;
 }
 
+/* ---------- 日间工作台 ---------- */
 :root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --radius: 2px;
+
+  /* ------------------------------------------------------------------
+     字体角色（唯一一处定义，别处只引用）
+     - --font-pixel：拉丁/数字用像素字体 Silkscreen，由 layout.tsx 注入为
+       --font-pixel-latin。色号、行列号、计数用它，让"机械信息"一眼可辨。
+     - --font-ui：中文正文。中文 Web 字体动辄数 MB，这里用系统高质量
+       中文字体栈（PingFang / 苹方 / 微软雅黑 / 思源黑体），
+       配合字重和字距做出手作感，不为体积极小的一点差异牺牲首屏。
+     - --font-display：标题。中文走系统黑体加粗 + 负字距，
+       拉丁部分仍是像素字体，形成"方块标题 + 像素点"的混排。
+     ------------------------------------------------------------------ */
+  /*
+   * 注意：--font-pixel / --font-display 必须定义在 body 上，不能放 :root。
+   *
+   * next/font 把 --font-pixel-latin 注入在 <body> 的 className 上，
+   * 于是 :root（即 <html>）求值时 --font-pixel-latin 还是空值，
+   * var() 替换失败会让**整条 font-family 声明在 computed-value 阶段作废**，
+   * 一路回落到继承来的系统字体 —— 表现为"像素字体从来没生效过"，
+   * 而且因为数字退化成普通数字，肉眼很难发现。定义在 body 上即可
+   * 保证求值时变量已在同一元素上解析成功。见下方 body 规则。
+   */
+  --font-ui: -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC",
+    "Noto Sans CJK SC", system-ui, sans-serif;
+
+  /*
+   * 色板：奶白纸 + 浅玫瑰 + 黄油点缀
+   * ============================================================
+   * 演进过程（都是用户反馈驱动的，别轻易退回）：
+   *
+   * v1 暖黄纸（饱和 50-100%）→ 用户："背景太黄了，感觉不是很清爽"。
+   *    问题是整页铺了一层奶油黄，看久了累。
+   * v2 中性暖白（饱和 20-33%）→ 清爽了，但所有强调色仍是陶土橙，
+   *    整体还是"黄调"，缺层次。
+   * v3（当前）奶白打底 + 玫瑰粉做主动作 + 黄油只做点缀。
+   *    用户原话："奶白和浅粉比较好，可以结合现在的黄色，
+   *    不然一直是黄色看着累。"
+   *
+   * 所以分工是**明确的**：
+   *   - 纸面（90% 面积）：奶白，只带一点点粉暖，不再偏黄；
+   *   - 主色 clay（按钮/当前选中/强调）：玫瑰粉，承担视觉重心；
+   *   - gold（麦黄）：只出现在"用量/提示/徽章"这类小面积点缀上，
+   *     负责暖意和甜度，不抢主色位置。
+   * 这样页面以奶白+粉为主，黄色像撒的糖粒，不再是一片黄。
+   *
+   * 对比度都按 WCAG 算过：ink 12.2:1、ink-2 6.1:1、主色 4.95:1（对纸面）、
+   * 按钮白字对主色 5.2:1，全部达 AA。
+   */
+  --paper-deep: #EDE3E2;
+  --paper-sunken: #F3EAE9;
+  --paper: #F8F3F2;
+  --paper-raised: #FDFAF9;
+  --paper-hi: #FFFDFC;
+
+  /* 墨色：带一点紫调的深暖褐，压在粉纸上不发脏 */
+  --ink: #3A2A30;
+  --ink-2: #6B565C;
+  --ink-3: #9C868C;
+
+  /* 线 */
+  --line: #E2D5D4;
+  --line-strong: #4A3238;
+
+  /* 主色：玫瑰粉 —— 主动作、当前选中、强调 */
+  --clay: #A94A66;
+  --clay-deep: #8C3A55;
+  --clay-soft: #F6DFE6;
+  --on-clay: #FFF8FA;
+
+  --leaf: #557030;          /* 苔绿 — 成功 / 自然 */
+  --leaf-deep: #3E5421;
+  --leaf-soft: #E6EFD8;
+
+  --bloom: #B93856;         /* 花色 — 提醒 / 花朵 */
+  --bloom-soft: #F8DCE1;
+
+  --sky: #456F82;           /* 天空 — 信息 */
+  --sky-soft: #DEEAEE;
+
+  --gold: #A87718;          /* 麦黄 — 点缀 / 用量（小面积，不当主色） */
+  --gold-deep: #8C6112;
+  --gold-soft: #F8EBCB;
+
+  --berry: #9E2942;         /* 危险 */
+  --berry-soft: #F6D6DB;
+
+  /* 投影：像素 UI 用硬投影，不用模糊 */
+  --shadow-px: 3px 3px 0 0 rgba(74, 50, 56, 0.18);
+  --shadow-px-lg: 5px 5px 0 0 rgba(74, 50, 56, 0.16);
+  --shadow-px-btn: 0 3px 0 0 rgba(74, 50, 56, 0.85);
+
+  /* 纹理 */
+  --dot: rgba(74, 50, 56, 0.055);
+  --checker-a: #EAE0DF;
+  --checker-b: #F5EFEE;
 }
 
+/* ---------- 夜灯工作台 ---------- */
+/*
+ * 深色主题与日间主题是**同一套语义**，只是把玫瑰粉调亮、纸面压暗：
+ * 日间的 --clay 是能压住奶白纸的中深玫瑰，夜里同一个色会糊在暗底上，
+ * 所以换成高明度玫瑰（#EC9BAF，对 #221A1E 达 8.0:1）。
+ * 所有值都按 WCAG 算过，范围 4.6–14.8:1。
+ */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --paper-deep: #191317;
+  --paper-sunken: #1E171A;
+  --paper: #221A1E;
+  --paper-raised: #2A2025;
+  --paper-hi: #34282E;
+
+  --ink: #F6EDEF;
+  --ink-2: #C9B3B8;
+  --ink-3: #96808A;
+
+  --line: #46353A;
+  --line-strong: #7E6070;
+
+  --clay: #EC9BAF;
+  --clay-deep: #D97E95;
+  --clay-soft: #3E2530;
+  --on-clay: #221A1E;
+
+  --leaf: #A8C97A;
+  --leaf-deep: #8CA95E;
+  --leaf-soft: #2A3520;
+
+  --bloom: #F092A8;
+  --bloom-soft: #40222A;
+
+  --sky: #8FBCCE;
+  --sky-soft: #1F3239;
+
+  --gold: #E8C06A;
+  --gold-deep: #C79E4A;
+  --gold-soft: #3A2E16;
+
+  --berry: #F58BA0;
+  --berry-soft: #3E1F26;
+
+  --shadow-px: 3px 3px 0 0 rgba(0, 0, 0, 0.5);
+  --shadow-px-lg: 5px 5px 0 0 rgba(0, 0, 0, 0.45);
+  --shadow-px-btn: 0 3px 0 0 rgba(0, 0, 0, 0.65);
+
+  --dot: rgba(246, 237, 239, 0.055);
+  --checker-a: #1B1418;
+  --checker-b: #221A1E;
 }
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border;
+    border-radius: 0;
   }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    scrollbar-color: var(--line) transparent;
+  }
+
   body {
-    @apply bg-background text-foreground;
+    /*
+     * --font-pixel / --font-display 在这里定义（不能在 :root）。
+     * 原因见文件顶部 :root 处的注释：next/font 的变量注入在 <body> 上，
+     * 写在 :root 会让 var() 求值失败、整条声明作废。
+     *
+     * Silkscreen 只有拉丁字形，所以 fallback 必须接住中文：
+     * 拉丁/数字走像素字体，中文落到后面的系统黑体栈，不会出现方块豆腐。
+     */
+    --font-pixel: var(--font-pixel-latin), ui-monospace, "SF Mono", Menlo,
+      "Courier New", "PingFang SC", "Microsoft YaHei", monospace;
+    --font-display: var(--font-pixel-latin), ui-monospace, "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", system-ui,
+      sans-serif;
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-feature-settings: "kern" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 纸张纹理：8px 点阵 + 顶部暖光 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-image:
+      radial-gradient(circle at 1px 1px, var(--dot) 1px, transparent 0),
+      radial-gradient(120% 42% at 50% -10%, rgba(255, 214, 150, 0.14), transparent 70%);
+    background-size: 8px 8px, 100% 100%;
+  }
+
+  .dark body::before {
+    background-image:
+      radial-gradient(circle at 1px 1px, var(--dot) 1px, transparent 0),
+      radial-gradient(120% 55% at 50% -10%, rgba(236, 155, 175, 0.09), transparent 70%);
+  }
+
+  ::selection {
+    background: var(--clay);
+    color: var(--on-clay);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--clay);
+    outline-offset: 2px;
+  }
+
+  /* 滚动条做成像素块 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--paper-sunken);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border: 2px solid var(--paper-sunken);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--ink-3);
+  }
+}
+
+@layer components {
+  /* ---------------- 字体角色 ---------------- */
+  .font-px {
+    font-family: var(--font-pixel);
+    font-weight: 400;
+    letter-spacing: 0.02em;
+  }
+
+  .font-display {
+    font-family: var(--font-display);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  /* 英文/数字的小型像素标签 */
+  .px-label {
+    font-family: var(--font-pixel);
+    font-size: 10px;
+    line-height: 1;
+    letter-spacing: 0.08em;
+    color: var(--ink-3);
+    text-transform: uppercase;
+  }
+
+  .px-code {
+    font-family: var(--font-pixel);
+    font-size: 11px;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    font-weight: 700;
+  }
+
+  /* ---------------- 容器 ---------------- */
+  .px-panel {
+    position: relative;
+    background: var(--paper-raised);
+    border: 2px solid var(--line-strong);
+    box-shadow: var(--shadow-px);
+  }
+
+  .px-panel-flat {
+    background: var(--paper-raised);
+    border: 2px solid var(--line);
+  }
+
+  /* 凹陷面板（画布、预览底） */
+  .px-inset {
+    background: var(--paper-sunken);
+    border: 2px solid var(--line);
+    box-shadow: inset 2px 2px 0 0 rgba(67, 47, 30, 0.10);
+  }
+
+  .dark .px-inset {
+    box-shadow: inset 2px 2px 0 0 rgba(0, 0, 0, 0.35);
+  }
+
+  /* 透明格子底（棋盘） */
+  .px-checker {
+    background-image:
+      linear-gradient(45deg, var(--checker-a) 25%, transparent 25%, transparent 75%, var(--checker-a) 75%),
+      linear-gradient(45deg, var(--checker-a) 25%, transparent 25%, transparent 75%, var(--checker-a) 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 8px 8px;
+    background-color: var(--checker-b);
+  }
+
+  /* ---------------- 按钮 ---------------- */
+  .px-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 9px 16px;
+    font-family: var(--font-ui);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--ink);
+    background: var(--paper-raised);
+    border: 2px solid var(--line-strong);
+    box-shadow: var(--shadow-px-btn);
+    cursor: pointer;
+    user-select: none;
+    transition: transform 0.06s steps(2), box-shadow 0.06s steps(2), background-color 0.12s linear;
+    /* 硬投影 = 立体感，按下时整体下沉 */
+  }
+
+  .px-btn:hover:not(:disabled) {
+    background: var(--paper-hi);
+  }
+
+  .px-btn:active:not(:disabled) {
+    transform: translateY(3px);
+    box-shadow: 0 0 0 0 rgba(67, 47, 30, 0.85);
+  }
+
+  .px-btn:disabled {
+    cursor: not-allowed;
+    color: var(--ink-3);
+    background: var(--paper-sunken);
+    box-shadow: 0 3px 0 0 var(--line);
+    opacity: 0.85;
+  }
+
+  .px-btn-primary {
+    color: var(--on-clay);
+    background: var(--clay);
+    border-color: var(--clay-deep);
+    box-shadow: 0 3px 0 0 var(--clay-deep);
+  }
+
+  .px-btn-primary:hover:not(:disabled) {
+    background: var(--clay-deep);
+  }
+
+  .px-btn-primary:active:not(:disabled) {
+    box-shadow: 0 0 0 0 var(--clay-deep);
+  }
+
+  .px-btn-primary:disabled {
+    color: var(--on-clay);
+    background: var(--clay);
+    border-color: var(--clay-deep);
+    box-shadow: 0 3px 0 0 var(--clay-deep);
+    opacity: 0.4;
+  }
+
+  .px-btn-ghost {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    color: var(--ink-2);
+  }
+
+  .px-btn-ghost:hover:not(:disabled) {
+    background: var(--paper-sunken);
+    color: var(--ink);
+  }
+
+  .px-btn-ghost:active:not(:disabled) {
+    transform: translateY(1px);
+    box-shadow: none;
+  }
+
+  .px-btn-sm {
+    padding: 6px 11px;
+    font-size: 12.5px;
+    gap: 6px;
+  }
+
+  .px-btn-danger {
+    color: var(--berry);
+    border-color: var(--berry);
+    box-shadow: 0 3px 0 0 var(--berry);
+    background: transparent;
+  }
+
+  .px-btn-danger:hover:not(:disabled) {
+    background: var(--berry-soft);
+  }
+
+  .px-btn-danger:active:not(:disabled) {
+    box-shadow: 0 0 0 0 var(--berry);
+  }
+
+  /* ---------------- 标签 / 色号 ---------------- */
+  .px-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 7px;
+    font-family: var(--font-pixel);
+    font-size: 10px;
+    line-height: 1.4;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border: 1px solid currentColor;
+  }
+
+  .px-tag-clay {
+    color: var(--clay);
+    background: var(--clay-soft);
+  }
+  .px-tag-leaf {
+    color: var(--leaf);
+    background: var(--leaf-soft);
+  }
+  .px-tag-bloom {
+    color: var(--bloom);
+    background: var(--bloom-soft);
+  }
+  .px-tag-sky {
+    color: var(--sky);
+    background: var(--sky-soft);
+  }
+  .px-tag-gold {
+    color: var(--gold);
+    background: var(--gold-soft);
+  }
+  .px-tag-ink {
+    color: var(--ink-2);
+    background: var(--paper-sunken);
+  }
+
+  /* ---------------- 分隔 ---------------- */
+  .px-rule {
+    height: 2px;
+    background-image: repeating-linear-gradient(
+      to right,
+      var(--line) 0 4px,
+      transparent 4px 8px
+    );
+  }
+
+  /* ---------------- 滑杆 ---------------- */
+  .px-slider [data-slot="slider-track"] {
+    height: 8px;
+    border: 2px solid var(--line-strong);
+    background: var(--paper-sunken);
+    box-shadow: inset 1px 1px 0 0 rgba(67, 47, 30, 0.12);
+  }
+
+  .px-slider [data-slot="slider-range"] {
+    background: var(--clay);
+    border: none;
+  }
+
+  .px-slider [data-slot="slider-thumb"] {
+    width: 16px;
+    height: 20px;
+    border: 2px solid var(--line-strong);
+    background: var(--paper-hi);
+    box-shadow: var(--shadow-px-btn);
+    border-radius: 0;
+    transition: transform 0.08s steps(2), background-color 0.12s linear;
+  }
+
+  .px-slider [data-slot="slider-thumb"]:hover {
+    background: var(--clay);
+    transform: translateY(-1px);
+  }
+
+  /* ---------------- 输入 ---------------- */
+  .px-input {
+    width: 100%;
+    padding: 8px 10px;
+    font-size: 14px;
+    color: var(--ink);
+    background: var(--paper-hi);
+    border: 2px solid var(--line-strong);
+    box-shadow: inset 2px 2px 0 0 rgba(67, 47, 30, 0.08);
+  }
+
+  .px-input::placeholder {
+    color: var(--ink-3);
+  }
+
+  .px-input:focus {
+    outline: none;
+    border-color: var(--clay);
+    box-shadow: inset 2px 2px 0 0 rgba(176, 82, 44, 0.14), 0 0 0 2px var(--clay-soft);
+  }
+
+  /* ---------------- 分区标题 ---------------- */
+  .px-section-no {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    font-family: var(--font-pixel);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--on-clay);
+    background: var(--clay);
+    border: 2px solid var(--clay-deep);
+    flex: none;
+  }
+
+  .px-section-title {
+    font-family: var(--font-display);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.005em;
+    color: var(--ink);
+  }
+
+  /* ---------------- 画布标尺 ---------------- */
+  .px-ruler {
+    background: var(--paper-sunken);
+    border: 2px solid var(--line-strong);
+    font-family: var(--font-pixel);
+    font-size: 9px;
+    line-height: 1;
+    color: var(--ink-2);
+  }
+
+  /* ---------------- 入场动效 ---------------- */
+  @keyframes px-rise {
+    from {
+      opacity: 0;
+      translate: 0 12px;
+    }
+    to {
+      opacity: 1;
+      translate: 0 0;
+    }
+  }
+
+  .px-rise {
+    animation: px-rise 0.34s steps(5, end) both;
+  }
+
+  .px-rise-1 { animation-delay: 0.03s; }
+  .px-rise-2 { animation-delay: 0.09s; }
+  .px-rise-3 { animation-delay: 0.15s; }
+  .px-rise-4 { animation-delay: 0.21s; }
+
+  @keyframes px-bob {
+    0%, 100% { translate: 0 0; }
+    50% { translate: 0 -3px; }
+  }
+
+  .px-bob {
+    animation: px-bob 2.6s steps(9, end) infinite;
+  }
+
+  @keyframes px-blink {
+    0%, 92%, 100% { opacity: 1; }
+    94%, 98% { opacity: 0; }
+  }
+
+  .px-blink {
+    animation: px-blink 5.2s steps(1, end) infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .px-rise,
+    .px-bob,
+    .px-blink {
+      animation: none !important;
+    }
+    .px-btn,
+    .px-slider [data-slot="slider-thumb"] {
+      transition: none !important;
+    }
+  }
+
+  /* ---------------- 像素绘图（场景/吉祥物） ---------------- */
+  .px-art {
+    shape-rendering: crispEdges;
+    image-rendering: pixelated;
+    display: block;
+  }
+
+  /* ---------------- 提示气泡 ---------------- */
+  .px-tooltip {
+    position: absolute;
+    z-index: 30;
+    padding: 6px 8px;
+    background: var(--paper-hi);
+    border: 2px solid var(--line-strong);
+    box-shadow: var(--shadow-px);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+}
+
+@layer utilities {
+  .text-ink { color: var(--ink); }
+  .text-ink-2 { color: var(--ink-2); }
+  .text-ink-3 { color: var(--ink-3); }
+  .text-clay { color: var(--clay); }
+  .text-leaf { color: var(--leaf); }
+  .text-bloom { color: var(--bloom); }
+  .bg-paper { background-color: var(--paper); }
+  .bg-paper-raised { background-color: var(--paper-raised); }
+  .bg-paper-sunken { background-color: var(--paper-sunken); }
+  .border-line { border-color: var(--line); }
+  .border-line-strong { border-color: var(--line-strong); }
+}
+
+@media print {
+  body::before { display: none; }
+  .px-panel, .px-panel-flat { box-shadow: none; }
+}
+
+/* ============================================================
+ * 工作台栅格（Workbench grid）
+ * ------------------------------------------------------------
+ * 为什么不用 Tailwind 的 `min-[1800px]:grid-cols-…`：
+ * 实测 Tailwind v4 生成的顺序是 `min-[1800px]:*` 规则**排在
+ * `lg:*` 之前**（arbitrary variant 的分组顺序和具名断点不同），
+ * 同特异度下后写的 `lg:grid-cols` 赢，第三栏在 1920px 上永远
+ * 不出现 —— 而且看源码完全看不出问题（类名都在）。
+ * 所以布局整块写进 CSS，用媒体查询按升序排列，顺序确定。
+ *
+ * 尺寸：
+ *   < 1024px  单列纵向排（手机上靠 order 把图纸提到参数前面）
+ *   1024px+   左 320px（图+参数，独立滚动） | 中 1fr（图纸，吃满高度）
+ *   1800px+   多一栏右 320px（用料清单），左栏里的清单同时隐藏
+ * ============================================================ */
+.wb {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.75rem;
+}
+
+/* 手机上让左栏"消失成透明"，三个 section 直接进入 .wb 参与 order 排序 */
+.wb-left {
+  display: contents;
+}
+.wb-right {
+  display: none;
+}
+
+@media (min-width: 64rem) {
+  .wb {
+    display: grid;
+    grid-template-columns: 320px minmax(0, 1fr);
+    /* 关键：单行必须是 1fr 才会被容器高度撑开。
+       auto 的话行高由内容决定，中间的图纸面板会缩成 300px 高的一条。 */
+    grid-template-rows: minmax(0, 1fr);
+    align-items: stretch;
+    overflow: hidden;
+  }
+  .wb-left {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 2px;
+  }
+  .wb-mid {
+    min-width: 0;
+    min-height: 0;
+  }
+}
+
+@media (min-width: 112.5rem) {
+  .wb {
+    grid-template-columns: 320px minmax(0, 1fr) 320px;
+  }
+  .wb-right {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .wb-left-legend {
+    display: none;
+  }
+}
+
+/* 手机上图纸区必须有确定高度，否则 flex-1 + min-h-0 会塌成 0 */
+@media (max-width: 63.999rem) {
+  /*
+   * 手机上图纸区需要一个确定高度（否则内部 flex-1 + min-h-0 会塌成 0），
+   * 但也不能太高：390px 宽下 64 格图每格只有 4px，整图才 260px 高，
+   * 给到 68dvh 会在画布上下各留一大片空白，还把「02 参数」推到屏幕外。
+   * 54dvh 让画布基本贴边，同时露出下一块的边角，明确提示"往下还有东西"。
+   */
+  .wb-mid {
+    height: 54dvh;
+    min-height: 320px;
+    flex-shrink: 0;
   }
 }

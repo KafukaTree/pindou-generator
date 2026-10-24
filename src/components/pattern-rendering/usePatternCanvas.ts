@@ -1,0 +1,2773 @@
+'use client';
+
+/**
+ * 图案画布的渲染引擎（与 UI 分离，便于单独推演/测试）
+ * ---------------------------------------------------------------
+ * 关键决策：
+ *
+ * 1. **高 DPI 渲染 + 设备像素对齐**。CSS 尺寸 × devicePixelRatio 作为 canvas
+ *    的 width/height 属性，绘制在 scale(dpr) 后的坐标系里；但每一格的位置
+ *    先换算成"设备像素整数"，再换算回 CSS 坐标 —— 等价于 setTransform(dpr)
+ *    且所有矩形四边都落在整设备像素上，任何 dpr（含 1.25/1.5 这种小数）都
+ *    不会出现 0.5px 灰色描边。线条统一用 fillRect 而不是 strokeRect。
+ *
+ * 2. **图案底色离屏缓存**。每格纯色先在 cols×rows 的离屏 canvas 上画一次
+ *    （putImageData），之后缩放只做 drawImage(nearest-neighbor)。所以缩放
+ *    *不会*重跑逐格绘制，只是重新采样；网格线和色号才是按当前 cellSize
+ *    重新生成的（它们必须随缩放改变粗细/字号）。
+ *
+ * 3. **分级网格**：1 格 = 极淡（cellSize ≥ 8 才画）/ 5 格 = 中等 / 10 格 =
+ *    深色主线。图案是主角，网格只是数格子的辅助。
+ *
+ * 4. **色号**：cellSize ≥ 14 完整色号，9–14 自适应缩小（measureText 收缩，
+ *    最小 6px），< 9 不画。字色用 readableInkFor()（真实 WCAG 对比度）。
+ *
+ * 5. **悬停高亮画在独立的 overlay canvas 上**，鼠标移动只重绘 overlay，
+ *    不重绘几千个格子。
+ *
+ * 6. 行/列标尺是 HTML（文字更清晰、不吃 canvas 显存），用 sticky 让标尺
+ *    在滚动时保持可见。
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
+import type { PatternResult } from '@/lib/pattern/generate';
+import { parseHex, readableInkFor } from '@/lib/color/oklab';
+import type { Brand } from '@/lib/color/palette';
+import {
+  EMPTY_EDITS,
+  applyDelta,
+  applyEdits,
+  editCount,
+  floodFill,
+  invertDelta,
+  makeDelta,
+  pickCodeAt,
+  type EditDelta,
+  type EditMap,
+} from '@/lib/pattern/edits';
+import {
+  buildRegionField,
+  regionAlgorithms,
+  type DetailBrush,
+  type RegionField,
+} from '@/lib/pattern/regions';
+import { getDetailProfile, type DetailAlgorithm } from '@/lib/pattern/detail';
+
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+export const ZOOM_MIN = 0.5;
+export const ZOOM_MAX = 4;
+const ZOOM_STEP = 0.25;
+
+/** 标尺尺寸（CSS px） */
+export const RULER_LEFT = 24;
+export const RULER_TOP = 18;
+
+/** .px-inset 的内边距 + 边框，以及滚动条预留 */
+const FRAME_PAD = 20;
+/** 滚动容器 px-inset 的边框（1px 描边 + 极小的内衬） */
+const FRAME_BORDER = 4;
+const SCROLLBAR_ALLOWANCE = 12;
+
+const MIN_FIT_CELL = 4;
+const MAX_FIT_CELL = 48;
+
+/** 色号字号上限（CSS px）。放大到 4× 时字也该跟着长，但不必无限长 */
+const MAX_CODE_FONT = 30;
+
+/** 画布显存预算：超过就降采样（极端缩放下宁可略软，也不要 200MB 的位图） */
+const MAX_BACKING_PX = 28_000_000;
+const MAX_BACKING_DIM = 8192;
+
+const PREF_PREFIX = 'pindou.canvas.';
+const PREF_KEYS = {
+  zoom: 'zoom',
+  codes: 'showCodes',
+  grid: 'showGrid',
+  rulers: 'showRulers',
+  regionOverlay: 'regionOverlay',
+} as const;
+
+/** fill 模式下父容器最小可用高度：低于它就降级成"限高 + 内部滚动" */
+const MIN_FILL_HOST_HEIGHT = 240;
+
+/**
+ * 区域遮罩的不透明度上限（中心处）。
+ *
+ * 0.18 实测在深色豆（R22 那种暗棕）上几乎看不出来，只能靠轮廓线猜。
+ * 0.26 是"能一眼看出这块会被重算"与"不干扰辨认豆子颜色"的平衡点
+ * —— 再高，用户就没法判断这块重算后色号对不对了。
+ */
+const REGION_MASK_ALPHA = 0.2;
+/**
+ * 待应用选区的遮罩透明度。
+ *
+ * 用 --sky 而不是 --clay，是为了让"还没生效"和"已经生效"一眼分得开：
+ * 陶土色 = 已应用，天空蓝 = 草稿。上限压在 0.30 以内 —— 再高会盖住
+ * 下方色号，用户就没法判断选区落得准不准了。
+ */
+const PENDING_MASK_ALPHA = 0.28;
+/**
+ * 一次刷区域最多保留多少支笔（点数，超出从头丢）。
+ *
+ * 120 而不是 60：改成"先画选区再应用"之后，用户会在一整块区域上反复
+ * 叠加笔划、还会叠好几笔再一次性提交，60 个点连一次稍长的拖动都不够。
+ */
+export const MAX_BRUSHES = 120;
+/** 笔刷半径的允许范围（归一化，相对图案长边） */
+export const BRUSH_RADIUS_MIN = 0.03;
+export const BRUSH_RADIUS_MAX = 0.35;
+/** 羽化范围（与引擎 buildRegionField 的 feather 参数一致） */
+export const FEATHER_MIN = 0.12;
+export const FEATHER_MAX = 1;
+
+/**
+ * 一画笔刷的几何：核心半径 + 羽化带 + 总触及半径。
+ *
+ * **这段必须与引擎 `buildRegionField`（src/lib/pattern/regions.ts）逐字同形。**
+ * 三处都要用同一个几何：
+ *   - 拖动中的实时预览（stampLive）
+ *   - 悬停/拖动时的圆环（drawBrushRing）
+ *   - 抬手后交给引擎重算的区域（pending → applyPending → buildRegionField）
+ *
+ * 早先 stampLive 只盖核心圆，而引擎按 reach 重算，于是"按住时看到的圈"
+ * 比"松手后冒出来的选区"小 1.73 倍 —— 用户吐槽的"选区逻辑很差"根子在这里。
+ * 现在三者共用这一个函数，按住 = 松手 = 引擎重算范围。
+ */
+export function brushGeometry(
+  x: number,
+  y: number,
+  radius: number,
+  cols: number,
+  rows: number,
+  feather: number,
+) {
+  const longest = Math.max(cols, rows);
+  // 与引擎完全一致的三个量（改这里之前先看 regions.ts:radiusCells/bandCells）
+  const radiusCells = Math.max(1.2, radius * longest);
+  const bandCells = Math.min(radiusCells, Math.max(1.2, radiusCells * Math.max(0.12, feather)));
+  return {
+    cx: x * cols,
+    cy: y * rows,
+    radiusCells,
+    bandCells,
+    reach: radiusCells + bandCells,
+  };
+}
+
+/** 与 regions.ts 的 smoothstep 同形（含两端 clamp） */
+const smoothstep = (t: number) => {
+  const v = t < 0 ? 0 : t > 1 ? 1 : t;
+  return v * v * (3 - 2 * v);
+};
+
+/**
+ * 把一支笔刷点盖进"正在拖的这一笔"的实时权重图。
+ *
+ * 为什么不直接用 buildRegionField：它每次要分配 5 个 Float32Array(cols*rows)，
+ * 320 格时约 1.7MB/次 —— 放在 pointermove 里等于每帧一次 GC 惊雷。
+ * 这里只维护一张 Float32Array，按格量化后取 max（同一格被同一笔反复盖时
+ * 不能叠加，否则拖着来回蹭会出现一块比别处深得多的斑）。
+ *
+ * 衰减形状刻意与 buildRegionField 的 smoothstep 同形，这样"拖的时候看到
+ * 的"和"抬手后 pending 遮罩显示的"是同一个渐变，不会出现一松手选区
+ * 突然变了个形状的错觉。
+ */
+function stampLive(
+  w: Float32Array,
+  cols: number,
+  rows: number,
+  p: DetailBrush,
+  feather: number,
+) {
+  const { cx, cy, radiusCells, bandCells, reach } = brushGeometry(
+    p.x,
+    p.y,
+    p.radius,
+    cols,
+    rows,
+    feather,
+  );
+  const c0 = Math.max(0, Math.floor(cx - reach));
+  const c1 = Math.min(cols - 1, Math.ceil(cx + reach));
+  const r0 = Math.max(0, Math.floor(cy - reach));
+  const r1 = Math.min(rows - 1, Math.ceil(cy + reach));
+  for (let y = r0; y <= r1; y++) {
+    const dy = y + 0.5 - cy;
+    for (let x = c0; x <= c1; x++) {
+      const dx = x + 0.5 - cx;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d > reach) continue;
+      /*
+       * 与引擎逐字同一套曲线：核心内权重 1，核心外按 smoothstep 衰减到 0。
+       * 不是"1 - smoothstep(d/r)"那种简化 —— 那种在核心边界处斜率不连续，
+       * 拖动时的渐变看着会比松手后硬一档。
+       */
+      const t = 1 - (d - radiusCells) / bandCells;
+      const v = smoothstep(t);
+      if (v <= 0.002) continue;
+      const i = y * cols + x;
+      if (v > w[i]) w[i] = v;
+    }
+  }
+}
+
+/**
+ * 把一串笔刷点重新聚成"笔"。
+ *
+ * brushes 是个扁平的 DetailBrush[]，一次拖动会被插值成十几个点存进去 ——
+ * 直接拿 length 当"几处"会显示"已应用 13 处"，而用户明明只画了一笔。
+ * 撤销时也只想整笔撤掉，不是撤掉一个点。
+ *
+ * 插值步长是 radius*0.35、抽稀阈值 radius*0.25，所以同一笔内相邻点的
+ * 间距不会超过约 0.35 个半径；两笔之间只要离得比 1.25 个半径远，就认为
+ * 是新的一处。阈值取 1.25 而不是 1.0：两笔挨着画（想刷成一片）时，
+ * 中间的重叠点不该被算成两处。
+ */
+function clusterBrushes(
+  strokes: DetailBrush[],
+  cols: number,
+  rows: number,
+): DetailBrush[][] {
+  if (strokes.length === 0) return [];
+  const longest = Math.max(cols, rows);
+  const groups: DetailBrush[][] = [];
+  let current: DetailBrush[] = [strokes[0]];
+
+  for (let i = 1; i < strokes.length; i++) {
+    const prev = strokes[i - 1];
+    const next = strokes[i];
+    const dx = (next.x - prev.x) * cols;
+    const dy = (next.y - prev.y) * rows;
+    const gap = Math.hypot(dx, dy);
+    const limit = Math.max(prev.radius, next.radius) * longest * 1.25;
+    if (gap > limit) {
+      groups.push(current);
+      current = [next];
+    } else {
+      current.push(next);
+    }
+  }
+  groups.push(current);
+  return groups;
+}
+
+// ---------------------------------------------------------------------------
+// 偏好存取（localStorage）
+// ---------------------------------------------------------------------------
+
+function readPref(key: string): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.localStorage.getItem(PREF_PREFIX + key);
+  } catch {
+    return null;
+  }
+}
+
+function writePref(key: string, value: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(PREF_PREFIX + key, value);
+  } catch {
+    /* 隐私模式 / 配额满：忽略即可 */
+  }
+}
+
+function readBoolPref(key: string, fallback: boolean): boolean {
+  const raw = readPref(key);
+  if (raw === '0') return false;
+  if (raw === '1') return true;
+  return fallback;
+}
+
+function clampZoom(v: number): number {
+  if (!Number.isFinite(v)) return 1;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(v * 100) / 100));
+}
+
+// ---------------------------------------------------------------------------
+// 几何 / 像素度量
+// ---------------------------------------------------------------------------
+
+export interface CanvasMetrics {
+  cols: number;
+  rows: number;
+  /** 每格设备像素（整数） */
+  cellDev: number;
+  /** 实际生效的 devicePixelRatio（大画布时会降级） */
+  eff: number;
+  /** canvas 的 CSS 尺寸 */
+  cssW: number;
+  cssH: number;
+  /** 每格 CSS 尺寸 */
+  cellCss: number;
+}
+
+function computeMetrics(cols: number, rows: number, cellPx: number, dpr: number): CanvasMetrics {
+  const cssW0 = Math.max(1, cols * cellPx);
+  const cssH0 = Math.max(1, rows * cellPx);
+
+  let eff = Math.max(0.5, Number.isFinite(dpr) && dpr > 0 ? dpr : 1);
+  eff = Math.min(eff, MAX_BACKING_DIM / Math.max(cssW0, cssH0));
+  eff = Math.min(eff, Math.sqrt(MAX_BACKING_PX / (cssW0 * cssH0)));
+  if (!Number.isFinite(eff) || eff <= 0) eff = 1;
+
+  const cellDev = Math.max(1, Math.round(cellPx * eff));
+  return {
+    cols,
+    rows,
+    cellDev,
+    eff,
+    // 让 canvas 的 CSS 尺寸 = 设备尺寸 / eff，保证 1 device px 精确对应
+    cssW: (cols * cellDev) / eff,
+    cssH: (rows * cellDev) / eff,
+    cellCss: cellDev / eff,
+  };
+}
+
+export interface HoverCell {
+  row: number;
+  col: number;
+  /** 视口坐标，用于 fixed 定位的工具提示（不会被滚动容器裁掉） */
+  x: number;
+  y: number;
+}
+
+// ---------------------------------------------------------------------------
+// 主题色读取（只用 CSS 变量，自动适配深色主题）
+// ---------------------------------------------------------------------------
+
+interface CanvasTokens {
+  line: string;
+  lineStrong: string;
+  ink: string;
+  ink3: string;
+  clay: string;
+  clayDeep: string;
+  sky: string;
+  skySoft: string;
+  paperHi: string;
+  /** 手改标记 / 强调用的麦黄 */
+  gold: string;
+  goldDeep: string;
+  /** 棋盘格双色：擦除预览要画成"和最终结果一样"的样子 */
+  checkerA: string;
+  checkerB: string;
+  mono: string;
+  /**
+   * 色号候选字体，按优先级排列。
+   *
+   * --font-pixel 是 Silkscreen 像素字体 —— 好看，但字符推进宽度约 0.875em，
+   * 比后备等宽字体宽得多。50×50（每格 19px）时它连 6px 都塞不下 "R22"，
+   * fitFontSize 会直接返回 null，色号整片消失（实测踩过）。
+   * 所以这里同时给出宽窄两种，让 fitFontSize 挑能排出最大字号的那个。
+   */
+  codeFonts: string[];
+}
+
+function readTokens(el: HTMLElement): CanvasTokens {
+  const cs = getComputedStyle(el);
+  const v = (name: string, fallback: string): string => {
+    const raw = cs.getPropertyValue(name).trim();
+    return raw || fallback;
+  };
+  const pixelFont = v('--font-pixel', '');
+  const mono = pixelFont
+    ? `${pixelFont}, ui-monospace, SFMono-Regular, Menlo, monospace`
+    : 'ui-monospace, SFMono-Regular, Menlo, monospace';
+  return {
+    line: v('--line', '#DDCDB2'),
+    lineStrong: v('--line-strong', '#432F1E'),
+    ink: v('--ink', '#33261A'),
+    ink3: v('--ink-3', '#9C876D'),
+    clay: v('--clay', '#B0522C'),
+    clayDeep: v('--clay-deep', '#8E3E1F'),
+    sky: v('--sky', '#456F82'),
+    skySoft: v('--sky-soft', '#DEEAEE'),
+    paperHi: v('--paper-hi', '#FFFEF9'),
+    gold: v('--gold', '#A87718'),
+    goldDeep: v('--gold-deep', '#8C6112'),
+    checkerA: v('--checker-a', '#F3E9D7'),
+    checkerB: v('--checker-b', '#FFFBF0'),
+    mono,
+    codeFonts: [mono, 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 图案离屏缓存
+// ---------------------------------------------------------------------------
+
+interface SurfaceHit {
+  pattern: PatternResult;
+  canvas: HTMLCanvasElement;
+}
+interface SurfaceCacheRef {
+  current: SurfaceHit | null;
+}
+
+function getSurface(pattern: PatternResult, cache: SurfaceCacheRef): HTMLCanvasElement {
+  const hit = cache.current;
+  if (hit && hit.pattern === pattern) return hit.canvas;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, pattern.cols);
+  canvas.height = Math.max(1, pattern.rows);
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const image = ctx.createImageData(canvas.width, canvas.height);
+    const data = image.data;
+    const rgb = pattern.palette.map((p) => parseHex(p.hex) ?? { r: 0, g: 0, b: 0 });
+    const { cols, rows, cells } = pattern;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = cells[r * cols + c];
+        if (idx < 0) continue; // 空白：保持透明
+        const color = rgb[idx];
+        if (!color) continue;
+        const o = (r * cols + c) * 4;
+        data[o] = color.r;
+        data[o + 1] = color.g;
+        data[o + 2] = color.b;
+        data[o + 3] = 255;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+  }
+  cache.current = { pattern, canvas };
+  return canvas;
+}
+
+// ---------------------------------------------------------------------------
+// 绘制：主画布
+// ---------------------------------------------------------------------------
+
+function ringFill(
+  ctx: CanvasRenderingContext2D,
+  d: (dev: number) => number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  t: number,
+) {
+  if (w <= 0 || h <= 0 || t <= 0) return;
+  const tw = Math.min(t, Math.floor(w / 2));
+  ctx.fillRect(d(x), d(y), d(w), d(tw));
+  ctx.fillRect(d(x), d(y + h - tw), d(w), d(tw));
+  ctx.fillRect(d(x), d(y + tw), d(tw), d(h - tw * 2));
+  ctx.fillRect(d(x + w - tw), d(y + tw), d(tw), d(h - tw * 2));
+}
+
+interface CodeFont {
+  size: number;
+  family: string;
+}
+
+/**
+ * 在给定宽度里排下最长的色号，返回能用的最大字号与对应字体。
+ *
+ * 同时尝试多个字体族（像素字体 vs 等宽字体）—— 像素字体更符合设计语言，
+ * 但它更宽；格子小的时候等宽字体能排出更大字号，可读性优先。
+ */
+function fitCodeFont(
+  ctx: CanvasRenderingContext2D,
+  texts: string[],
+  maxWidth: number,
+  preferred: number,
+  minSize: number,
+  families: string[],
+): CodeFont | null {
+  let best: CodeFont | null = null;
+  for (const family of families) {
+    let size = Math.floor(Math.min(preferred, MAX_CODE_FONT) * 2) / 2;
+    if (size < minSize) size = minSize;
+    while (size >= minSize - 1e-6) {
+      ctx.font = `600 ${size}px ${family}`;
+      let widest = 0;
+      for (const t of texts) {
+        const w = ctx.measureText(t).width;
+        if (w > widest) widest = w;
+      }
+      if (widest <= maxWidth) {
+        if (!best || size > best.size) best = { size, family };
+        break;
+      }
+      size = Math.round((size - 0.5) * 2) / 2;
+    }
+    // 已经能排到 preferred 上限了，换字体也不会更好
+    if (best && best.size >= Math.min(preferred, MAX_CODE_FONT) - 0.5) break;
+  }
+  return best;
+}
+
+/** 可视区（CSS px，相对图案左上角）。null = 不知道，退化为整张绘制。 */
+export interface PatternView {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * 把可视区换算成格子范围，并向外多留几格。
+ *
+ * 320 格 × 400% 时整张图有 5120×4336 设备像素（22M）—— 逐格遍历一遍色号
+ * 要 86,400 次 measure/draw，单帧根本进不了 16ms。视口裁剪后每次只处理
+ * 屏幕上真能看见的那几十格宽的行列，开销和缩放级别无关。
+ */
+function visibleCellRange(
+  metrics: CanvasMetrics,
+  view: PatternView | null | undefined,
+): { c0: number; c1: number; r0: number; r1: number } {
+  const { cols, rows, cellCss } = metrics;
+  if (!view) return { c0: 0, c1: cols, r0: 0, r1: rows };
+  const pad = 2;
+  const c0 = Math.max(0, Math.floor(view.x / cellCss) - pad);
+  const c1 = Math.min(cols, Math.ceil((view.x + view.w) / cellCss) + pad);
+  const r0 = Math.max(0, Math.floor(view.y / cellCss) - pad);
+  const r1 = Math.min(rows, Math.ceil((view.y + view.h) / cellCss) + pad);
+  return { c0, c1: Math.max(c0, c1), r0, r1: Math.max(r0, r1) };
+}
+
+/**
+ * 网格线宽度随格宽降级。
+ *
+ * 320 格时每格只有 3–4 CSS px，还按"10 格 = 3px 深线"画的话，一条线就吃掉
+ * 大半个格子，整张图看起来全是网格、色块反而不见了。网格是辅助定位的，
+ * 任何时候都不能盖过图案本身 —— 所以格子越小，线越少越细。
+ */
+function gridProfile(cellCss: number) {
+  if (cellCss >= 12) {
+    return { minor: true, minorAlpha: 0.22, med: true, medDev: 2, strongDev: 3 };
+  }
+  if (cellCss >= 7) {
+    return { minor: true, minorAlpha: 0.14, med: true, medDev: 2, strongDev: 2 };
+  }
+  if (cellCss >= 3.5) {
+    // 4px 格时 1px 的细线会糊成一片灰底，索性只留 5 格 / 10 格
+    return { minor: false, minorAlpha: 0, med: true, medDev: 1, strongDev: 2 };
+  }
+  // 再小就只剩 10 格主线，否则色块完全被网格吃掉
+  return { minor: false, minorAlpha: 0, med: false, medDev: 1, strongDev: 1 };
+}
+
+function drawPattern(
+  canvas: HTMLCanvasElement,
+  pattern: PatternResult,
+  metrics: CanvasMetrics,
+  surface: HTMLCanvasElement,
+  opts: {
+    showCodes: boolean;
+    showGrid: boolean;
+    tokens: CanvasTokens;
+    forceRebuild?: boolean;
+    view?: PatternView | null;
+    /** 手工改过的格子标记（1 = 改过），用于画金色三角 */
+    editMarks?: Uint8Array | null;
+  },
+) {
+  const { cols, rows, cellDev, eff, cssW, cssH } = metrics;
+  const cellCss = cellDev / eff;
+  const devW = cols * cellDev;
+  const devH = rows * cellDev;
+
+  // forceRebuild：图案换了（尺寸/内容），必须整块重建，不能复用上一张的位图
+  if (canvas.width !== devW || canvas.height !== devH || opts.forceRebuild) {
+    canvas.width = devW;
+    canvas.height = devH;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, devW, devH);
+  ctx.scale(eff, eff);
+
+  const d = (dev: number) => dev / eff;
+  const { tokens } = opts;
+  const { c0, c1, r0, r1 } = visibleCellRange(metrics, opts.view);
+
+  // ---- 1. 图案底色（离屏缓存，最近邻放大，绝不模糊） ----
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(surface, 0, 0, cols, rows, 0, 0, cssW, cssH);
+
+  // ---- 2. 分级网格 ----
+  if (opts.showGrid) {
+    const g = gridProfile(cellCss);
+    const medDev = eff >= 1.5 ? g.medDev : 1;
+    const strongDev = eff >= 1.5 ? g.strongDev : Math.min(g.strongDev, 2);
+
+    /*
+     * 只画可视区内的线条（±2 格余量）。整张图 320 格时要画的线本来也就
+     * 640 条，但配合 400% 缩放后每条线长 5120 设备像素，全画一遍的
+     * fillRect 调用量依然可观 —— 裁剪后开销只和视口大小有关。
+     */
+    const vLine = (col: number, wDev: number, color: string, alpha: number) => {
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      ctx.fillRect(d(col * cellDev), d(r0 * cellDev), d(wDev), d((r1 - r0) * cellDev));
+    };
+    const hLine = (row: number, hDev: number, color: string, alpha: number) => {
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = color;
+      ctx.fillRect(d(c0 * cellDev), d(row * cellDev), d((c1 - c0) * cellDev), d(hDev));
+    };
+
+    for (let c = c0; c <= c1; c++) {
+      if (c % 10 === 0) vLine(c, strongDev, tokens.lineStrong, 0.9);
+      else if (g.med && c % 5 === 0) vLine(c, medDev, tokens.ink3, 0.9);
+      else if (g.minor && c % 1 === 0) vLine(c, 1, tokens.line, g.minorAlpha);
+    }
+    for (let r = r0; r <= r1; r++) {
+      if (r % 10 === 0) hLine(r, strongDev, tokens.lineStrong, 0.9);
+      else if (g.med && r % 5 === 0) hLine(r, medDev, tokens.ink3, 0.9);
+      else if (g.minor) hLine(r, 1, tokens.line, g.minorAlpha);
+    }
+  }
+
+  // 图案外框永远画，便于看出图案边界（关掉网格时尤其重要）
+  ctx.globalAlpha = 0.9;
+  ctx.fillStyle = tokens.lineStrong;
+  ctx.fillRect(0, 0, d(devW), d(1));
+  ctx.fillRect(0, d(devH - 1), d(devW), d(1));
+  ctx.fillRect(0, 0, d(1), d(devH));
+  ctx.fillRect(d(devW - 1), 0, d(1), d(devH));
+
+  // ---- 3. 色号 ----
+  if (opts.showCodes && cellCss >= 9) {
+    const codes = pattern.palette.map((p) => p.code).filter(Boolean);
+    if (codes.length) {
+      // 留 8% 边距即可：色号本来就要撑满格子才好读（太多留白会把字号压小一档）
+      const maxWidth = cellCss * 0.92;
+      // 100% 时（cellCss≈19）保持 9.5px 的可读字号；放大后跟着格宽一起长
+      // （否则 300% 下每格 57px 里挤着 9px 的字，看着像没放大）。
+      const preferred = cellCss >= 14 ? Math.max(9.5, cellCss * 0.5) : cellCss * 0.55;
+      const code = fitCodeFont(ctx, codes, maxWidth, preferred, 6, tokens.codeFonts);
+      if (code) {
+        ctx.globalAlpha = 1;
+        ctx.font = `600 ${code.size}px ${code.family}`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const inks = pattern.palette.map((p) => readableInkFor(p.rgb));
+        const { cells } = pattern;
+        let lastInk = '';
+        for (let r = r0; r < r1; r++) {
+          for (let c = c0; c < c1; c++) {
+            const idx = cells[r * cols + c];
+            if (idx < 0) continue;
+            const bead = pattern.palette[idx];
+            if (!bead) continue;
+            const ink = inks[idx];
+            if (ink !== lastInk) {
+              ctx.fillStyle = ink;
+              lastInk = ink;
+            }
+            // 中心点对齐到整设备像素，文字才不会发虚
+            ctx.fillText(
+              bead.code,
+              d(Math.round((c + 0.5) * cellDev)),
+              d(Math.round((r + 0.5) * cellDev)),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /*
+   * ---- 3.5 手改标记 ----
+   *
+   * 每颗被手工改过的豆子右上角打一个金色小三角。为什么不用描边框：
+   * 50×50 时每格才 19px，描边会把整格颜色压掉一半、还把网格线糊掉；
+   * 三角只占右上角约 1/3，色号照样看得清，而且"尖角朝内"的形状在
+   * 满屏幕的方块里非常跳 —— 用户扫一眼就知道哪几颗是自己改的。
+   *
+   * 只在每格 ≥ 6px 时画：再小三角只有一个像素，等于给格子上了一颗脏点。
+   */
+  const marks = opts.editMarks;
+  if (marks && cellCss >= 6) {
+    /*
+     * 注意坐标系：这里已经 `ctx.scale(eff, eff)`，所以**一切尺寸都要用
+     * CSS px**（cellCss），不能混进设备像素 —— 混进去三角会画到画布外
+     * （dpr2 下坐标翻倍，实测整片消失）。格子边界那些地方才用 d() 把
+     * 设备像素换算回来，是为了让线条落在整设备像素上。
+     */
+    const leg = Math.max(2, Math.round(cellDev * 0.32)) / eff;
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = tokens.gold;
+    ctx.beginPath();
+    for (let r = r0; r < r1; r++) {
+      for (let c = c0; c < c1; c++) {
+        if (!marks[r * cols + c]) continue;
+        const x = (c + 1) * cellCss;
+        const y = r * cellCss;
+        ctx.moveTo(x - leg, y);
+        ctx.lineTo(x, y);
+        ctx.lineTo(x, y + leg);
+        ctx.closePath();
+      }
+    }
+    ctx.fill();
+    // 描一道深色边：金色在浅黄/亮绿豆子上会隐形，压深一档才够看
+    if (cellDev >= 10) {
+      ctx.globalAlpha = 0.55;
+      ctx.strokeStyle = tokens.goldDeep;
+      ctx.lineWidth = Math.max(1, 1 / eff);
+      ctx.stroke();
+    }
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 绘制：区域遮罩（独立图层，绝不污染图案本体）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把区域场画成一层"能看见但不挡图"的标记。
+ *
+ * 为什么按格画、而不是画一个模糊的圆：引擎的权重本来就是**按格**算的，
+ * 按格画出来的 alpha 阶梯就是引擎实际生效的那条羽化曲线 —— 用户看到的
+ * 渐变和最终重算出来的渐变是同一件事，不会"看着柔和、出图生硬"。
+ *
+ * 两层结构：
+ *   1. 填充：alpha = 权重 × 0.18，中心深、边缘淡，峰谷之间的过渡带自然浮现；
+ *   2. 轮廓：在权重穿过 0.5 的等值线上描一圈亮线，标出"核心区域在哪"。
+ *      只描核心等值线而不描填充最外沿 —— 外沿 alpha 已趋近 0，描了反而像硬边。
+ */
+function drawRegionMask(
+  canvas: HTMLCanvasElement,
+  metrics: CanvasMetrics,
+  appliedField: RegionField | null,
+  pendingField: RegionField | null,
+  liveWeights: Float32Array | null,
+  liveBox: { c0: number; r0: number; c1: number; r1: number } | null,
+  tokens: CanvasTokens,
+) {
+  const { cols, rows, cellDev } = metrics;
+  const devW = cols * cellDev;
+  const devH = rows * cellDev;
+
+  if (canvas.width !== devW || canvas.height !== devH) {
+    canvas.width = devW;
+    canvas.height = devH;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, devW, devH);
+  if (!appliedField?.active && !pendingField?.active && !liveWeights) return;
+
+  /*
+   * 这一层只回答一个问题：**哪些地方会被重新分析**。
+   *
+   * 刻意保持克制 —— 曾经试过两种"更花"的表达，都不合适：
+   *   a) 斜线网按密度分桶：各环覆盖率 28.4/26.4/27.7… 几乎恒定，
+   *      线距收窄与 alpha 变淡互相抵消，肉眼看不出梯度；
+   *   b) 每格撒采样点阵：梯度是出来了，但点阵把色号盖住了。
+   *      拼豆画布上真正的主角永远是色号，标记层不能抢。
+   *
+   * 现在每层只做两件事：极淡底纹（按权重衰减）+ 一圈外沿轮廓。
+   * 精度本身有没有真的渐变，看的是**重算后的图像**，不是这层标记 ——
+   * 标记若画得像另一种颜色，反而会误导用户以为区域被涂色了。
+   *
+   * 两套配色区分状态：
+   *   - 已应用（appliedField）：陶土色 + 虚线轮廓
+   *   - 待应用（pendingField）：天空蓝 + **实线**轮廓（更亮、更肯定，
+   *     因为这是"你正要提交的东西"，需要比已应用的更醒目）
+   */
+  const paint = (
+    field: RegionField | null,
+    color: string,
+    lineColor: string,
+    maskAlpha: number,
+    lineAlpha: number,
+    dashed: boolean,
+  ) => {
+    if (!field?.active) return;
+    const weights = field.w;
+
+    // 1) 极淡底纹：中心最浓，边缘随权重自然衰减到 0
+    ctx.fillStyle = color;
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const weight = weights[r * cols + c];
+        if (weight <= 0.02) continue;
+        ctx.globalAlpha = weight * maskAlpha;
+        ctx.fillRect(c * cellDev, r * cellDev, cellDev, cellDev);
+      }
+    }
+
+    /*
+     * 2) 外沿轮廓。
+     *
+     * 描在"权重刚过 0.02"的位置而不是 0.5：0.5 那圈是**参数变化最快**的
+     * 地方，描上去会形成一条视觉硬线，正是用户要避免的"生硬"。描在最
+     * 外沿只标记区域范围，中间的过渡区留给图像自己去渐变。
+     *
+     * 用连续 stroke 而非逐格 fillRect：相邻格的边界段在格角首尾相接，
+     * 逐段 stroke 才连得成一条折线（逐格填小方块会裂成碎屑）。
+     */
+    ctx.globalAlpha = lineAlpha;
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = Math.max(1, Math.round(cellDev * 0.07));
+    if (dashed) {
+      const dash = Math.max(2, Math.round(cellDev * 0.5));
+      ctx.setLineDash([dash, dash]);
+    }
+    ctx.beginPath();
+    const at = (r: number, c: number) =>
+      r < 0 || c < 0 || r >= rows || c >= cols ? 0 : weights[r * cols + c];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const inside = at(r, c) > 0.02;
+        if (inside !== at(r, c + 1) > 0.02) {
+          const x = (c + 1) * cellDev;
+          ctx.moveTo(x, r * cellDev);
+          ctx.lineTo(x, (r + 1) * cellDev);
+        }
+        if (inside !== at(r + 1, c) > 0.02) {
+          const y = (r + 1) * cellDev;
+          ctx.moveTo(c * cellDev, y);
+          ctx.lineTo((c + 1) * cellDev, y);
+        }
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  };
+
+  // 先画已应用（低调、虚线），再画待应用盖在上面（更醒目、实线）
+  paint(appliedField, tokens.clay, tokens.clayDeep, REGION_MASK_ALPHA, 0.4, true);
+  paint(pendingField, tokens.sky, tokens.sky, PENDING_MASK_ALPHA, 0.95, false);
+
+  /*
+   * 3) 正在拖的这一笔：alpha 与 pending 同档，但**不画轮廓**。
+   *
+   * 轮廓留给抬手后的 pending —— 拖动时每一帧都在重算外沿，轮廓线会
+   * 一路抖动，反而像坏了。所以"拖"和"已提交"的视觉差就是这圈实线
+   * 轮廓（外加 tag 从无到有）。
+   *
+   * 早先这里取 pending 的 0.75 倍（约 0.21），实测在白格上也几乎看不见，
+   * 用户抱怨的"按着没反应"等于没解决 —— 预览必须一眼可见，0.28 是
+   * 上限内能保证看得清的值。
+   */
+  if (liveWeights) {
+    /*
+     * 只遍历这一笔扫过的包围盒。
+     *
+     * 320 格是 86,400 格，全遍历一遍在 pointermove 里要 20ms+（实测手感
+     * 发滞）；而一笔最多只盖住几千格。包围盒由 growLiveBox 在盖章时
+     * 顺手累加，成本为 0。
+     */
+    const box = liveBox ?? { c0: 0, r0: 0, c1: cols - 1, r1: rows - 1 };
+    ctx.fillStyle = tokens.sky;
+    for (let r = Math.max(0, box.r0); r <= Math.min(rows - 1, box.r1); r++) {
+      for (let c = Math.max(0, box.c0); c <= Math.min(cols - 1, box.c1); c++) {
+        const weight = liveWeights[r * cols + c];
+        if (weight <= 0.02) continue;
+        ctx.globalAlpha = weight * PENDING_MASK_ALPHA;
+        ctx.fillRect(c * cellDev, r * cellDev, cellDev, cellDev);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+/**
+ * 笔刷圆环：跟随指针，半径就是这一笔实际会影响的半径（已含羽化带）。
+ * 虚线边 + 半透明填充，压在图上也能看清自己刷到哪儿。
+ */
+function drawBrushRing(
+  ctx: CanvasRenderingContext2D,
+  metrics: CanvasMetrics,
+  cursor: { x: number; y: number; r: number } | null,
+  tokens: CanvasTokens,
+) {
+  if (!cursor) return;
+  // ctx 已 scale(eff)，这里的坐标系就是 CSS px，直接用即可
+  const { x: cx, y: cy, r: radius } = cursor;
+  if (radius < 1) return;
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.globalAlpha = 0.13;
+  // 刷子模式下画出来的一切都先进"待应用"草稿层，所以圆环用草稿色 --sky，
+  // 和它在遮罩层里留下的蓝色选区是同一个语义
+  ctx.fillStyle = tokens.sky;
+  ctx.fill();
+
+  // 虚线间距随格宽走：固定间距在放大后会变成一串疏点，缩小时又会糊成实线
+  const dash = Math.max(3, Math.min(9, Math.round(metrics.cellCss * 0.5)));
+  ctx.globalAlpha = 0.95;
+  ctx.strokeStyle = tokens.sky;
+  ctx.lineWidth = metrics.eff >= 1.5 ? 1.5 : 1;
+  ctx.setLineDash([dash, dash]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 圆心十字：大笔刷下更需要一个精确落点
+  ctx.globalAlpha = 0.8;
+  ctx.fillStyle = tokens.sky;
+  const arm = Math.max(2, Math.round(radius * 0.14));
+  ctx.fillRect(cx - arm, cy - 0.5, arm * 2, 1);
+  ctx.fillRect(cx - 0.5, cy - arm, 1, arm * 2);
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------------------
+// 绘制：悬停 overlay（只重绘这一层）
+// ---------------------------------------------------------------------------
+
+function drawHover(
+  canvas: HTMLCanvasElement,
+  metrics: CanvasMetrics,
+  hover: HoverCell | null,
+  tokens: CanvasTokens,
+) {
+  const { cols, rows, cellDev, eff } = metrics;
+  const devW = cols * cellDev;
+  const devH = rows * cellDev;
+
+  if (canvas.width !== devW || canvas.height !== devH) {
+    canvas.width = devW;
+    canvas.height = devH;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, devW, devH);
+  if (!hover || cellDev < 4) return;
+  if (hover.col < 0 || hover.row < 0 || hover.col >= cols || hover.row >= rows) return;
+
+  ctx.scale(eff, eff);
+  const d = (dev: number) => dev / eff;
+  const x = hover.col * cellDev;
+  const y = hover.row * cellDev;
+
+  // 单色描边在深色豆（R22 那种深棕）上会糊掉，所以用"深-亮-陶土"三层环：
+  // 最外层深墨（亮色块可见）→ 中间纸白（深色块可见）→ 内层陶土（品牌色强调）。
+  if (cellDev >= 12) {
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = tokens.ink;
+    ringFill(ctx, d, x - 1, y - 1, cellDev + 2, cellDev + 2, 1);
+
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = tokens.paperHi;
+    ringFill(ctx, d, x, y, cellDev, cellDev, 1);
+
+    const ring = Math.max(2, Math.min(4, Math.round(cellDev * 0.11)));
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = tokens.clay;
+    ringFill(ctx, d, x + 1, y + 1, cellDev - 2, cellDev - 2, ring);
+
+    // 中心留一点纸白十字，密集色块里也能一眼锁定这一格
+    if (cellDev >= 22) {
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = tokens.paperHi;
+      const arm = Math.max(2, Math.round(cellDev * 0.12));
+      ctx.fillRect(
+        d(x + Math.round(cellDev / 2) - arm),
+        d(y + Math.round(cellDev / 2) - 1),
+        d(arm * 2),
+        d(2),
+      );
+      ctx.fillRect(
+        d(x + Math.round(cellDev / 2) - 1),
+        d(y + Math.round(cellDev / 2) - arm),
+        d(2),
+        d(arm * 2),
+      );
+    }
+  } else {
+    // 缩得很小时只画一圈，避免糊成一片
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = tokens.clay;
+    ringFill(ctx, d, x, y, cellDev, cellDev, 1);
+  }
+
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+/**
+ * 编辑工具。
+ *
+ * `pencil` 是唯一会连续绘制（拖出一片）的；`eraser` 同理；`picker` 与
+ * `fill` 都是一次性点击 —— 它们没有"拖动"的语义，拖也只算点一下。
+ */
+export type EditTool = 'pencil' | 'eraser' | 'picker' | 'fill';
+
+/** 编辑历史上限：每笔一格一条 delta，太大反而找不到想撤的那一步 */
+const MAX_EDIT_HISTORY = 200;
+
+export interface UsePatternCanvasOptions {
+  /** 受控的区域笔刷 */
+  brushes?: DetailBrush[];
+  /** 笔刷变化回调（每一笔结束 / 撤销 / 清空时调用一次） */
+  onBrushesChange?: (next: DetailBrush[]) => void;
+  /** 区域羽化（0.12–1），由父组件持有 */
+  regionFeather?: number;
+  /** 填满父容器高度（父容器需是有确定高度的 flex 列） */
+  fill?: boolean;
+  /** 品牌（编辑需要它把色号翻译成真实 hex/rgb） */
+  brand?: Brand;
+  /** 手工编辑覆盖层（受控；不传则编辑功能关闭） */
+  edits?: EditMap;
+  /** 编辑变化回调；`deltas` 是这次变化包含的若干笔（撤销栈用） */
+  onEditsChange?: (next: EditMap, deltas: EditDelta[]) => void;
+  /** 取色器/当前画笔色号 变化时通知父组件（色卡高亮用） */
+  onCurrentCodeChange?: (code: string) => void;
+  /** 初始工具（不传默认 pencil） */
+  initialTool?: EditTool;
+}
+
+export function usePatternCanvas(
+  pattern: PatternResult | null,
+  options: UsePatternCanvasOptions = {},
+) {
+  const {
+    brushes,
+    onBrushesChange,
+    regionFeather = 0.55,
+    fill = false,
+    brand,
+    edits: editsProp,
+    onEditsChange,
+    onCurrentCodeChange,
+    initialTool,
+  } = options;
+
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const maskRef = useRef<HTMLCanvasElement | null>(null);
+  const surfaceRef = useRef<SurfaceHit | null>(null);
+  const zoomRef = useRef(1);
+  const anchorRef = useRef<{ fx: number; fy: number; vx: number; vy: number; active: boolean }>({
+    fx: 0.5,
+    fy: 0.5,
+    vx: 0,
+    vy: 0,
+    active: false,
+  });
+
+  const [hostWidth, setHostWidth] = useState(0);
+  const [hostHeight, setHostHeight] = useState(0);
+  /**
+   * 滚动容器自身的可视尺寸。
+   *
+   * 不能用 hostHeight 算格子高度：host 里还有工具条（约 32px）和提示行，
+   * 拿整个 host 的高度去凑图，格子会比可视区多算一档，结果每次都差 30px
+   * 而多出一条纵向滚动条（实测 1920×1080：scrollH 774 vs clientH 742）。
+   * 滚动容器在 fill 模式下是 flex:1，高度只由父级决定、不受内容影响，
+   * 直接量它不会形成反馈环。
+   */
+  const [viewportW, setViewportW] = useState(0);
+  const [viewportH, setViewportH] = useState(0);
+
+  /**
+   * 滚动位置计数器。
+   *
+   * 滚动会改变"可视区"，可视区决定要重绘哪些格子 —— 所以滚动必须触发重绘，
+   * 否则一侧滚就会看到没画过的空白。用 rAF 节流：一次滚动事件只排一次重绘，
+   * 再快的滚轮也不会排队堆积。
+   */
+  const [scrollTick, setScrollTick] = useState(0);
+  const scrollRafRef = useRef(0);
+  const [dpr, setDpr] = useState(1);
+  const [zoom, setZoomState] = useState(1);
+  const [showCodes, setShowCodesState] = useState(true);
+  const [showGrid, setShowGridState] = useState(true);
+  const [showRulers, setShowRulersState] = useState(true);
+  const [showRegionOverlay, setShowRegionOverlayState] = useState(true);
+  const [hover, setHover] = useState<HoverCell | null>(null);
+  const lastPointerRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [themeTick, setThemeTick] = useState(0);
+
+  // ---- 刷区域状态 ----
+  const [brushMode, setBrushModeState] = useState(false);
+  const [brushAlgorithm, setBrushAlgorithmState] = useState<DetailAlgorithm>('crisp');
+  const [brushRadius, setBrushRadiusState] = useState(0.12);
+  /** 指针在画布上的归一化位置 + 设备像素半径，用于画笔刷圆环 */
+  const [brushCursor, setBrushCursor] = useState<{ x: number; y: number; r: number } | null>(
+    null,
+  );
+  /** 正在拖的这笔（抬手时并入 pending，不触发任何重算） */
+  const strokeRef = useRef<DetailBrush[] | null>(null);
+  /** 最后一次仍在画布内的位置：拖出画布再拖回来时用它补插值，线不断 */
+  const lastInsideRef = useRef<{ x: number; y: number } | null>(null);
+  /**
+   * 待应用的选区草稿。
+   *
+   * 这是"两步式"的核心：拖动过程中所有笔划只累在这里，**全程不调用
+   * onBrushesChange**。父组件的重算是 180ms debounce + 全图重算，如果
+   * 每一笔都提交，用户体感就是"只能单点、拖不动"——那正是要修的毛病。
+   * 用户点「应用重建」时这一整批才一次性提交。
+   *
+   * 不持久化：刷新即丢。否则隔天回来会莫名其妙带着一堆自己忘了的选区。
+   */
+  const [pendingStrokes, setPendingStrokesState] = useState<DetailBrush[][]>([]);
+  const pendingRef = useRef<DetailBrush[][]>([]);
+  const setPendingStrokes = useCallback((next: DetailBrush[][]) => {
+    pendingRef.current = next;
+    setPendingStrokesState(next);
+  }, []);
+  /** 草稿的扁平点序列：只用来算遮罩和提交，界面上按"几处"报数 */
+  const pendingPoints = useMemo(() => pendingStrokes.flat(), [pendingStrokes]);
+
+  /*
+   * 正在拖的这一笔的**实时**权重图。
+   *
+   * 为什么单独维护：pendingField 只在抬手后才有数据，拖动全程遮罩是空的 ——
+   * 用户手指底下什么都不发生，一松手突然冒出一大片，体感就是"没反应"。
+   * 但又不能每帧重建 RegionField（见 stampLive 上方的注释）。
+   *
+   * 所以这里走一张轻量 Float32Array，只被 pointermove 直接写，
+   * 再用 liveTick 这个计数器把重绘"推"一次（ref 变化不会触发渲染）。
+   */
+  const liveRef = useRef<Float32Array | null>(null);
+  const liveStampedRef = useRef(0);
+  const [liveTick, setLiveTick] = useState(0);
+  /**
+   * 这一笔实时遮罩覆盖的格子包围盒。
+   *
+   * 每一帧重画实时层时只遍历这块区域 —— 320 格是 86,400 格，全遍历一遍
+   * 要 20ms 以上（实测拖动手感发滞），只遍历笔刷扫过的几百格则 <1ms。
+   */
+  const liveBoxRef = useRef<{ c0: number; r0: number; c1: number; r1: number } | null>(null);
+  const liveRafRef = useRef(0);
+
+  const brushModeRef = useRef(false);
+  const brushAlgorithmRef = useRef<DetailAlgorithm>('crisp');
+  const brushRadiusRef = useRef(0.12);
+
+  /**
+   * 推进实时层。
+   *
+   * 用 rAF 合并：pointermove 在 120Hz 触摸屏上每秒能来 120 次，每次都
+   * setState 会让 React 一帧渲染多轮、遮罩层重复重画。合并到"每帧最多
+   * 一次"后，帧耗时和事件频率无关。
+   */
+  /** 把一支笔的包围盒并进实时层的总包围盒 */
+  const growLiveBox = useCallback((p: DetailBrush) => {
+    if (!pattern) return;
+    const { cols, rows } = pattern;
+    // 包围盒必须按 reach（含羽化带）算，否则外圈过渡区画不出来
+    const { cx, cy, reach } = brushGeometry(
+      p.x,
+      p.y,
+      p.radius,
+      cols,
+      rows,
+      featherRef.current,
+    );
+    const r = Math.ceil(reach) + 1;
+    const c0 = Math.max(0, Math.floor(cx - r));
+    const c1 = Math.min(cols - 1, Math.ceil(cx + r));
+    const r0 = Math.max(0, Math.floor(cy - r));
+    const r1 = Math.min(rows - 1, Math.ceil(cy + r));
+    const cur = liveBoxRef.current;
+    if (!cur) {
+      liveBoxRef.current = { c0, r0, c1, r1 };
+      return;
+    }
+    if (c0 < cur.c0) cur.c0 = c0;
+    if (r0 < cur.r0) cur.r0 = r0;
+    if (c1 > cur.c1) cur.c1 = c1;
+    if (r1 > cur.r1) cur.r1 = r1;
+  }, [pattern]);
+
+  const bumpLiveTick = useCallback(() => {
+    if (liveRafRef.current) return;
+    liveRafRef.current = requestAnimationFrame(() => {
+      liveRafRef.current = 0;
+      setLiveTick((t) => t + 1);
+    });
+  }, []);
+
+  /** 清掉实时层（抬笔 / 移出画布 / 切出刷子 / 换图案都要清，否则留幽灵遮罩） */
+  const resetLive = useCallback(() => {
+    liveRef.current = null;
+    liveStampedRef.current = 0;
+    // 注意：liveBoxRef 由绘制 effect 在擦完上一帧后自己清空，
+    // 这里清掉会导致那一块擦不干净（残留幽灵遮罩）
+    setLiveTick((t) => t + 1);
+  }, []);
+
+  /** 确保实时层已分配，并和设备尺寸对齐 */
+  const ensureLive = useCallback((cols: number, rows: number): Float32Array => {
+    const need = cols * rows;
+    const cur = liveRef.current;
+    if (!cur || cur.length !== need) {
+      const fresh = new Float32Array(need);
+      liveRef.current = fresh;
+      liveStampedRef.current = 0;
+      return fresh;
+    }
+    return cur;
+  }, []);
+  const brushesRef = useRef<DetailBrush[]>(brushes ?? []);
+  brushesRef.current = brushes ?? [];
+
+  const hasPattern = !!pattern && pattern.cols > 0 && pattern.rows > 0;
+  /**
+   * fill 生效条件：父容器必须真的给出了高度。
+   *
+   * 移动端单列布局里父容器常常没有确定高度（或者 h-dvh 被软键盘压缩），
+   * 直接用 height:100% 会把画布塌成一条线。所以低于 MIN_FILL_HOST_HEIGHT
+   * 就自动降级回"限高 + 内部滚动"的老行为 —— ResizeObserver 同时盯着宽高，
+   * 条件恢复时会自动切回 fill，不需要额外的窗口 resize 监听。
+   */
+  const useFill = fill && hostHeight >= MIN_FILL_HOST_HEIGHT;
+
+  // ==========================================================================
+  // 编辑层（手绘 / 橡皮 / 取色器 / 油漆桶）
+  // ==========================================================================
+
+  /*
+   * 编辑的真相分两层：`pattern` 是引擎结果（不可变），`edits` 是稀疏覆盖层。
+   * 画布、统计、导出都必须消费**两者叠加后**的结果，否则"屏幕上看到的"
+   * 和"拼出来的"就会打架。这里统一在 hook 内部算出叠加后的 `displayPattern`，
+   * 下游（surface / 色号 / 统计条）只认它，不再各自去 applyEdits。
+   */
+  const edits = editsProp ?? EMPTY_EDITS;
+  const editsRef = useRef<EditMap>(edits);
+  editsRef.current = edits;
+
+  /** 编辑器是否可用：父组件给了 onEditsChange 才启用（不传则整块 UI 消失） */
+  const editEnabled = typeof onEditsChange === 'function' && typeof brand === 'string';
+
+  /**
+   * 叠加编辑后的图案 —— **画布/统计/hover 全都只认这一个**。
+   *
+   * 为什么不把编辑直接写回 pattern：pattern 是引擎结果，换参数重算时要
+   * 能整体替换；覆盖层独立存着，重算后同一套格子下标还能继续套用。
+   *
+   * `editCount > 0` 才克隆：没编辑时直接返回原引用，surface 缓存命中，
+   * 不会白重建一张 320×292 的位图。
+   */
+  const displayPattern = useMemo<PatternResult | null>(() => {
+    if (!pattern) return pattern;
+    if (!editEnabled || !brand) return pattern;
+    if (editCount(edits) === 0) return pattern;
+    return applyEdits(pattern, edits, brand);
+  }, [pattern, edits, brand, editEnabled]);
+
+  /**
+   * 手改格子的位图（每格 1 字节），供 drawPattern 画金色三角。
+   *
+   * 用 Uint8Array 而不是 Set<number>：drawPattern 里要对可视区每一格做
+   * 一次查表，Set.has 在 30 万格/帧的量级下比数组下标慢一个数量级。
+   */
+  const editMarks = useMemo<Uint8Array | null>(() => {
+    if (!pattern || !editEnabled) return null;
+    const keys = Object.keys(edits);
+    if (keys.length === 0) return null;
+    const marks = new Uint8Array(pattern.cells.length);
+    for (const key of keys) {
+      const i = Number(key);
+      if (Number.isInteger(i) && i >= 0 && i < marks.length) marks[i] = 1;
+    }
+    return marks;
+  }, [pattern, edits, editEnabled]);
+
+  const [editTool, setEditToolState] = useState<EditTool>(initialTool ?? 'pencil');
+  const [currentCode, setCurrentCodeState] = useState<string>('');
+  // 事件回调里要读最新工具/色号，但不能让它们进依赖数组（否则每换一次色就重建指针处理器）
+  const editToolRef = useRef<EditTool>(editTool);
+  editToolRef.current = editTool;
+  const currentCodeRef = useRef(currentCode);
+  currentCodeRef.current = currentCode;
+
+  /*
+   * 撤销/重做栈存的是 **delta**（改了哪些格、改之前是什么、改之后是什么），
+   * 不是整份 EditMap 快照 —— 一张 320 格图纸改 500 格时，快照会占几十 MB。
+   */
+  /*
+   * 刷区域的"隐式应用"也要能撤销（lead 明确要求）。
+   *
+   * 但刷子和编辑是两个不同的数据层：刷子改的是 `brushes`（引擎重算的输入），
+   * 编辑改的是 `edits`（格子覆盖层）。撤销栈如果只认 delta，就撤不掉
+   * brushes 的变化。所以这里额外记一份"刷子快照"，让 Ctrl+Z 在两类操作
+   * 之间按时间顺序回退 —— 用户不关心底层是哪个层，他只知道"刚才那一下"。
+   */
+  type BrushUndoEntry = { kind: 'brushes'; before: DetailBrush[]; after: DetailBrush[] };
+  type EditUndoEntry = { kind: 'edits'; delta: EditDelta };
+  const undoLogRef = useRef<(BrushUndoEntry | EditUndoEntry)[]>([]);
+  const redoLogRef = useRef<(BrushUndoEntry | EditUndoEntry)[]>([]);
+  /** 栈状态用计数器推进渲染（栈本身在 ref 里，避免每次 push 都整棵重渲染） */
+  const [historyTick, setHistoryTick] = useState(0);
+  const bumpHistory = useCallback(() => setHistoryTick((t) => t + 1), []);
+
+  /** 把一笔记入撤销栈（同时清空重做栈：新的分支开始了） */
+  const pushUndo = useCallback(
+    (entry: BrushUndoEntry | EditUndoEntry) => {
+      const log = undoLogRef.current;
+      log.push(entry);
+      if (log.length > MAX_EDIT_HISTORY) log.shift();
+      redoLogRef.current = [];
+      bumpHistory();
+    },
+    [bumpHistory],
+  );
+
+  /** 提交一批编辑 delta（一次油漆桶 / 一笔涂色 = 一条或多条 delta，原子撤销） */
+  const commitDeltas = useCallback(
+    (deltas: EditDelta[]) => {
+      if (!onEditsChange || deltas.length === 0) return;
+      let next = editsRef.current;
+      for (const d of deltas) next = applyDelta(next, d);
+      // 多条 delta 合成一条历史项，撤销时一起退掉
+      const merged: EditDelta =
+        deltas.length === 1
+          ? deltas[0]
+          : {
+              cells: deltas.flatMap((d) => d.cells),
+              before: deltas.flatMap((d) => d.before),
+              after: deltas.flatMap((d) => d.after),
+            };
+      editsRef.current = next;
+      pushUndo({ kind: 'edits', delta: merged });
+      onEditsChange(next, deltas);
+    },
+    [onEditsChange, pushUndo],
+  );
+
+  const setCurrentCode = useCallback(
+    (code: string) => {
+      setCurrentCodeState(code);
+      onCurrentCodeChange?.(code);
+    },
+    [onCurrentCodeChange],
+  );
+
+  // ---- 偏好恢复（挂载后一次） ----
+  useEffect(() => {
+    const z = Number(readPref(PREF_KEYS.zoom));
+    if (Number.isFinite(z) && z > 0) {
+      const v = clampZoom(z);
+      zoomRef.current = v;
+      setZoomState(v);
+    }
+    setShowCodesState(readBoolPref(PREF_KEYS.codes, true));
+    setShowGridState(readBoolPref(PREF_KEYS.grid, true));
+    setShowRulersState(readBoolPref(PREF_KEYS.rulers, true));
+    setShowRegionOverlayState(readBoolPref(PREF_KEYS.regionOverlay, true));
+  }, []);
+
+  // ---- 设置器（同时持久化） ----
+  const setZoom = useCallback((next: number) => {
+    const v = clampZoom(next);
+    zoomRef.current = v;
+    setZoomState(v);
+    writePref(PREF_KEYS.zoom, String(v));
+  }, []);
+
+  const setShowCodes = useCallback((next: boolean | ((p: boolean) => boolean)) => {
+    setShowCodesState((prev) => {
+      const v = typeof next === 'function' ? next(prev) : next;
+      writePref(PREF_KEYS.codes, v ? '1' : '0');
+      return v;
+    });
+  }, []);
+  const setShowGrid = useCallback((next: boolean | ((p: boolean) => boolean)) => {
+    setShowGridState((prev) => {
+      const v = typeof next === 'function' ? next(prev) : next;
+      writePref(PREF_KEYS.grid, v ? '1' : '0');
+      return v;
+    });
+  }, []);
+  const setShowRulers = useCallback((next: boolean | ((p: boolean) => boolean)) => {
+    setShowRulersState((prev) => {
+      const v = typeof next === 'function' ? next(prev) : next;
+      writePref(PREF_KEYS.rulers, v ? '1' : '0');
+      return v;
+    });
+  }, []);
+
+  const setShowRegionOverlay = useCallback((next: boolean | ((p: boolean) => boolean)) => {
+    setShowRegionOverlayState((prev) => {
+      const v = typeof next === 'function' ? next(prev) : next;
+      writePref(PREF_KEYS.regionOverlay, v ? '1' : '0');
+      return v;
+    });
+  }, []);
+
+  const setBrushRadius = useCallback((next: number) => {
+    const v = Math.min(BRUSH_RADIUS_MAX, Math.max(BRUSH_RADIUS_MIN, next));
+    brushRadiusRef.current = v;
+    setBrushRadiusState(v);
+  }, []);
+
+  const setBrushAlgorithm = useCallback((next: DetailAlgorithm) => {
+    brushAlgorithmRef.current = next;
+    setBrushAlgorithmState(next);
+  }, []);
+
+  const setBrushMode = useCallback(
+    (next: boolean | ((p: boolean) => boolean)) => {
+      setBrushModeState((prev) => {
+        const v = typeof next === 'function' ? next(prev) : next;
+        brushModeRef.current = v;
+        if (!v) {
+          setBrushCursor(null);
+          // 切出刷子模式时清掉实时层：否则那张半成品遮罩会一直挂着，
+          // 变成一层没有对应的"幽灵选区"
+          strokeRef.current = null;
+          resetLive();
+        }
+        return v;
+      });
+    },
+    [resetLive],
+  );
+
+  const setEditTool = useCallback(
+    (t: EditTool) => {
+      setEditToolState(t);
+      // 切工具时退出刷区域模式：两套拖动语义会打架（一个改格子、一个改选区）
+      if (brushModeRef.current) setBrushMode(false);
+    },
+    [setBrushMode],
+  );
+
+
+  // ---- 容器尺寸（宽定 cellPx，高只用于判定 fill 是否成立） ----
+  useEffect(() => {
+    if (!hasPattern) return;
+    const host = hostRef.current;
+    if (!host) return;
+    const measure = () => {
+      const rect = host.getBoundingClientRect();
+      if (rect.width > 0) setHostWidth(Math.round(rect.width));
+      // offsetHeight 而非 rect.height：host 在 fill 模式下高度由 flex 决定，
+      // 用布局高度才能在内容把容器撑高时拿到真实值
+      setHostHeight(Math.round(host.clientHeight || rect.height));
+      const vp = scrollRef.current;
+      if (vp) {
+        setViewportW(Math.round(vp.clientWidth));
+        setViewportH(Math.round(vp.clientHeight));
+      }
+      /*
+       * 容器尺寸变化也会改变"可视区"，而 computeView() 读的是 DOM 矩形。
+       * 只靠 metrics 变化来驱动重绘不够：分栏断点切换、拖动窗口这些场景
+       * 里 cellPx 可能算出同一个值（宽度刚好卡在两档之间），但可视区变了，
+       * 视口裁剪就会按旧范围画、边缘漏白。这里显式再推一次。
+       */
+      if (scrollRafRef.current) return;
+      scrollRafRef.current = requestAnimationFrame(() => {
+        scrollRafRef.current = 0;
+        setScrollTick((t) => t + 1);
+      });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(host);
+    if (scrollRef.current) ro.observe(scrollRef.current);
+    return () => ro.disconnect();
+  }, [hasPattern]);
+
+  // ---- devicePixelRatio（含跨屏拖动的 dppx 变化） ----
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const update = () => setDpr(window.devicePixelRatio || 1);
+    update();
+    window.addEventListener('resize', update);
+    let mq: MediaQueryList | null = null;
+    const onDppx = () => {
+      update();
+      mq?.removeEventListener('change', onDppx);
+      mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      mq.addEventListener('change', onDppx);
+    };
+    onDppx();
+    return () => {
+      window.removeEventListener('resize', update);
+      mq?.removeEventListener('change', onDppx);
+    };
+  }, []);
+
+  // ---- 主题变化 / 字体加载完成后重绘 ----
+  useEffect(() => {
+    const bump = () => setThemeTick((t) => t + 1);
+    const mo = new MutationObserver(bump);
+    mo.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class', 'data-theme'],
+    });
+    document.fonts?.ready.then(bump).catch(() => {});
+    return () => mo.disconnect();
+  }, []);
+
+  // ---- 每格尺寸 ----
+  /**
+   * 100% 时的格子大小。
+   *
+   * fill 模式下**同时**受宽度和高度约束：只按宽度算的话，64×54 的图在
+   * 1440 宽的中栏里每格约 18px，图高 972px，而可视区只有 566px ——
+   * 打开就要滚动才能看全，工作台上"一眼看到整张图"的意义就没了。
+   * 所以高度也参与取小值，让整张图刚好铺满可视区（用户仍可放大看细节，
+   * 那时才出现滚动条，是符合预期的）。
+   *
+   * 高度约束只在 useFill 成立、且 hostHeight 是有效值时启用：非 fill 模式
+   * 高度本来就由内容决定，拿它算会形成反馈环。
+   */
+  const cellPx = useMemo(() => {
+    if (!pattern) return 16;
+    const rulerX = showRulers ? RULER_LEFT : 0;
+    // 有滚动容器的实测宽度就优先用它（减掉边框），否则退回 hostWidth
+    const baseW = viewportW > 0 ? viewportW - FRAME_BORDER : (hostWidth || 640) - FRAME_PAD;
+    const availW = Math.max(120, baseW - rulerX - SCROLLBAR_ALLOWANCE);
+    const fitW = Math.floor(availW / Math.max(1, pattern.cols));
+
+    let fit = fitW;
+    if (useFill && viewportH > 0) {
+      const rulerY = showRulers ? RULER_TOP : 0;
+      // 横向滚动条只有在真的溢出时才占位，先按不出现算，留 1 格余量即可
+      const availH = Math.max(80, viewportH - FRAME_BORDER - rulerY);
+      const fitH = Math.floor(availH / Math.max(1, pattern.rows));
+      fit = Math.min(fitW, fitH);
+    }
+
+    const base = Math.max(MIN_FIT_CELL, Math.min(MAX_FIT_CELL, fit));
+    return Math.max(2, Math.round(base * zoom));
+  }, [pattern, hostWidth, viewportW, viewportH, showRulers, zoom, useFill]);
+
+  const metrics = useMemo<CanvasMetrics | null>(() => {
+    if (!hasPattern || !pattern) return null;
+    return computeMetrics(pattern.cols, pattern.rows, cellPx, dpr);
+  }, [hasPattern, pattern, cellPx, dpr]);
+
+  /**
+   * 区域场：直接复用引擎的 buildRegionField 解算。
+   *
+   * 关键点 —— 画布上画的遮罩和引擎算出来的参数场是**同一份数据**，
+   * 所以用户看到的渐变就是重算时真正生效的渐变。若这里自己用高斯模糊
+   * 画个好看的圆，等重算出来是另一条曲线，那个"所见即所得"就断了。
+   */
+  const regionField = useMemo<RegionField | null>(() => {
+    if (!pattern || !brushes || brushes.length === 0) return null;
+    const base = getDetailProfile(pattern.meta?.detail);
+    return buildRegionField(pattern.cols, pattern.rows, brushes, base, regionFeather);
+  }, [pattern, brushes, regionFeather]);
+
+  /** 待应用草稿对应的参数场：只用来画蓝色遮罩，绝不喂给引擎 */
+  const pendingField = useMemo<RegionField | null>(() => {
+    if (!pattern || pendingPoints.length === 0) return null;
+    const base = getDetailProfile(pattern.meta?.detail);
+    return buildRegionField(pattern.cols, pattern.rows, pendingPoints, base, regionFeather);
+  }, [pattern, pendingPoints, regionFeather]);
+
+  /**
+   * 覆盖率一律按**格数**估算，用圆面积累加。
+   *
+   * 不用 regionCoverage(field)：那是引擎按 smoothstep 权重求和再除以总格数，
+   * 权重在羽化带里衰减到 0，大笔刷重叠时数字也上不去，跟用户"我刷了一片"
+   * 的直觉对不上。这里直接 π r²（r 换算成格）× 笔次，再按总格数归一，
+   * 多笔重叠会超过 100%，所以最后 clamp —— 宁可显示 100% 也不能出现 137%。
+   */
+  /**
+   * 估算一组笔刷覆盖了图案的百分之多少。
+   *
+   * 不能用"Σ 圆面积 ÷ 总格数"：拖动时插值出来的几十个点间距远小于笔刷
+   * 半径，圆与圆大幅重叠，面积一相加就爆表（实测一笔拖动算出 70%，
+   * 而实际只盖住中间一条带）。这里改成**按格求并集**：把每个笔刷的包围盒
+   * 扫一遍，命中圆心距 ≤ 半径的格子打标记，最后数标记数。
+   *
+   * 顺带得到两个好处：① 天然不会超过 100%，不用再 clamp；
+   * ② 数字和用户眼睛看到的蓝色选区面积一致，不会"我明明只刷了一条，怎么
+   * 显示 70%"。
+   */
+  const estimateCoverage = useCallback(
+    (strokes: DetailBrush[] | undefined): number => {
+      if (!pattern || !strokes || strokes.length === 0) return 0;
+      const { cols, rows } = pattern;
+      const totalCells = cols * rows;
+      if (totalCells <= 0) return 0;
+      const longest = Math.max(cols, rows);
+      const hits = new Uint8Array(totalCells);
+      let covered = 0;
+
+      for (const b of strokes) {
+        const rCells = Math.max(0.6, b.radius * longest);
+        /*
+         * 用 reach（核心 + 羽化带）而不是只有核心半径。
+         *
+         * 引擎真正会重算的是 reach 这么大一块，遮罩也是画到 reach 的（权重
+         * 衰减到 0.02 处）。如果这里只数核心圆，就会出现"显示覆盖 17%、
+         * 蓝色却盖了小半张图"的自相矛盾 —— 用户会怀疑数字是假的。
+         * bandCells 必须和 buildRegionField 内部用同一个公式。
+         */
+        const bandCells = Math.min(
+          rCells,
+          Math.max(1.2, rCells * Math.max(0.12, regionFeather)),
+        );
+        const reach = rCells + bandCells;
+        const cx = b.x * cols;
+        const cy = b.y * rows;
+        const r2 = reach * reach;
+        // 只扫圆的包围盒，别为每支笔都遍历整张图
+        const c0 = Math.max(0, Math.floor(cx - reach));
+        const c1 = Math.min(cols - 1, Math.ceil(cx + reach));
+        const r0 = Math.max(0, Math.floor(cy - reach));
+        const r1 = Math.min(rows - 1, Math.ceil(cy + reach));
+        for (let r = r0; r <= r1; r++) {
+          const dy = r + 0.5 - cy;
+          for (let c = c0; c <= c1; c++) {
+            const dx = c + 0.5 - cx;
+            if (dx * dx + dy * dy > r2) continue;
+            const i = r * cols + c;
+            if (hits[i]) continue;
+            hits[i] = 1;
+            covered++;
+          }
+        }
+      }
+      return covered / totalCells;
+    },
+    [pattern, regionFeather],
+  );
+
+  /**
+   * 已应用的"几处" = 重新聚出来的笔数。
+   *
+   * brushes 是扁平的点数组（一次拖动插值成十几个点），直接数 length 会
+   * 显示"已应用 13 处"而用户只画了一笔。见 clusterBrushes 的注释。
+   */
+  const appliedGroups = useMemo(
+    () =>
+      pattern && brushes?.length
+        ? clusterBrushes(brushes, pattern.cols, pattern.rows)
+        : ([] as DetailBrush[][]),
+    [brushes, pattern],
+  );
+  const appliedCount = appliedGroups.length;
+  /** 草稿是按笔分组存的，"几处"直接数分组 */
+  /**
+   * 草稿的"几处" = **连通块数**，不是笔数。
+   *
+   * 用户连着拖三笔把一片刷满，他心里是"一块区域"；如果报"3 处"，
+   * 读数和他眼睛看到的就对不上了。4 邻域 BFS 在 pendingField.w 上跑，
+   * 依赖是 pendingField（useMemo），所以只在草稿变化时算一次，
+   * 绝不进渲染循环。
+   */
+  const pendingRegions = useMemo(() => {
+    if (!pattern || !pendingField?.active) return 0;
+    const { cols, rows } = pattern;
+    const w = pendingField.w;
+    const seen = new Uint8Array(cols * rows);
+    const stack: number[] = [];
+    let count = 0;
+    for (let i = 0; i < w.length; i++) {
+      if (seen[i] || w[i] <= 0.02) continue;
+      count++;
+      seen[i] = 1;
+      stack.push(i);
+      while (stack.length > 0) {
+        const j = stack.pop() as number;
+        const r = (j / cols) | 0;
+        const c = j % cols;
+        if (r > 0 && !seen[j - cols] && w[j - cols] > 0.02) {
+          seen[j - cols] = 1;
+          stack.push(j - cols);
+        }
+        if (r < rows - 1 && !seen[j + cols] && w[j + cols] > 0.02) {
+          seen[j + cols] = 1;
+          stack.push(j + cols);
+        }
+        if (c > 0 && !seen[j - 1] && w[j - 1] > 0.02) {
+          seen[j - 1] = 1;
+          stack.push(j - 1);
+        }
+        if (c < cols - 1 && !seen[j + 1] && w[j + 1] > 0.02) {
+          seen[j + 1] = 1;
+          stack.push(j + 1);
+        }
+      }
+    }
+    return count;
+  }, [pendingField, pattern]);
+
+  /** 笔数仍要保留：撤销是按"一笔"操作的 */
+  const pendingCount = pendingRegions;
+
+  const appliedCoverage = useMemo(() => estimateCoverage(brushes), [estimateCoverage, brushes]);
+  /**
+   * 草稿覆盖率 = pending ∪ 正在拖的这一笔，按**格数**数。
+   *
+   * 用权重图而不是圆的面积（applied 那边还在用面积法）：拖动中每一笔都
+   * 是密集重叠的点，面积法会把同几格数十几遍，数字一路飙到 100% 而图上
+   * 只有一条带。权重图天然去重，数字和图面一致。
+   */
+  const pendingCoverage = useMemo(() => {
+    if (!pattern) return 0;
+    // liveTick 只用于"拖动推进时重算"：权重图是 ref，本身不触发渲染，
+    // 靠这个计数器把新值推出来。这里显式读一下，让依赖关系成立。
+    if (liveTick < 0) return 0;
+    const total = pattern.cols * pattern.rows;
+    if (total <= 0) return 0;
+    const pw = pendingField?.active ? pendingField.w : null;
+    const lw = liveRef.current;
+    if (!pw && !lw) return 0;
+    let n = 0;
+    for (let i = 0; i < total; i++) {
+      const a = pw ? pw[i] : 0;
+      const b = lw ? lw[i] : 0;
+      if (a > 0.02 || b > 0.02) n++;
+    }
+    return n / total;
+  }, [pattern, pendingField, liveTick]);
+
+  /**
+   * 已应用的摘要。
+   *
+   * count 用 brushes.length 而不是"几个圈"：一个圈在插值后会展开成很多个点，
+   * 用户眼里"我刷了 1 处"，所以这里按**笔数**统计（stroke 数），不是点数。
+   */
+  const regionSummary = useMemo(() => {
+    if (!regionField || !regionField.active) {
+      return {
+        active: false,
+        count: 0,
+        coverage: 0,
+        algorithms: [] as DetailAlgorithm[],
+        appliedCount,
+        pendingCount,
+        appliedCoverage,
+        pendingCoverage,
+      };
+    }
+    return {
+      active: true,
+      count: brushes?.length ?? 0,
+      coverage: appliedCoverage,
+      algorithms: regionAlgorithms(regionField),
+      appliedCount,
+      pendingCount,
+      appliedCoverage,
+      pendingCoverage,
+    };
+  }, [
+    regionField,
+    brushes,
+    appliedCount,
+    pendingCount,
+    appliedCoverage,
+    pendingCoverage,
+  ]);
+
+  // ---- 缩放：以光标为锚点 ----
+  const zoomAt = useCallback(
+    (next: number, anchor?: { clientX: number; clientY: number }) => {
+      const scroll = scrollRef.current;
+      const canvas = canvasRef.current;
+      if (scroll && canvas) {
+        const sRect = scroll.getBoundingClientRect();
+        const a =
+          anchor ?? {
+            clientX: sRect.left + sRect.width / 2,
+            clientY: sRect.top + sRect.height / 2,
+          };
+        const cRect = canvas.getBoundingClientRect();
+        if (cRect.width > 0 && cRect.height > 0) {
+          anchorRef.current = {
+            fx: (a.clientX - cRect.left) / cRect.width,
+            fy: (a.clientY - cRect.top) / cRect.height,
+            vx: a.clientX - sRect.left,
+            vy: a.clientY - sRect.top,
+            active: true,
+          };
+        }
+      }
+      setZoom(next);
+    },
+    [setZoom],
+  );
+
+  const zoomIn = useCallback(() => zoomAt(zoomRef.current + ZOOM_STEP), [zoomAt]);
+  const zoomOut = useCallback(() => zoomAt(zoomRef.current - ZOOM_STEP), [zoomAt]);
+  const resetZoom = useCallback(() => zoomAt(1), [zoomAt]);
+
+  // 缩放后把光标下的那一格固定在原处（缩放前记录的锚点，布局更新后应用）
+  const useIsoLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+  useIsoLayoutEffect(() => {
+    const anchor = anchorRef.current;
+    if (!anchor.active) return;
+    anchor.active = false;
+    const scroll = scrollRef.current;
+    const canvas = canvasRef.current;
+    if (!scroll || !canvas || !metrics) return;
+    const sRect = scroll.getBoundingClientRect();
+    const cRect = canvas.getBoundingClientRect();
+    const offX = cRect.left - sRect.left + scroll.scrollLeft;
+    const offY = cRect.top - sRect.top + scroll.scrollTop;
+    scroll.scrollLeft = offX + anchor.fx * cRect.width - anchor.vx;
+    scroll.scrollTop = offY + anchor.fy * cRect.height - anchor.vy;
+  }, [zoom, metrics, showRulers]);
+
+  // ---- 滚轮缩放（只作用于画布表面；React 的 onWheel 是被动的，必须原生监听） ----
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target?.closest('[data-canvas-surface]')) return;
+      e.preventDefault();
+      const factor = Math.exp(-e.deltaY * 0.0016);
+      zoomAt(zoomRef.current * factor, { clientX: e.clientX, clientY: e.clientY });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+    // hasPattern：空状态时滚动容器还没挂载，图案出现后必须重新绑定
+  }, [zoomAt, hasPattern]);
+
+  // ---- 指针悬停 ----
+  const onPointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (brushModeRef.current) return; // 刷子模式不再弹色号 tooltip
+      const canvas = canvasRef.current;
+      if (!canvas || !pattern) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const px = e.clientX;
+      const py = e.clientY;
+      lastPointerRef.current = { x: px, y: py };
+      const col = Math.floor(((px - rect.left) / rect.width) * pattern.cols);
+      const row = Math.floor(((py - rect.top) / rect.height) * pattern.rows);
+      if (row < 0 || col < 0 || row >= pattern.rows || col >= pattern.cols) {
+        setHover((prev) => (prev ? null : prev));
+        return;
+      }
+      setHover((prev) =>
+        prev && prev.row === row && prev.col === col && prev.x === px && prev.y === py
+          ? prev
+          : { row, col, x: px, y: py },
+      );
+    },
+    [pattern],
+  );
+
+  const onPointerLeave = useCallback(() => {
+    setHover(null);
+    setBrushCursor(null);
+    /*
+     * 指针离开画布也要清实时层。
+     *
+     * 但只在「这一笔已经断了」时清：正常拖动拖出画布外再拖回来，
+     * strokeRef 还在（pointer capture 让事件继续送来），此时清掉会让
+     * 遮罩闪一下。真正该清的是"没按下却残留"的情况。
+     */
+    if (!strokeRef.current) resetLive();
+  }, [resetLive]);
+
+  // ---- 刷区域：Pointer Events（鼠标 / 触屏 / 手写笔同一套） ----
+
+  /** 视口坐标 → 归一化图案坐标（0..1）。超出画布时夹紧，避免刷到界外产生无效笔刷 */
+  const toPatternSpace = useCallback(
+    (clientX: number, clientY: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      return {
+        x: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
+        y: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height)),
+        inside:
+          clientX >= rect.left &&
+          clientX <= rect.right &&
+          clientY >= rect.top &&
+          clientY <= rect.bottom,
+      };
+    },
+    [],
+  );
+
+  /**
+   * 把一笔落成点序列。
+   *
+   * 两个间距参数针对不同问题：
+   *  - 插值间距 radius*0.35：快速拖动时两次 pointermove 可能隔了半张图，
+   *    不插值就会刷成一串断开的圆点；
+   *  - 抽稀间距 radius*0.25：慢慢拖会生成大量几乎重合的点，
+   *    对渲染没有任何贡献，只会让 brushes 数组膨胀。
+   * 两个阈值合起来就是"只保留必要点"。上限 60 支，超出从头丢。
+   */
+  /**
+   * 把一次指针移动插值成一串笔刷点，追加到 stroke。
+   *
+   * fromX/fromY 用于"拖出画布再拖回来"：那时 stroke 的最后一个点在画布
+   * 边界附近，而新位置在很远的地方，直接连线会横穿整个图案。传入上一次
+   * **仍在画布内**的位置作为起点，就能只补画用户实际划过的这一段。
+   */
+  const stampStroke = useCallback(
+    (
+      stroke: DetailBrush[],
+      x: number,
+      y: number,
+      radius: number,
+      algo: DetailAlgorithm,
+      fromX?: number,
+      fromY?: number,
+      discontinuous?: boolean,
+    ) => {
+      const step = Math.max(0.004, radius * 0.35);
+      const dedupe = radius * 0.25;
+      const last = stroke[stroke.length - 1];
+      /*
+       * 起笔的第一个点、以及"拖出画布再拖回画布"后的第一个点，都必须无条件
+       * 入栈：它们与上一个点之间没有需要补画的路径（中间那段根本不在画布上），
+       * 硬插值会横穿整个图案画出一条假线。
+       */
+      if (last && !discontinuous) {
+        const ox = fromX ?? last.x;
+        const oy = fromY ?? last.y;
+        const dx = x - ox;
+        const dy = y - oy;
+        const dist = Math.hypot(dx, dy);
+        // 抽稀：移动距离小于半径 1/4 的中间点丢掉（连续 pointermove 常常是同一点）
+        if (dist < dedupe) return;
+        // 沿路径补齐中间点
+        if (dist > step) {
+          const n = Math.min(64, Math.floor(dist / step));
+          for (let i = 1; i < n; i++) {
+            const t = i / n;
+            stroke.push({
+              x: ox + dx * t,
+              y: oy + dy * t,
+              radius,
+              algorithm: algo,
+            });
+          }
+        }
+      }
+      stroke.push({ x, y, radius, algorithm: algo });
+      if (stroke.length > MAX_BRUSHES) stroke.splice(0, stroke.length - MAX_BRUSHES);
+    },
+    [],
+  );
+
+  /**
+   * 抬手：把这一笔并入**草稿**，不触发任何重算。
+   *
+   * 这是两步式的关键差异。旧版这里直接 onBrushesChange，父组件立刻 debounce
+   * 全图重算，拖动中途图案一直在变，"只能单点"的体感就是这么来的。
+   */
+  const commitStroke = useCallback(() => {
+    const stroke = strokeRef.current;
+    strokeRef.current = null;
+    if (!stroke || stroke.length === 0) return;
+    const next = [...pendingRef.current, stroke];
+    // 上限按点数算，超了就整笔整笔地从最早处丢 —— 半笔被砍掉会在图上
+    // 留下一段"凭空消失"的选区，用户会以为笔刷掉帧了
+    let total = next.reduce((sum, s2) => sum + s2.length, 0);
+    let from = 0;
+    while (total > MAX_BRUSHES && from < next.length - 1) {
+      total -= next[from].length;
+      from++;
+    }
+    setPendingStrokes(from > 0 ? next.slice(from) : next);
+  }, [setPendingStrokes]);
+
+  /**
+   * 拖动中的实时预览值。
+   *
+   * 抬手前 pendingStrokes 还是空的，工具条如果只看 pending 就会一直显示
+   * "0 处 / 0%"，用户拖了半天没有任何数字变化 —— 和"按着没反应"是同一种
+   * 体感。所以拖动期间改用实时层的格数来报数。
+   */
+  const livePreview = useMemo(() => {
+    if (!pattern) return { active: false, cells: 0, percent: 0 };
+    const lw = liveRef.current;
+    if (!lw || liveTick === 0) {
+      return { active: false, cells: 0, percent: 0 };
+    }
+    const total = pattern.cols * pattern.rows;
+    let n = 0;
+    for (let i = 0; i < lw.length; i++) if (lw[i] > 0.02) n++;
+    return {
+      active: n > 0,
+      cells: n,
+      percent: total > 0 ? Math.round((n / total) * 100) : 0,
+    };
+  }, [pattern, liveTick]);
+
+  /** 草稿处的"几处 · 覆盖几%"文案，工具条主按钮和蓝色 tag 共用 */
+  const pendingLabel = useMemo(
+    () => ({
+      count: pendingCount,
+      coverage: pendingCoverage,
+      percent: Math.round(pendingCoverage * 100),
+    }),
+    [pendingCount, pendingCoverage],
+  );
+
+  /**
+   * 提交草稿：一次性把 pending 追加到已应用列表，然后清空草稿。
+   *
+   * 注意顺序 —— 先 onBrushesChange 再清 pending。父组件收到新数组后会
+   * 走 180ms debounce 重算，图案稍后才更新；而 pending 立刻清空，主按钮
+   * 马上回到 disabled，不会出现"点两次应用出双份"的窗口。
+   */
+  const applyPending = useCallback(() => {
+    const groups = pendingRef.current;
+    if (groups.length === 0) return;
+    const flat = groups.flat();
+    const before = brushesRef.current ?? [];
+    const next = [...before, ...flat];
+    const clipped = next.length > MAX_BRUSHES ? next.slice(next.length - MAX_BRUSHES) : next;
+    brushesRef.current = clipped;
+    /*
+     * 记一笔历史。退出刷区域时草稿是**隐式应用**的（不弹确认），如果这次
+     * 应用撤不掉，用户会觉得"我只是切了个开关，选区就没了"。
+     */
+    pushUndo({ kind: 'brushes', before, after: clipped });
+    setPendingStrokes([]);
+    onBrushesChange?.(clipped);
+  }, [onBrushesChange, setPendingStrokes, pushUndo]);
+
+  /** 取消选区：只丢草稿，已应用的一根汗毛都不动 */
+  const cancelPending = useCallback(() => {
+    if (pendingRef.current.length === 0) return;
+    setPendingStrokes([]);
+  }, [setPendingStrokes]);
+
+  const onBrushPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!brushModeRef.current || !pattern) return;
+      // 只接主键 / 触摸 / 笔尖，右键留给浏览器菜单
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      const pos = toPatternSpace(e.clientX, e.clientY);
+      if (!pos || !pos.inside) return;
+      e.preventDefault();
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      const stroke: DetailBrush[] = [];
+      strokeRef.current = stroke;
+      lastInsideRef.current = { x: pos.x, y: pos.y };
+      // 实时层：一按下就有反馈，不用等抬手
+      const live = ensureLive(pattern.cols, pattern.rows);
+      live.fill(0);
+      liveBoxRef.current = null;
+      liveStampedRef.current = 0;
+      stampStroke(
+        stroke,
+        pos.x,
+        pos.y,
+        brushRadiusRef.current,
+        brushAlgorithmRef.current,
+      );
+      for (const pt of stroke) {
+        stampLive(live, pattern.cols, pattern.rows, pt, featherRef.current);
+        growLiveBox(pt);
+      }
+      liveStampedRef.current = stroke.length;
+      bumpLiveTick();
+    },
+    [pattern, stampStroke, toPatternSpace, ensureLive, bumpLiveTick, growLiveBox],
+  );
+
+  const onBrushPointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!brushModeRef.current || !pattern) return;
+      const pos = toPatternSpace(e.clientX, e.clientY);
+      if (!pos) return;
+      // 存归一化坐标而不是像素：缩放时圆环要跟着变，不能钉在旧尺寸上
+      setBrushCursor({ x: pos.x, y: pos.y, r: brushRadiusRef.current });
+      if (!strokeRef.current) return;
+
+      /*
+       * 指针拖到画布外时**不盖章**。
+       *
+       * strokeRef 因为 setPointerCapture 还在，事件会继续送进来；如果照常
+       * 盖章，toPatternSpace 夹紧后的坐标会让笔一路"贴边刷" —— 实测拖出
+       * 画布再拖回来，遮罩像素从 34 万暴涨到 121 万，用户只是想拖出去再
+       * 拖回来，结果整条边都被刷满了。
+       *
+       * 但线要接上：记住最后一次在画布内的位置，指针回到画布内时从那里
+       * 向新位置插值补齐，视觉上仍是连续的一笔（而不是断成两截）。
+       */
+      if (!pos.inside) {
+        lastInsideRef.current = null;
+        return;
+      }
+      // 上一个点不在画布内 → 这是"重新进入"，断开插值，直接落一个点
+      const reentering = lastInsideRef.current === null;
+      lastInsideRef.current = { x: pos.x, y: pos.y };
+
+      const stroke = strokeRef.current;
+      const before = stroke.length;
+      stampStroke(
+        stroke,
+        pos.x,
+        pos.y,
+        brushRadiusRef.current,
+        brushAlgorithmRef.current,
+        undefined,
+        undefined,
+        reentering,
+      );
+      // 只盖这一笔新长出来的点（liveStampedRef 之前的已经盖过了）
+      const live = ensureLive(pattern.cols, pattern.rows);
+      const start = Math.min(liveStampedRef.current, before);
+      for (let i = start; i < stroke.length; i++) {
+        stampLive(live, pattern.cols, pattern.rows, stroke[i], featherRef.current);
+        growLiveBox(stroke[i]);
+      }
+      liveStampedRef.current = stroke.length;
+      bumpLiveTick();
+    },
+    [pattern, stampStroke, toPatternSpace, ensureLive, bumpLiveTick, growLiveBox],
+  );
+
+  const onBrushPointerUp = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!brushModeRef.current) return;
+      const el = e.currentTarget as HTMLElement;
+      if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      commitStroke();
+      // 抬手后 pending 遮罩接棒（带实线轮廓），实时层立刻退场，
+      // 否则两张遮罩会叠在一起变成一条更深的带子
+      resetLive();
+    },
+    [commitStroke, resetLive],
+  );
+
+  useEffect(() => {
+    setHover(null);
+  }, [pattern]);
+
+  // ==========================================================================
+  // 编辑：落点 / 绘制 / 油漆桶 / 取色器
+  // ==========================================================================
+
+  /** 正在拖的编辑笔（cellIndex 集合，抬手时一次性提交成一条 delta） */
+  const editStrokeRef = useRef<{ cells: number[]; after: string } | null>(null);
+  const [editCursor, setEditCursor] = useState<{ col: number; row: number } | null>(null);
+
+  /**
+   * 视口坐标 → 格子下标（越界返回 null）。
+   *
+   * 必须用**画布的** getBoundingClientRect 反算，不能用整张图或滚动容器：
+   * 画布本身可能被居中、被缩放，只有它自己的矩形才是"格子的坐标系"。
+   */
+  const cellAt = useCallback(
+    (clientX: number, clientY: number): number | null => {
+      const canvas = canvasRef.current;
+      if (!canvas || !pattern) return null;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      const fx = (clientX - rect.left) / rect.width;
+      const fy = (clientY - rect.top) / rect.height;
+      if (fx < 0 || fx >= 1 || fy < 0 || fy >= 1) return null;
+      const col = Math.min(pattern.cols - 1, Math.floor(fx * pattern.cols));
+      const row = Math.min(pattern.rows - 1, Math.floor(fy * pattern.rows));
+      return row * pattern.cols + col;
+    },
+    [pattern],
+  );
+
+  /**
+   * 应用一次"编辑笔"到指定格子。
+   *
+   * `pencil` 把格子设成当前色号；`eraser` 设成 `''`（引擎约定的擦除值）。
+   * 只记进 editStrokeRef，不立刻提交 —— 拖一次要合并成一条 delta，
+   * 否则一次拖动会往撤销栈里塞几百条。
+   */
+  const paintCell = useCallback(
+    (index: number, after: string) => {
+      const stroke = editStrokeRef.current;
+      if (!stroke || !pattern) return;
+      if (stroke.after !== after) return;
+      // 同一格在一条笔里只记一次（拖回来重复涂不该产生多条 before/after）
+      if (stroke.cells.includes(index)) return;
+      /*
+       * 涂成它**本来就是**的颜色，不算一次编辑。
+       *
+       * 不做这层过滤的后果很具体：用户拿默认色（用量最大的那个）随手涂
+       * 两笔，画面上什么都没变，却冒出 40 条"手改"，标签亮着、Ctrl+Z
+       * 要按 40 下才能退出 —— 全是空操作。擦同样颜色的空白也一样。
+       */
+      if (pickCodeAt(pattern, editsRef.current, index) === after) return;
+      stroke.cells.push(index);
+    },
+    [pattern],
+  );
+
+  /**
+   * 一次落点（点击或拖动中的一点）。
+   *
+   * 取色器不写数据：读出该格当前色号、设为当前画笔色，然后**不产生 delta**。
+   * 空白格用取色器时保持原色不变（不能把画笔设成"空"—— 那用户就没法画了）。
+   */
+  const applyToolAt = useCallback(
+    (index: number) => {
+      if (!pattern || !editEnabled) return;
+      const tool = editToolRef.current;
+      const code = currentCodeRef.current;
+
+      if (tool === 'picker') {
+        const picked = pickCodeAt(pattern, editsRef.current, index);
+        if (picked) setCurrentCode(picked);
+        return;
+      }
+      if (tool === 'fill') {
+        const cells = floodFill(pattern, editsRef.current, index, code);
+        if (cells.length === 0) return;
+        commitDeltas([makeDelta(editsRef.current, cells, code)]);
+        return;
+      }
+      /*
+       * pencil / eraser：开始或继续一条笔。
+       *
+       * 橡皮的 `after` 就是空串（引擎约定的"擦除"值），**不能**像铅笔那样
+       * 要求它非空 —— 早先写成 `if (!after) return` 直接让橡皮彻底失效。
+       * 只有铅笔需要校验"当前有没有选色"。
+       */
+      if (tool === 'pencil' && !code) return;
+      const after = tool === 'eraser' ? '' : code;
+      const stroke = editStrokeRef.current;
+      // 换工具时（比如擦到一半切回铅笔）不能混在一条笔里：after 不同就另起一条
+      if (!stroke || stroke.after !== after) editStrokeRef.current = { cells: [], after };
+      paintCell(index, after);
+    },
+    [pattern, editEnabled, paintCell, commitDeltas, setCurrentCode],
+  );
+
+  /** 抬手：把这一条笔提交成一条 delta */
+  const commitEditStroke = useCallback(() => {
+    const stroke = editStrokeRef.current;
+    editStrokeRef.current = null;
+    if (!stroke || stroke.cells.length === 0) return;
+    commitDeltas([makeDelta(editsRef.current, stroke.cells, stroke.after)]);
+  }, [commitDeltas]);
+
+  // ---- 图案变更：整块重建 + 维持滚动位置不跳 ----
+  const drawnPatternRef = useRef<PatternResult | null>(null);
+  const scrollKeepRef = useRef({ x: 0, y: 0 });
+
+  // 持续记录滚动位置：图案换掉时用它复位（浏览器会因画布变小而夹紧滚动值）
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      scrollKeepRef.current = { x: el.scrollLeft, y: el.scrollTop };
+      if (scrollRafRef.current) return;
+      scrollRafRef.current = requestAnimationFrame(() => {
+        scrollRafRef.current = 0;
+        setScrollTick((t) => t + 1);
+      });
+    };
+    onScroll();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (scrollRafRef.current) {
+        cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = 0;
+      }
+    };
+  }, [hasPattern, showRulers]);
+
+  useIsoLayoutEffect(() => {
+    if (!pattern) return;
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const keep = scrollKeepRef.current;
+    scroll.scrollLeft = Math.min(keep.x, Math.max(0, scroll.scrollWidth - scroll.clientWidth));
+    scroll.scrollTop = Math.min(keep.y, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+    scrollKeepRef.current = { x: scroll.scrollLeft, y: scroll.scrollTop };
+    // 只在图案（内容）换掉时复位；缩放走 zoomAt 的光标锚点逻辑
+  }, [pattern]);
+
+  /**
+   * 当前可视区（相对图案左上角，CSS px）。
+   *
+   * 滚动容器里滚到哪，就只需要重画那一片 —— 320 格 × 400% 时整张图
+   * 是 5120×4336 设备像素（22M），全画一遍光 clearRect 就要几毫秒，
+   * 色号更是 86,400 次 fillText。裁剪后开销只和**窗口大小**有关，
+   * 和网格密度、缩放倍数都无关。
+   */
+  const computeView = useCallback((): PatternView | null => {
+    const scroll = scrollRef.current;
+    const canvas = canvasRef.current;
+    if (!scroll || !canvas) return null;
+    const scrollBox = scroll.getBoundingClientRect();
+    const canvasBox = canvas.getBoundingClientRect();
+    if (canvasBox.width <= 0 || canvasBox.height <= 0) return null;
+    // canvas 左上角相对可视区左上角的偏移（画布可能被居中）
+    const x = scrollBox.left - canvasBox.left;
+    const y = scrollBox.top - canvasBox.top;
+    return { x, y, w: scrollBox.width, h: scrollBox.height };
+  }, []);
+
+  // ---- 主画布绘制 ----
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const shown = displayPattern;
+    if (!canvas || !shown || !metrics) return;
+    const tokens = readTokens(canvas);
+    /*
+     * surface 必须基于**叠加编辑后**的图案生成。
+     *
+     * 否则用户手绘的那一颗豆永远不会出现在画布上 —— 引擎结果没变，
+     * 变的只是覆盖层。缓存键是 pattern 引用，displayPattern 换新引用
+     * 时会自然重建，不需要额外的失效逻辑。
+     */
+    const surface = getSurface(shown, surfaceRef);
+    // 图案引用变了就强制重建位图（尺寸可能变小，旧画布残留会露出来）
+    const forceRebuild = drawnPatternRef.current !== shown;
+    drawnPatternRef.current = shown;
+    drawPattern(canvas, shown, metrics, surface, {
+      showCodes,
+      showGrid,
+      tokens,
+      forceRebuild,
+      view: computeView(),
+      editMarks,
+    });
+    // computeView 读的是 DOM 的实时位置，不能进依赖数组（每次渲染都是新函数）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayPattern, editMarks, metrics, showCodes, showGrid, themeTick, scrollTick]);
+
+  // ---- 区域遮罩层（独立 canvas，绝不画在图案本体上） ----
+  useEffect(() => {
+    const canvas = maskRef.current;
+    if (!canvas || !metrics) return;
+    const tokens = readTokens(canvas);
+    drawRegionMask(
+      canvas,
+      metrics,
+      showRegionOverlay ? regionField : null,
+      showRegionOverlay ? pendingField : null,
+      showRegionOverlay ? liveRef.current : null,
+      liveBoxRef.current,
+      tokens,
+    );
+  }, [metrics, regionField, pendingField, showRegionOverlay, themeTick, pattern, liveTick]);
+
+  // ---- overlay 绘制：刷子模式画笔刷圆环，否则画 hover 高亮 ----
+  useEffect(() => {
+    const canvas = overlayRef.current;
+    if (!canvas || !metrics) return;
+    const tokens = readTokens(canvas);
+    if (brushMode) {
+      // 刷子模式：整层重画成"圆环"，不再画格子高亮（两者会打架）
+      const { cols, rows, cellDev, eff } = metrics;
+      const devW = cols * cellDev;
+      const devH = rows * cellDev;
+      if (canvas.width !== devW || canvas.height !== devH) {
+        canvas.width = devW;
+        canvas.height = devH;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, devW, devH);
+      ctx.scale(eff, eff);
+      // 归一化 → CSS 像素：半径相对长边，格子是正方形所以单位宽一致
+      const unit = metrics.cellCss;
+      const ring = brushCursor
+        ? {
+            x: brushCursor.x * cols * unit,
+            y: brushCursor.y * rows * unit,
+            r: brushCursor.r * Math.max(cols, rows) * unit,
+          }
+        : null;
+      drawBrushRing(ctx, metrics, ring, tokens);
+    } else {
+      drawHover(canvas, metrics, hover, tokens);
+      /*
+       * 编辑模式下再加一个"当前格"方框。
+       *
+       * hover 的三层环是给"看色号"用的，颜色是陶土；编辑时用户关心的是
+       * "我这一下会落在哪一格"，需要更硬、更方的提示 —— 用金色方框，
+       * 与手改标记同色系，语义一致（金色 = 我动过/我要动）。
+       */
+      if (editEnabled && editCursor) {
+        const { cellDev, eff } = metrics;
+        const ctx = canvas.getContext('2d');
+        if (ctx && cellDev >= 4) {
+          // drawHover 结束后变换矩阵还停在 scale(eff) 上，这里显式重置再缩放，
+          // 不能直接再 scale 一次（会变成 eff²，方框画到画布外）
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.scale(eff, eff);
+          const d = (dev: number) => dev / eff;
+          const x = editCursor.col * cellDev;
+          const y = editCursor.row * cellDev;
+          const w = Math.max(1, Math.round(cellDev * 0.09));
+          ctx.globalAlpha = 0.95;
+          ctx.fillStyle = tokens.gold;
+          ctx.fillRect(d(x), d(y), d(w), d(cellDev));
+          ctx.fillRect(d(x + cellDev - w), d(y), d(w), d(cellDev));
+          ctx.fillRect(d(x), d(y), d(cellDev), d(w));
+          ctx.fillRect(d(x), d(y + cellDev - w), d(cellDev), d(w));
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+  }, [metrics, hover, themeTick, brushMode, brushCursor, editEnabled, editCursor]);
+
+  // ---- 标尺 ----
+  /*
+   * 标签步长必须按可用间距反算，不能死守"每 5 格一个数字"。
+   *
+   * 320 格时每格只有 3–4 CSS px，"每 5 格"就是 20px 一个三位数 —— 标尺上
+   * 会挤成一团连续的数字，一个都读不出来（实测实锤）。这里按"至少 18px
+   * 才放得下三位数 + 间隙"反算，再 snap 到人类习惯的档位（1/2/5/10/20/25/50/100）。
+   *
+   * 注意 10 格主线**不受这个步长影响**：那是拼豆板的物理分界，无论缩到多小
+   * 都必须画出来，变的只是"隔多少格标一个数字"。
+   */
+  const ruler = useMemo(() => {
+    const cellCss = metrics?.cellCss ?? 12;
+    const span = Math.max(metrics?.cols ?? 0, metrics?.rows ?? 0);
+    /*
+     * 标签要几个字宽，取决于最大是多少 —— 320 格的标尺要放 3 位数。
+     * 固定 18px 在 3 位数上是不够的：8.5px 像素字体一个数字约 5.5–6px，
+     * 三位数加间隙要 ~28px，否则相邻标签会叠在一起（实测 320 格时
+     * "105 110 115" 直接糊成一团）。
+     */
+    const digits = Math.max(2, String(span).length);
+    const minLabelPx = 10 + digits * 6;
+    const rawStep = Math.max(1, Math.ceil(minLabelPx / cellCss));
+    /*
+     * 从 5 起跳，不给 1/2 的档位。
+     *
+     * 格子大的时候（16 格图每格 48px）rawStep = ceil(22/48) = 1，若候选里
+     * 有 1 就会变成"每格都标一个数字"，16 格标 16 个 —— 间距是够，但密得
+     * 没有信息量。标尺的语义是"每 5 格一档、10 格加粗"，5 就是下限。
+     */
+    const step = [5, 10, 20, 25, 50, 100].find((s) => s >= rawStep) ?? 100;
+
+    /*
+     * 刻度底纹的周期也要跟着放大：每格 4px 时"每格一条 1px 线"意味着
+     * 25% 的面积是墨色，那条标尺会看起来像一条灰带子。小格时改成
+     * 每 5 格一档，至少能读成"刻度"。
+     */
+    const tickPeriod = cellCss >= 6 ? cellCss : cellCss * 5;
+    return {
+      left: RULER_LEFT,
+      top: RULER_TOP,
+      labelStep: step,
+      tickPeriod,
+      tickBgTop: `repeating-linear-gradient(to right, var(--line) 0 1px, transparent 1px ${tickPeriod}px)`,
+      tickBgLeft: `repeating-linear-gradient(to bottom, var(--line) 0 1px, transparent 1px ${tickPeriod}px)`,
+    };
+  }, [metrics]);
+
+  // ---- 编辑：指针驱动 ----
+  /*
+   * 编辑和刷区域互斥，共用同一个画布表面，所以指针处理器必须在最外层
+   * 分派 —— 谁的模式开着就走谁，绝不两边都跑（否则一次拖动既改格子
+   * 又画选区，两种遮罩叠在一起，用户完全看不懂发生了什么）。
+   */
+  const onEditPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!editEnabled || brushModeRef.current) return;
+      // 只响应主键：右键/中键在画布上是"别的动作"，不该落笔
+      if (e.button !== undefined && e.button !== 0) return;
+      const index = cellAt(e.clientX, e.clientY);
+      if (index === null) return;
+      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+      editStrokeRef.current = null;
+      applyToolAt(index);
+    },
+    [editEnabled, cellAt, applyToolAt],
+  );
+
+  const onEditPointerMove = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!editEnabled || brushModeRef.current) return;
+      const index = cellAt(e.clientX, e.clientY);
+      setEditCursor(
+        index === null || !pattern
+          ? null
+          : { col: index % pattern.cols, row: Math.floor(index / pattern.cols) },
+      );
+      // 只有笔在拖动中才连续画：取色器/油漆桶没有拖动语义，拖也只算点一下
+      if (!editStrokeRef.current) return;
+      if (index === null) return;
+      // 夹紧到边界太远会画成一条穿图的直线 —— 用上一个格子和当前格子
+      // 做直线插值（Bresenham），这样快速拖动也不会漏格
+      const stroke = editStrokeRef.current;
+      const last = stroke.cells[stroke.cells.length - 1];
+      if (last === undefined || !pattern) {
+        paintCell(index, stroke.after);
+        return;
+      }
+      if (last !== index) {
+        // 走一遍两点之间的格子，避免快速拖动跳过中间格（相邻时就是它自己）
+        let c0 = last % pattern.cols;
+        let r0 = Math.floor(last / pattern.cols);
+        const c1 = index % pattern.cols;
+        const r1 = Math.floor(index / pattern.cols);
+        const dc = Math.abs(c1 - c0);
+        const dr = Math.abs(r1 - r0);
+        const sc = c0 < c1 ? 1 : -1;
+        const sr = r0 < r1 ? 1 : -1;
+        let err = dc - dr;
+        for (let guard = 0; guard < 4096; guard++) {
+          paintCell(r0 * pattern.cols + c0, stroke.after);
+          if (c0 === c1 && r0 === r1) break;
+          const e2 = err * 2;
+          if (e2 > -dr) {
+            err -= dr;
+            c0 += sc;
+          }
+          if (e2 < dc) {
+            err += dc;
+            r0 += sr;
+          }
+        }
+      } else {
+        paintCell(index, stroke.after);
+      }
+    },
+    [editEnabled, cellAt, pattern, paintCell],
+  );
+
+  const onEditPointerUp = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (!editEnabled) return;
+      const el = e.currentTarget as HTMLElement;
+      if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      commitEditStroke();
+    },
+    [editEnabled, commitEditStroke],
+  );
+
+  const onEditPointerLeave = useCallback(() => {
+    setEditCursor(null);
+  }, []);
+
+  // ---- 撤销 / 重做（统一历史） ----
+  /*
+   * 撤销栈里混着两类操作：编辑 delta 和刷子快照。它们分属不同的数据层，
+   * 但用户在界面上只看到"我刚做的那一下"，所以按时间顺序统一回退。
+   *
+   * 刷子那条尤其重要：退出刷区域时草稿会被**隐式应用**（不弹确认），
+   * 如果那次应用撤不掉，用户会觉得"我只是切了个开关，选区就没了"。
+   */
+  const undoEdit = useCallback(() => {
+    const log = undoLogRef.current;
+    const entry = log.pop();
+    if (!entry) return;
+    redoLogRef.current.push(entry);
+    if (entry.kind === 'brushes') {
+      brushesRef.current = entry.before;
+      onBrushesChange?.(entry.before);
+    } else if (onEditsChange) {
+      const next = applyDelta(editsRef.current, invertDelta(editsRef.current, entry.delta));
+      editsRef.current = next;
+      onEditsChange(next, []);
+    }
+    bumpHistory();
+  }, [onBrushesChange, onEditsChange, bumpHistory]);
+
+  const redoEdit = useCallback(() => {
+    const entry = redoLogRef.current.pop();
+    if (!entry) return;
+    undoLogRef.current.push(entry);
+    if (entry.kind === 'brushes') {
+      brushesRef.current = entry.after;
+      onBrushesChange?.(entry.after);
+    } else if (onEditsChange) {
+      const next = applyDelta(editsRef.current, entry.delta);
+      editsRef.current = next;
+      onEditsChange(next, []);
+    }
+    bumpHistory();
+  }, [onBrushesChange, onEditsChange, bumpHistory]);
+
+  const canUndoEdit = undoLogRef.current.length > 0;
+  const canRedoEdit = redoLogRef.current.length > 0;
+  /*
+   * historyTick 只用来"推一下"渲染：撤销栈在 ref 里，push 不会触发重渲染，
+   * 按钮的 disabled 状态就会滞后一帧。这个 void 表达式让 lint 知道它是故意的。
+   */
+  void historyTick;
+  const editedCount = editEnabled ? editCount(edits) : 0;
+
+  /** 清空所有手工编辑（可撤销：整批合成一条 delta 反转） */
+  const clearEdits = useCallback(() => {
+    if (!onEditsChange) return;
+    const cur = editsRef.current;
+    const cells = Object.keys(cur)
+      .map(Number)
+      .filter((i) => Number.isInteger(i));
+    if (cells.length === 0) return;
+    const delta: EditDelta = {
+      cells,
+      before: cells.map((c) => cur[c]),
+      after: cells.map(() => undefined as string | undefined),
+    };
+    /*
+     * 压栈的是**原始** delta，不要在这里预反转 —— undoEdit 会调 invertDelta
+     * 再翻一次。早先预反转了一次，结果"还原"撤不回（撤销后仍是 0 格）。
+     */
+    pushUndo({ kind: 'edits', delta });
+    editsRef.current = EMPTY_EDITS;
+    onEditsChange(EMPTY_EDITS, [delta]);
+  }, [onEditsChange, pushUndo]);
+
+  // ---- 撤销 / 清空 ----
+  /*
+   * 两者都优先作用在**草稿**上：草稿是用户刚画、还没提交的东西，
+   * 撤销它不需要等重算，是最便宜也最符合直觉的操作。草稿空了才动
+   * 已应用的部分（那才需要走 onBrushesChange 触发重算）。
+   */
+  const undoBrush = useCallback(() => {
+    const drafts = pendingRef.current;
+    if (drafts.length > 0) {
+      setPendingStrokes(drafts.slice(0, -1));
+      return;
+    }
+    const cur = brushesRef.current ?? [];
+    if (cur.length === 0) return;
+    // 整笔撤掉：按簇算出最后一笔占多少个点，一次砍掉它们
+    const clusters = pattern
+      ? clusterBrushes(cur, pattern.cols, pattern.rows)
+      : [cur];
+    const lastLen = clusters.length > 0 ? clusters[clusters.length - 1].length : 1;
+    const next = cur.slice(0, Math.max(0, cur.length - lastLen));
+    brushesRef.current = next;
+    onBrushesChange?.(next);
+  }, [onBrushesChange, setPendingStrokes, pattern]);
+
+  const clearBrushes = useCallback(() => {
+    if (pendingRef.current.length > 0) {
+      setPendingStrokes([]);
+      return;
+    }
+    if ((brushesRef.current ?? []).length === 0) return;
+    brushesRef.current = [];
+    onBrushesChange?.([]);
+  }, [onBrushesChange, setPendingStrokes]);
+
+  /** 撤销/清空按钮是否该亮：草稿或已应用任一非空 */
+  const canUndo = pendingCount > 0 || appliedCount > 0;
+  const hasAnything = canUndo;
+
+  /**
+   * 退出刷子模式时怎么处理没提交的草稿？
+   *
+   * 选了**自动应用**，而不是丢弃 + toast。理由：
+   *  - 丢弃是破坏性操作，而"退出刷子"这个动作本身没有任何"我不要了"的
+   *    语义 —— 用户只是想看看图案、切个开关。凭空吞掉他刚画的选区，
+   *    比多算一次更让人恼火（尤其选区画了几十笔的时候）。
+   *  - 自动应用也符合"草稿最终都要落地"的心智，而且成本可控：这就是
+   *    他本来要点「应用重建」的那一次重算。
+   *  - toast 得引入 sonner 的调用点，还会在移动端盖住工具条；自动应用
+   *    连提示都不需要 —— 图案自己变了，就是最好的反馈。
+   */
+  const exitBrushMode = useCallback(() => {
+    if (pendingRef.current.length > 0) applyPending();
+    setBrushMode(false);
+  }, [applyPending, setBrushMode]);
+
+  return {
+    hostRef,
+    scrollRef,
+    canvasRef,
+    overlayRef,
+    maskRef,
+    metrics,
+    zoom,
+    setZoom,
+    zoomIn,
+    zoomOut,
+    resetZoom,
+    showCodes,
+    showGrid,
+    showRulers,
+    showRegionOverlay,
+    setShowCodes,
+    setShowGrid,
+    setShowRulers,
+    setShowRegionOverlay,
+    hover,
+    onPointerMove,
+    onPointerLeave,
+    ruler,
+    hasPattern,
+    // 刷区域
+    brushMode,
+    setBrushMode,
+    brushAlgorithm,
+    setBrushAlgorithm,
+    brushRadius,
+    setBrushRadius,
+    brushCursor,
+    onBrushPointerDown,
+    onBrushPointerMove,
+    onBrushPointerUp,
+    undoBrush,
+    clearBrushes,
+    regionField,
+    regionSummary,
+    // 两步式选区
+    pendingStrokes,
+    pendingCount,
+    pendingCoverage,
+    livePreview,
+    pendingLabel,
+    appliedCount,
+    appliedCoverage,
+    applyPending,
+    cancelPending,
+    canUndo,
+    hasAnything,
+    exitBrushMode,
+    useFill,
+    // ---- 编辑（② 工具栏） ----
+    displayPattern,
+    editEnabled,
+    editTool,
+    setEditTool,
+    currentCode,
+    setCurrentCode,
+    editCursor,
+    onEditPointerDown,
+    onEditPointerMove,
+    onEditPointerUp,
+    onEditPointerLeave,
+    undoEdit,
+    redoEdit,
+    canUndoEdit,
+    canRedoEdit,
+    clearEdits,
+    editedCount,
+    editHistoryTick: historyTick,
+    hud: pattern
+      ? {
+          cols: pattern.cols,
+          rows: pattern.rows,
+          totalBeads: pattern.totalBeads,
+          paletteSize: pattern.palette.length,
+          meanDeltaE: pattern.meanDeltaE,
+        }
+      : null,
+  };
+}
+
+export type PatternCanvasController = ReturnType<typeof usePatternCanvas>;
