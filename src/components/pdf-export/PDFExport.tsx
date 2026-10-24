@@ -84,7 +84,19 @@ export function PDFExport({
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
-  const disabled = !pattern || pattern.cols < 1 || pattern.rows < 1 || isGenerating;
+  /*
+   * 空调色板也是不可导出的状态。
+   *
+   * 空白画布刚建出来时 palette 是空的，"一张什么都没画的板子"导成 PDF
+   * 是一叠没有色号的空白格 —— 用户拿到会以为是导出失败。更实际的是
+   * API 侧 `route.ts` 明确要求 palette 非空，会直接 400，用户看到的是
+   * 一个错误弹窗而不是"你还没开始画"。
+   *
+   * 所以这里提前禁用，并把原因写进 title，比让他点一下撞墙好。
+   */
+  const emptyPalette = !pattern || pattern.palette.length === 0;
+  const disabled =
+    !pattern || pattern.cols < 1 || pattern.rows < 1 || emptyPalette || isGenerating;
 
   const sizeLabel = useMemo(() => {
     if (!pattern) return null;
@@ -149,9 +161,11 @@ export function PDFExport({
     }
   }, [brand, pattern, sizeLabel]);
 
-  const title = pattern
-    ? `导出可打印 PDF（${pattern.cols} × ${pattern.rows}，${pattern.palette.length} 个色号）`
-    : '先放一张图';
+  const title = !pattern
+    ? '先放一张图'
+    : emptyPalette
+      ? '还没上色 —— 先画几格再导出'
+      : `导出可打印 PDF（${pattern.cols} × ${pattern.rows}，${pattern.palette.length} 个色号）`;
 
   if (compact) {
     return (
