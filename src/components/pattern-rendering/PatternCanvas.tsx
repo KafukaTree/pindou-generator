@@ -32,6 +32,9 @@ import { DETAIL_ALGORITHMS, DETAIL_META, type DetailAlgorithm } from '@/lib/patt
 import type { DetailBrush } from '@/lib/pattern/regions';
 import type { EditDelta, EditMap } from '@/lib/pattern/edits';
 import { PixelCursor, PixelSwatch } from '@/components/scenery';
+import { BrushSizeButton } from './BrushSizeButton';
+import { Redo2, RotateCcw, Undo2 } from 'lucide-react';
+import { groupByCode, groupByFamily } from '@/lib/color/family';
 import {
   usePatternCanvas,
   RULER_LEFT,
@@ -120,6 +123,23 @@ export type CanvasActivity = 'idle' | 'brushing' | 'editing';
  * 再宽就开始明显抢画布 —— 而这个改动的首要目的恰恰是"把面积还给画布"。
  */
 const TRAY_RAIL_W = 200;
+/**
+ * 立起右侧色板竖栏所需的最小 host 宽度（CSS px）。
+ *
+ * 1000 是从实测反推的拐点，不是拍的：
+ *
+ *   host  640 → 编辑态画布 384（视图态 576，**小 192**）
+ *   host  716 → 448（视图态 640，小 192）
+ *   host  816 → 512（视图态 768，小 256）
+ *   host  896 → 640（视图态 832，小 192）
+ *   host 1056 → 768（视图态 896，小 128，已可接受）
+ *   host 1216 → 960（视图态 896，**大 64**）
+ *
+ * 收窄竖栏不能解决（试过 116/132/160：格子数向下取整到同一档，画布不变），
+ * 只有"竖栏在不在"这一档有效。所以窄于这条线时改用覆盖式浮层，把宽度整个
+ * 留给画布。
+ */
+const RAIL_MIN_HOST_W = 1000;
 /** 桌面断点，与 globals.css 里的 .wb 断点（64rem）保持一致 */
 const DESKTOP_QUERY = '(min-width: 64rem)';
 /**
@@ -205,6 +225,7 @@ export function PatternCanvas({
     canvasRef,
     overlayRef,
     maskRef,
+    hostWidth,
     metrics,
     zoom,
     zoomIn,
@@ -251,6 +272,9 @@ export function PatternCanvas({
     setEditTool,
     currentCode,
     setCurrentCode,
+    brushWidth,
+    setBrushWidth,
+    recentCodes,
     editCursor,
     onEditPointerDown,
     onEditPointerMove,
@@ -315,25 +339,58 @@ export function PatternCanvas({
     getDesktopSnapshot,
     getDesktopServerSnapshot,
   );
+  /**
+   * 右侧色板竖栏**放得下**吗。
+   *
+   * 为什么不能只用 isDesktop 一刀切：竖栏是 flex-none 的 200px 固定开销，
+   * 中栏一窄，它抢走的就比它给的多。实测（示例图 64×54，视图态 → 编辑态）：
+   *
+   *   host 640 (视口 1024)：576 → 384   进编辑画布**反而小了 192px**
+   *   host 716 (视口 1100)：640 → 448   小 192
+   *   host 816 (视口 1200)：768 → 512   小 256
+   *   host 896 (视口 1280)：832 → 640   小 192
+   *   host 1216(视口 1600)：896 → 960   **大 64**（这才是想要的）
+   *
+   * 前四档用户会直接当成 bug —— 点「编辑」画布缩了一半，跟"编辑时画板占
+   * 主要面积"的诉求正好相反。我也试过把竖栏收窄（116/132/160px）：1024 下
+   * 画布仍是 448 或 384，因为格子数会向下取整到同一档，**收窄换不回画布**，
+   * 只有"竖栏在不在"这一档有效。
+   *
+   * 所以判据换成 host 的实际宽度：>= 1000 才立竖栏，否则走手机那套覆盖式
+   * 浮层（画布保持满宽，点「当前色」浮出色板，选完收起）。1000 是从上表
+   * 反推的拐点 —— host 896 仍是负收益，host 1056 开始转正。
+   *
+   * **用 hostWidth 而不是量滚动容器**：滚动容器的宽度会随竖栏出现而变，
+   * 判据跟着翻转就会"立起来→画布变窄→判据不成立→塌回去"地自己抖。host
+   * 包着竖栏，宽度与竖栏在不在无关，是稳定的判据。
+   *
+   * hostWidth 为 0 只发生在首帧还没量到尺寸时（进编辑前它早就量过了），
+   * 此时退回 isDesktop：桌面首帧先按窄栏渲染，不会有一次明显的闪动。
+   */
+  const railFits = hostWidth === 0 ? isDesktop : hostWidth >= RAIL_MIN_HOST_W;
   /** 色板是否展开。桌面 = 右侧竖栏，手机 = 覆盖在画布上的浮层 */
   const [trayOpen, setTrayOpen] = useState(false);
   /**
-   * 进入编辑时按断点给色板初值：桌面展开、手机收起。
+   * 进入编辑时给色板初值：能立竖栏就展开，否则收起。
    *
-   * 桌面展开的理由：竖栏在右，不占画布高度，291 色直接摊开最省事。
-   * 手机收起的理由：横条会把画布往下推（用户原话认可"放在上面没问题"，
-   * 但高度本来就紧），所以默认收起、点「当前色」再以浮层出现。
+   * 展开的理由：竖栏在右，不占画布高度，291 色直接摊开最省事。
+   * 收起的理由：竖栏立不起来的宽度下，色板只能以浮层出现（同手机），
+   * 而浮层是"主动叫出来的" —— 默认开着会挡住整块画布，用户进编辑第一眼
+   * 看不到图纸，还得先关一次。
    *
    * 写成"渲染期调整 state"而不是 useEffect：effect 里同步 setState 会触发
    * 一轮级联渲染（eslint 的 react-hooks/set-state-in-effect 会直接报错），
    * 而这里要的恰恰是"在渲染同一帧里就按新状态算好"，正是 React 文档里
    * adjusting state when props change 那个模式。跨断点拖窗口也走这条路：
-   * 切到手机 → 收起；切回桌面 → 展开。
+   * 收窄到立不起竖栏 → 收起；放宽 → 展开。
    */
-  const [layoutSeed, setLayoutSeed] = useState({ editing: editActive, desktop: isDesktop });
-  if (layoutSeed.editing !== editActive || layoutSeed.desktop !== isDesktop) {
-    setLayoutSeed({ editing: editActive, desktop: isDesktop });
-    if (editActive) setTrayOpen(isDesktop);
+  const [layoutSeed, setLayoutSeed] = useState({
+    editing: editActive,
+    desktop: railFits,
+  });
+  if (layoutSeed.editing !== editActive || layoutSeed.desktop !== railFits) {
+    setLayoutSeed({ editing: editActive, desktop: railFits });
+    if (editActive) setTrayOpen(railFits);
   }
   const trayRef = useRef<HTMLDivElement | null>(null);
   /**
@@ -384,17 +441,48 @@ export function PatternCanvas({
    * 视线能直接跳到"我要 A 开头"那一段。标题 sticky 在容器顶部，滚到哪
    * 都知道自己在哪一组。
    */
-  const colorGroups = useMemo(() => {
-    const groups: { prefix: string; colors: typeof brandColors }[] = [];
-    for (const bead of brandColors) {
-      const match = /^[A-Z]+/.exec(bead.code);
-      const prefix = match ? match[0] : '#';
-      const last = groups[groups.length - 1];
-      if (last && last.prefix === prefix) last.colors.push(bead);
-      else groups.push({ prefix, colors: [bead] });
-    }
-    return groups;
-  }, [brandColors]);
+  /*
+   * 色卡分组。
+   *
+   * 两种排法（用户要求"默认色系，再者才是编号顺序"）：
+   *   · 色系：按 OKLab 色相归到 12 组 + 白/灰/黑 + 常用，组内按明度排。
+   *     摊开是一条从红绕到玫红的渐变，找"偏橙的黄"扫一眼就到。
+   *   · 色号：按字母前缀分组（A/B/C…），同改造前。补货、对货号时用。
+   *
+   * 默认色系 —— 编号是印厂的分类逻辑，不是找色的逻辑。
+   */
+  const [colorSort, setColorSort] = useState<'family' | 'code'>('family');
+
+  /*
+   * 「常用」组的色号列表由 hook 维护（`recentCodes`），判据是"这一笔真的
+   * 写了这个色" —— 见 usePatternCanvas 里 commitDeltas 的注释。组件这边只读。
+   */
+
+  const colorGroups = useMemo(
+    () =>
+      colorSort === 'family'
+        ? groupByFamily(brandColors, recentCodes)
+        : groupByCode(brandColors),
+    [brandColors, colorSort, recentCodes],
+  );
+
+  /*
+   * 换排序方式时顺手把色板滚回顶部。
+   *
+   * 不滚会出现一个很难看的中间态：从"黄"组（已经翻到下面）切到"编号"，
+   * 滚动位置留在原处，第一组的表头被顶掉半截、露出"常用 1"这种残缺文字。
+   * 换排序等于换了一套目录，本来就该从第一页看起。
+   *
+   * 写在事件里而不是 effect 里：这是"用户点了按钮"的一次性副作用，
+   * 放 effect 还得靠 ref 记住上一次的值去判断"是不是真变了"，绕一大圈。
+   */
+  const changeSort = useCallback(
+    (next: 'family' | 'code') => {
+      setColorSort(next);
+      trayRef.current?.scrollTo({ top: 0 });
+    },
+    [],
+  );
 
   const EDIT_TOOLS: { tool: EditTool; label: string; title: string }[] = [
     { tool: 'pencil', label: '手绘', title: '逐格涂色（可拖动连涂）' },
@@ -667,7 +755,7 @@ export function PatternCanvas({
         redoEdit();
         return;
       }
-      // 编辑模式下的工具快捷键（1–4），Esc 退出
+      // 编辑模式下的工具快捷键（1–4：手绘/橡皮/取色/油漆桶），Esc 退出
       if (editActive && !mod) {
         if (e.key === 'Escape') {
           e.preventDefault();
@@ -775,6 +863,38 @@ export function PatternCanvas({
     window.addEventListener('keydown', onWindowKey);
     return () => window.removeEventListener('keydown', onWindowKey);
   }, [editEnabled, brushEnabled, undoEdit, redoEdit]);
+
+  /*
+   * 色板浮层打开时的 Esc。
+   *
+   * 浮层是**覆盖层**：它盖住画布后，用户点了浮层里的色块/收起按钮，焦点就
+   * 落在浮层内的按钮上，而 scrollRef 上的 onKeyDown 只在容器有焦点时才触发
+   * —— 于是 Esc 什么都没发生（实测 1100 宽：浮层开着按 Esc，浮层还在）。
+   *
+   * 这里补一个 window 兜底，并且明确**优先级**：浮层开着时，Esc 先关浮层，
+   * 再按一次才退出编辑。反过来的话，用户想收起色板会一不小心整套编辑都没了，
+   * 而这是破坏性更大的一步。
+   *
+   * 只在浮层真的开着（railFits 为假 = 覆盖形态）且 trayOpen 时挂，正常
+   * 竖栏/无浮层时完全不影响原有键盘行为。
+   */
+  const overlayTrayOpen = !railFits && editEnabled && editActive && trayOpen;
+  useEffect(() => {
+    if (!overlayTrayOpen) return;
+    const onWindowKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) return;
+      e.preventDefault();
+      // 只关色板，不动编辑态；stopPropagation 防止同一次按键继续走到画布的
+      // onKeyDown 把编辑也退掉。
+      e.stopPropagation();
+      setTrayOpen(false);
+    };
+    window.addEventListener('keydown', onWindowKey, true);
+    return () => window.removeEventListener('keydown', onWindowKey, true);
+  }, [overlayTrayOpen]);
 
   // ---------------------------------------------------------------- 空状态
   if (!pattern || !hasPattern) {
@@ -929,7 +1049,7 @@ export function PatternCanvas({
         className="flex min-h-0 min-w-0 gap-2"
         style={{
           flex: useFill ? '1 1 auto' : undefined,
-          flexDirection: isDesktop && editActive ? 'row' : 'column',
+          flexDirection: railFits && editActive ? 'row' : 'column',
           // 非 fill（老行为）时不让这一层撑高，交给里面原来的限高逻辑
           minHeight: 0,
         }}
@@ -988,7 +1108,30 @@ export function PatternCanvas({
                   当前色 + 展开色卡。
                   桌面端它仍然是色板竖栏的开关（此时色号的大预览在右侧栏顶）；
                   手机端它是唯一入口 —— 点击才浮出色板，不常驻。
+
+                  提示文案跟着**色板的实际形态**走，不是跟着 isDesktop 走 ——
+                  1024–1349 这段是桌面但竖栏立不起来（见 railFits），色板以
+                  浮层出现，此时说"收起右侧色板"就是错的，右侧并没有东西。
                 */}
+                {/*
+                  笔刷按钮：图形化的"粗细 + 当前色"。
+
+                  原来是「色块 + 色号 + ▲/▼」的色板开关。用户要求把它换成
+                  「一个按钮，是能代表笔刷粗细和颜色的图形，粗的时候就粗一点，
+                  细的时候就细一点，然后颜色变的时候也跟着变」——
+                  于是这个按钮同时承担两件事：笔宽的入口、当前状态的读数。
+                  色板开关挪到紧挨着它的右边（还是同一个 toggle-tray），
+                  用色卡图标表示，两个职责分开但挨在一起。
+
+                  只在有当前色（=编辑模式）时才画得出来；没选色时画空笔。
+                */}
+                <BrushSizeButton
+                  width={brushWidth}
+                  onWidthChange={setBrushWidth}
+                  hex={currentBead?.hex ?? null}
+                  code={currentCode || null}
+                />
+
                 <button
                   type="button"
                   className="px-btn px-btn-sm inline-flex items-center gap-1.5"
@@ -996,65 +1139,81 @@ export function PatternCanvas({
                   aria-expanded={trayOpen}
                   title={
                     trayOpen
-                      ? isDesktop
+                      ? railFits
                         ? '收起右侧色板，让画布变宽'
                         : '收起色板'
-                      : isDesktop
+                      : railFits
                         ? '展开右侧色板'
                         : '展开色板选色'
                   }
                   data-testid="toggle-tray"
                 >
-                  {currentBead ? (
-                    <PixelSwatch hex={currentBead.hex} size={16} />
-                  ) : (
-                    <span
-                      style={{
-                        width: 16,
-                        height: 16,
-                        background: 'var(--paper-sunken)',
-                        border: '1px solid var(--line-strong)',
-                        display: 'inline-block',
-                      }}
-                    />
-                  )}
+                  <PixelSwatch hex={currentBead?.hex ?? 'var(--paper-sunken)'} size={14} />
                   <span className="font-px text-[11px] font-bold" style={{ color: 'var(--ink)' }}>
                     {currentCode || '—'}
                   </span>
-                  <span style={{ color: 'var(--ink-3)' }}>{trayOpen ? '▲' : '▼'}</span>
+                  {/*
+                    箭头方向跟着**色板出现在哪个方向**走，不是恒定上下。
+
+                    用户原话：「layout 到右边的时候，那个展开箭头就不应该向下了，
+                    而是向右」。竖栏在右时把它整体转 90°（原本的 ▼/▲ 对变成
+                    ▶/◀）：收起态 ▶ 指向右侧面板将要出现的方向，展开态 ◀ 指回
+                    画布，语义和原来的 "往下展开 / 往上收起" 完全对应。
+                    浮层形态（浮层盖在画布上，仍是从上方盖下来）保留 ▼/▲。
+                  */}
+                  <span style={{ color: 'var(--ink-3)' }}>
+                    {railFits ? (trayOpen ? '◀' : '▶') : trayOpen ? '▲' : '▼'}
+                  </span>
                 </button>
 
-                {/* 撤销 / 重做 / 清除手改 */}
-                <div className="flex items-center gap-1.5">
+                {/*
+                  撤销 / 重做 / 还原。
+
+                  用户原话：「撤销和还原要在一起，然后直接做成经典的两个样式
+                  就行，不需要写汉字；重做直接是像那种恢复的经典表示一样，
+                  也不需要写汉字」——
+                  所以三个按钮全用图标，同一组紧挨着排（撤销↶ / 重做↷ / 还原⟲）。
+                  图标是通识符号，比汉字省一半宽度，也不会在窄屏把工具条挤到换行。
+
+                  文字只留在 title / aria-label 里：鼠标悬停有提示、读屏能念、
+                  Playwright 也能按 accessible name 定位 —— 只是不画在按钮上。
+                */}
+                <div className="flex items-center gap-1" role="group" aria-label="撤销与还原">
                   <button
                     type="button"
-                    className="px-btn px-btn-sm"
+                    className="px-btn px-btn-sm inline-flex items-center justify-center"
+                    style={{ width: 28, height: 26, padding: 0 }}
                     onClick={undoEdit}
                     disabled={!canUndoEdit}
                     title="撤销上一步（Ctrl+Z）"
+                    aria-label="撤销"
                     data-testid="undo-edit"
                   >
-                    撤销
+                    <Undo2 className="h-[15px] w-[15px]" aria-hidden="true" />
                   </button>
                   <button
                     type="button"
-                    className="px-btn px-btn-sm"
+                    className="px-btn px-btn-sm inline-flex items-center justify-center"
+                    style={{ width: 28, height: 26, padding: 0 }}
                     onClick={redoEdit}
                     disabled={!canRedoEdit}
                     title="重做（Ctrl+Shift+Z / Ctrl+Y）"
+                    aria-label="重做"
                     data-testid="redo-edit"
                   >
-                    重做
+                    <Redo2 className="h-[15px] w-[15px]" aria-hidden="true" />
                   </button>
                   <button
                     type="button"
-                    className="px-btn px-btn-sm"
+                    className="px-btn px-btn-sm inline-flex items-center justify-center"
+                    style={{ width: 28, height: 26, padding: 0 }}
                     onClick={clearEdits}
                     disabled={editedCount === 0}
                     title="把所有手改格子恢复成引擎生成的样子（可撤销）"
+                    aria-label="还原"
                     data-testid="clear-edits"
                   >
-                    还原
+                    <RotateCcw className="h-[15px] w-[15px]" aria-hidden="true" />
                   </button>
                 </div>
 
@@ -1619,23 +1778,24 @@ export function PatternCanvas({
             </div>
 
             {/*
-              手机色板：**覆盖**在画布上的浮层，不推挤画布高度。
+              色板浮层：竖栏立不起来时（手机、以及窄桌面 host < 1000）用它。
 
-              为什么不选"展开时压缩画布"：压缩那条路已经在原来横条版里试过了
-              —— 92px 的横条把 390×844 的画布挤到只剩 216px 高，正好落进
-              "看不清也点不准"的区间。浮层方案下画布高度完全不变，色板占的
-              是用户"正在选色、暂时不画"的那几秒，选完收起即可。
+              为什么是**铺满画布区**（inset-0）而不是只占顶上一条、也不是
+              靠右的窄浮窗：
+                · 手机画布区本身只有约 207px 高，只取顶上一条就只剩 95px ——
+                  28px 的色块只放得下两行，291 色要翻二十屏；
+                · 窄桌面（1024 / 1190 / 1280）试过"贴右 200px 浮窗"，虽然
+                  只盖住画布 11–22%，但色块只有 7 列、一屏看不到几个色，
+                  而且用户的原话是「原来逻辑是对的」—— 铺满这种"我明确
+                  要看色板"的模态感，反而比一个小窗更清楚；
+                · 铺满之后色块区有 150px 以上，一屏能看 6 行，翻五屏看完。
+                  代价是选色时看不见画布，但这是"先选色、再回去画"的两段式
+                  操作，收起即恢复。
 
               定位在这一层（画布外壳）而不是画布滚动容器里：后者会跟着画布
               内容一起滚走；也不在工具条那层，否则会盖住工具条。
-
-              **铺满画布区**（inset-0）而不是只占顶上一条：手机画布区本身只有
-              约 207px 高，浮层若只取 46% 就只剩 95px —— 28px 的色块只放得下
-              两行，291 色要翻二十屏。铺满之后色块区有 150px 以上，一屏能看
-              6 行，翻五屏左右看完。代价是选色时看不见画布，但这本来就是
-              "先选色、再回去画"的两段式操作，收起即恢复。
             */}
-            {!isDesktop && editEnabled && editActive && trayOpen && (
+            {!railFits && editEnabled && editActive && trayOpen && (
               <div
                 className="px-panel absolute inset-0 z-30 flex flex-col"
                 style={{
@@ -1694,32 +1854,114 @@ export function PatternCanvas({
                     收起
                   </button>
                 </div>
+                {/*
+                  排序切换在浮层里同样要有。
+
+                  用户的原话：「就是往下展开的时候，看不到色系卡和编号卡，
+                  还有常用色系区分了」—— 展开出来的浮层原来是一整片平铺的
+                  291 色，按色号排，既没有分组也切不了排序。桌面竖栏有的
+                  两样东西（色系/编号切换、常用+色系分组），浮层这里必须
+                  一模一样，否则同一个功能在不同宽度下表现不一样。
+                */}
+                <div
+                  className="flex flex-none gap-1 px-1.5 pb-1.5"
+                  role="group"
+                  aria-label="色卡排序方式"
+                >
+                  {(
+                    [
+                      { id: 'family', label: '色系' },
+                      { id: 'code', label: '编号' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => changeSort(opt.id)}
+                      aria-pressed={colorSort === opt.id}
+                      data-testid={`color-sort-${opt.id}-overlay`}
+                      className="px-btn px-btn-sm flex-1"
+                      style={
+                        colorSort === opt.id
+                          ? {
+                              background: 'var(--clay)',
+                              borderColor: 'var(--clay-deep)',
+                              color: 'var(--on-clay)',
+                            }
+                          : undefined
+                      }
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
                 <div
                   ref={trayRef}
                   className="px-inset min-h-0 flex-1 overflow-y-auto p-1.5"
                   data-testid="color-tray"
                   aria-label="品牌色卡"
-                  style={{ display: 'flex', flexWrap: 'wrap', alignContent: 'flex-start', gap: 4 }}
                 >
-                  {brandColors.map((bead) => {
-                    const active = bead.code === currentCode;
-                    return (
-                      <PixelSwatch
-                        key={bead.code}
-                        hex={bead.hex}
-                        code={bead.code}
-                        /*
-                          手机上 22px 是"看"的尺寸，不是"点"的尺寸：手指落点
-                          有 8–10px 抖动，22px 的方块点准一格很费劲。28px 是
-                          能稳定点中的下限，再大就一屏放不下几个色了。
-                        */
-                        size={SWATCH_MOBILE}
-                        selected={active}
-                        title={`${bead.code} · ${bead.hex.toUpperCase()}（${bead.rgb.r},${bead.rgb.g},${bead.rgb.b}）`}
-                        onClick={() => setCurrentCode(bead.code)}
-                      />
-                    );
-                  })}
+                  {colorGroups.map((group) => (
+                    <div key={group.id} className="mb-2">
+                      {/*
+                        分组头用 flex 布局：小色点 + 组名 + 数量。
+                        色点是这一组的"身份"（最饱和那颗），9px 的字读不出
+                        "黄绿"和"绿"的差别，有个色点就直接对上了。
+                      */}
+                      <div className="mb-1 flex items-center gap-1">
+                        <span
+                          aria-hidden
+                          style={{
+                            width: 8,
+                            height: 8,
+                            flex: 'none',
+                            background: group.swatch || 'var(--paper-sunken)',
+                            border: '1px solid var(--line-strong)',
+                          }}
+                        />
+                        <span
+                          className="text-[10px] font-bold leading-none"
+                          style={{ color: 'var(--ink-2)' }}
+                        >
+                          {group.label}
+                        </span>
+                        <span
+                          className="font-px text-[9px] leading-none tabular-nums"
+                          style={{ color: 'var(--ink-3)' }}
+                        >
+                          {group.colors.length}
+                        </span>
+                      </div>
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          alignContent: 'flex-start',
+                          gap: 4,
+                        }}
+                      >
+                        {group.colors.map((bead) => {
+                          const active = bead.code === currentCode;
+                          return (
+                            <PixelSwatch
+                              key={bead.code}
+                              hex={bead.hex}
+                              code={bead.code}
+                              /*
+                                手机上 22px 是"看"的尺寸，不是"点"的尺寸：手指
+                                落点有 8–10px 抖动，22px 的方块点准一格很费劲。
+                                28px 是能稳定点中的下限，再大就一屏放不下几个色。
+                              */
+                              size={SWATCH_MOBILE}
+                              selected={active}
+                              title={`${bead.code} · ${bead.hex.toUpperCase()}（${bead.rgb.r},${bead.rgb.g},${bead.rgb.b}）`}
+                              onClick={() => setCurrentCode(bead.code)}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
                   {brandColors.length === 0 && (
                     <span className="text-[11px]" style={{ color: 'var(--ink-3)' }}>
                       这个品牌没有色卡数据
@@ -1748,8 +1990,11 @@ export function PatternCanvas({
 
           它是 flex-none：画布列 flex-1 吃掉其余宽度，所以"侧栏多宽"与"画布多高"
           完全无关 —— 这正是原来横条版做不到的。
+
+          条件用 railFits 而不是 isDesktop：窄桌面（host < 1000）立不起竖栏，
+          色板改走上面的覆盖式浮层，把宽度整个留给画布。两者严格互斥。
         */}
-        {isDesktop && editEnabled && editActive && trayOpen && (
+        {railFits && editEnabled && editActive && trayOpen && (
           <aside
             className="px-panel flex flex-none flex-col"
             aria-label="品牌色板"
@@ -1800,6 +2045,48 @@ export function PatternCanvas({
               </div>
             </div>
 
+            {/*
+              排序切换：色系 / 编号。
+
+              用户要求"默认色系，再者才是编号顺序"。两个都要：色系是找色
+              （"我要个偏橙的黄"），编号是补货对货号（"图纸写 F19，我手里
+              不够了，看看 F18/F20"）。切换成本要低到一个点击 —— 所以是
+              两段并排的分段控件，不是一个"排序设置"入口。
+            */}
+            <div
+              className="flex flex-none gap-1 border-b-2 px-2 py-1.5"
+              style={{ borderColor: 'var(--line)' }}
+              role="group"
+              aria-label="色卡排序方式"
+            >
+              {(
+                [
+                  { id: 'family', label: '色系' },
+                  { id: 'code', label: '编号' },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => changeSort(opt.id)}
+                  aria-pressed={colorSort === opt.id}
+                  data-testid={`color-sort-${opt.id}`}
+                  className="px-btn px-btn-sm flex-1"
+                  style={
+                    colorSort === opt.id
+                      ? {
+                          background: 'var(--clay)',
+                          borderColor: 'var(--clay-deep)',
+                          color: 'var(--on-clay)',
+                        }
+                      : undefined
+                  }
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
             {/* 色号网格：7 列 × 24px + 2px 间隙 = 侧栏内宽正好吃满 */}
             <div
               ref={trayRef}
@@ -1808,16 +2095,43 @@ export function PatternCanvas({
               aria-label="品牌色卡"
             >
               {colorGroups.map((group) => (
-                <div key={group.prefix} className="mb-1.5">
+                <div key={group.id} className="mb-2">
+                  {/*
+                    分组头：小色点 + 组名 + 数量。
+
+                    色点是这一组的"身份"（该组最饱和的那颗），因为在 9px
+                    的中文组名下，光看两个字读不出"黄绿"和"绿"的差别，
+                    有个色点就直接对上了。数量让用户知道这一组要不要往下翻。
+                  */}
                   <div
-                    className="font-px sticky top-0 z-10 mb-1 text-[9px] uppercase tracking-[0.12em]"
+                    className="sticky top-0 z-10 mb-1 flex items-center gap-1"
                     style={{
-                      color: 'var(--ink-3)',
                       background: 'var(--paper-raised)',
-                      paddingBlock: 1,
+                      paddingBlock: 2,
                     }}
                   >
-                    {group.prefix}
+                    <span
+                      aria-hidden
+                      style={{
+                        width: 7,
+                        height: 7,
+                        flex: 'none',
+                        background: group.swatch || 'var(--paper-sunken)',
+                        border: '1px solid var(--line-strong)',
+                      }}
+                    />
+                    <span
+                      className="text-[10px] font-bold leading-none"
+                      style={{ color: 'var(--ink-2)' }}
+                    >
+                      {group.label}
+                    </span>
+                    <span
+                      className="font-px text-[9px] leading-none tabular-nums"
+                      style={{ color: 'var(--ink-3)' }}
+                    >
+                      {group.colors.length}
+                    </span>
                   </div>
                   <div
                     style={{

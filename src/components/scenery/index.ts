@@ -33,6 +33,9 @@ export type {
 } from './MascotRoamer';
 
 export { MascotMark, MascotPromptButton } from './MascotMark';
+
+export { MascotBubble } from './MascotBubble';
+export type { MascotBubbleProps } from './MascotBubble';
 export type { MascotMarkProps, MascotPromptButtonProps } from './MascotMark';
 
 export { MascotPromptPopover } from './MascotPromptPopover';

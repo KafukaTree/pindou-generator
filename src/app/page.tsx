@@ -34,6 +34,7 @@ import {
   PixelGarden,
   PixelMascotPeek,
   PixelEmpty,
+  MascotBubble,
   MascotPromptButton,
   MascotRoamer,
   WORKBENCH_ANCHORS,
@@ -790,10 +791,16 @@ export default function Home() {
 
       {/* ============================ 顶栏 ============================ */}
       <header className="relative z-20 shrink-0 border-b-2 border-[var(--line-strong)] bg-[var(--paper-raised)]/92 backdrop-blur-[2px]">
-        <div className="flex items-center justify-between gap-4 px-4 py-2.5">
-          <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+        <div className="relative flex items-center justify-between gap-4 px-4 py-2.5">
+          {/*
+            左：吉祥物 + （手机上）标题。
+            这个 div 是 `relative` 的，聊天气泡挂在它下面 —— 气泡要贴着
+            鸭子说话，而不是贴着整条顶栏。
+          */}
+          <div className="relative flex min-w-0 items-center gap-2.5 sm:gap-3">
             <MascotMark brand={options.brand} />
-            <div className="min-w-0 leading-none">
+            {/* 手机上标题留在鸭子右边；lg 以上挪到顶栏正中（见下面那块） */}
+            <div className="min-w-0 leading-none lg:hidden">
               <h1 className="font-display truncate text-[17px] font-bold tracking-tight text-[var(--ink)] sm:text-[18px]">
                 拼豆图纸工坊
               </h1>
@@ -802,6 +809,30 @@ export default function Home() {
                 perler bead atelier
               </p>
             </div>
+            {/*
+              吉祥物的随机台词气泡。
+              用户原话：「这里面可以加个小宠物的聊天气泡，有几句话随机说
+              （有时候出现有时不出现），就是引起兴趣的，就是那种 AI 帮助
+              创作的」。它自己管节奏（9–18s 间隔、4.6–6.4s 停留），
+              这里只决定挂在哪。
+            */}
+            <MascotBubble />
+          </div>
+
+          {/*
+            中：标题。
+            用户说「然后拼豆创意工坊这个标题移动到中间也行」。
+            用绝对定位居中而不是 flex-1：flex 居中会被左右两侧宽度不同的
+            内容推着走（右侧有统计 tag 时会偏），绝对居中才是真居中。
+            手机放不下三段，所以只在 lg 以上这样排。
+          */}
+          <div className="pointer-events-none absolute left-1/2 hidden -translate-x-1/2 leading-none lg:block">
+            <h1 className="font-display text-center text-[18px] font-bold tracking-tight text-[var(--ink)]">
+              拼豆图纸工坊
+            </h1>
+            <p className="mt-1 text-center font-px text-[9px] uppercase tracking-[0.22em] text-[var(--ink-3)]">
+              perler bead atelier
+            </p>
           </div>
 
           <div className="flex items-center gap-2">
@@ -1280,10 +1311,30 @@ export default function Home() {
  * （scenery 交付时专门提醒过这一点）。40px 刚好 1:1，像素一颗不歪。
  * 外框 size-11 = 44px border-box，减去 2px 边框正好容纳 40px 内容盒。
  */
+/**
+ * 页头左上角的吉祥物（点开会出提示词弹窗）。
+ *
+ * 外框**去掉了**。用户两次提到这件事：
+ *   1. 「鼠标移动到左上角鼠标可以变成可点击的那种，会好很多」
+ *   2. 「然后可以把左上角小宠物的框框去掉，这样看起来比较自由，宠物也能变大一点」
+ *
+ * 原来那层 `size-11 + clay 底 + 2px 描边 + 硬投影` 是照 shadcn 按钮的思路
+ * 套的，但它把一只 40px 的像素鸭子关进 44px 的格子里 —— 四边各只剩 2px
+ * 余量，鸭子看着被裁脚，而且那个方块本身也是个视觉噪音（顶栏最左边突然
+ * 出现一块陶土色）。
+ *
+ * 现在鸭子直接以 48px 裸露在纸面上：48 是原生 160×136 网格的 0.3 倍
+ * （每格 1.2 CSS px），像素边缘仍然干净 —— 比原来 40px 只大 20%，
+ * 但视觉上因为没有边框圈着，显得开阔得多。可点击性由 cursor + 悬停
+ * 放大（见 MascotMark 的 button 类名）承担，不靠边框。
+ *
+ * 尺寸对齐：外框去掉后鸭子占 48×41，与右侧标题的行高不冲突，顶栏高度
+ * 不变（49px）。
+ */
 function MascotMark({ brand }: { brand: string }) {
   return (
-    <div className="relative flex size-11 items-center justify-center border-2 border-[var(--line-strong)] bg-[var(--clay)] shadow-[var(--shadow-px-btn)]">
-      <MascotPromptButton size={40} brand={brand} />
+    <div className="relative flex shrink-0 items-center justify-center">
+      <MascotPromptButton size={48} brand={brand} />
     </div>
   );
 }

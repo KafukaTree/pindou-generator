@@ -145,7 +145,28 @@ export function MascotMark({
       <button
         type="button"
         onClick={onClick}
-        className={className}
+        /*
+         * `cursor-pointer` + 悬停放大：用户原话「鼠标移动到左上角鼠标可以
+         * 变成可点击的那种，会好很多」。
+         *
+         * 光有 cursor 不够 —— 页头那只鸭子四周没有边框（用户又要求「把
+         * 左上角小宠物的框框去掉，这样看起来比较自由」），没有边界就没有
+         * 「这里可以点」的形状提示。所以悬停时轻微放大 6% 并抬一点，
+         * 用变化本身当可点击的暗示。
+         *
+         * 用 transform 而不是改 size：size 变化会重算整个像素网格
+         * （PixelMascot 按 size 算 cell 尺寸），40→42 会让像素边缘错位、
+         * 悬停时糊一下。transform: scale 走合成层，不动布局也不重采样。
+         */
+        className={[
+          'cursor-pointer transition-transform duration-150',
+          'hover:-translate-y-0.5 hover:scale-[1.06]',
+          'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2',
+          className,
+        ]
+          .filter(Boolean)
+          .join(' ')}
+        style={{ outlineColor: 'var(--clay)' }}
         aria-label={title ?? '吉祥物：点开拼豆创作提示词'}
         title={title}
       >

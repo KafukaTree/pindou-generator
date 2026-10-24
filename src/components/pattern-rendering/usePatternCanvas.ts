@@ -1263,6 +1263,77 @@ function drawEditPreview(
  */
 export type EditTool = 'pencil' | 'eraser' | 'picker' | 'fill';
 
+/**
+ * 笔头粗细（直径，格）。
+ *
+ * 用户先后提了三件事：
+ *   1.「编辑模式可以加入一个粗笔刷，这样初期绘制起来比较方便」
+ *   2.「其实可以合并笔……调整笔刷的粗细」
+ *   3.「太保守了，可以做个滑动条然后跟进到 1-16 直径的吧」
+ *
+ * 所以最后不设"粗笔"这个独立工具 —— 笔只有一支，粗细是个连续参数，
+ * 用一个滑动条从 1 调到 16。
+ *
+ * 为什么是参数而不是工具：
+ *   · 分开两个工具时，用户画到一半想变粗必须先切工具，切完 currentCode
+ *     和笔迹状态都要重建，手感是断的；
+ *   · 而"粗/细"本质是同一个动作的两档反馈，放在同一个笔上才符合直觉
+ *     （真实的手绘就是换笔尖，不是换笔）。
+ *
+ * 上限从 4 提到 16：4 太保守了。320 格的大图上，16 格直径只占 5%，一笔
+ * 铺一片背景正好；而 4 格在大图上和细笔几乎没差别，用户还得来回拖几十笔。
+ * 小图上 16 格确实很粗，但那是用户自己的选择 —— 有个滑动条在旁边，
+ * 手感和结果的关系是直接可见的，不需要系统去替他挡。
+ */
+export const MIN_BRUSH_WIDTH = 1;
+export const MAX_BRUSH_WIDTH = 16;
+
+/**
+ * 笔头形状：把"直径 N 格"翻译成"覆盖哪些偏移格"。
+ * ===============================================================
+ * 这个函数被**两处**共用，而且必须共用：
+ *   1. `applyToolAt` 落笔时实际涂哪些格；
+ *   2. 画布上的预览环（鼠标悬停时那圈金线）。
+ * 两处各写一份的话，改了一处忘了另一处，用户就会看到"圈住 4 格、涂了 1 格"
+ * 这种最伤信任的错位。
+ *
+ * ## 为什么偶数直径要偏移半格
+ *
+ * 奇数直径（1/3/5…）中心正好落在某一格的正中，直接算距离就行。
+ * 偶数直径（2/4/6…）没有"正中那一格" —— 中心落在四格的交角上。
+ * 如果硬按格心算：
+ *   · 直径 2 的半径是 0.5，阈值 0.5+0.35=0.85，而相邻格心距离是 1.0
+ *     → 只有自己那一格入选，直径 2 和直径 1 画出来一模一样（实测过，
+ *     用户报的就是这个：滑动条从 1 拖到 2，画面没变化）；
+ *   · 直径 4 也只覆盖到 9 格，和直径 3 的 5 格差别远小于应有倍数。
+ * 把中心偏移到 `(0.5, 0.5)`，直径 2 正好覆盖 2×2 的四格 —— 这才是
+ * "直径 2 颗豆"的物理含义（一个 2×2 的豆块）。
+ *
+ * 阈值 `+0.35` 是给圆盘边缘做柔化：纯粹按半径切，直径 3 会得到 3×3 的
+ * 实心方块（画竖线变成 3 格宽的柱子，很硬）；+0.35 把四个角切掉，
+ * 得到"3×3 去四角"的十字块，斜边和细线上自然得多。
+ */
+export function brushSpan(width: number): { lo: number; hi: number } {
+  const w = Math.max(MIN_BRUSH_WIDTH, Math.min(MAX_BRUSH_WIDTH, Math.round(width)));
+  const center = w % 2 === 0 ? 0.5 : 0;
+  const radius = (w - 1) / 2;
+  return { lo: Math.floor(center - radius), hi: Math.ceil(center + radius) };
+}
+
+/** 这个偏移格是否被笔头覆盖（中心偏移规则见 `brushSpan`） */
+export function brushContains(width: number, dx: number, dy: number): boolean {
+  const w = Math.max(MIN_BRUSH_WIDTH, Math.min(MAX_BRUSH_WIDTH, Math.round(width)));
+  if (w === 1) return dx === 0 && dy === 0;
+  const center = w % 2 === 0 ? 0.5 : 0;
+  const radius = (w - 1) / 2;
+  return Math.hypot(dx - center, dy - center) <= radius + 0.35;
+}
+
+/** 把任意输入夹到合法笔宽（渲染期与事件里都要用，抽出来避免两处不同步） */
+export const clampBrushWidth = (w: number): number =>
+  Math.min(MAX_BRUSH_WIDTH, Math.max(MIN_BRUSH_WIDTH, Math.round(w)));
+
+
 /** 编辑历史上限：每笔一格一条 delta，太大反而找不到想撤的那一步 */
 const MAX_EDIT_HISTORY = 200;
 
@@ -1558,6 +1629,34 @@ export function usePatternCanvas(
 
   const [editTool, setEditToolState] = useState<EditTool>(initialTool ?? 'pencil');
   const [currentCode, setCurrentCodeState] = useState<string>('');
+  /*
+   * 笔宽 1–4（格）。默认 1 = 单格，和原来的手绘完全一致 —— 老用户升级
+   * 版本后手感不该变。想铺大色块自己调粗。
+   *
+   * ref 同步：指针处理器是 useCallback 缓存的，直接读 state 会拿到旧值
+   * （处理器不会为笔宽变化重建）。ref 每次渲染同步。
+   */
+  /**
+   * 最近真正用过的色号（倒序，最多 18 个）。
+   *
+   * 色卡里那个「常用」组的数据源。**只在 commitDeltas 里更新** —— 也就是说
+   * 只有真的落笔画了东西才算"用过"。
+   *
+   * 为什么不能用 currentCode 当数据源：进编辑模式时系统会自动选中"图案里
+   * 用得最多的那个色"作为起手色（见 PatternCanvas 里那个默认画笔 effect），
+   * 用户还没动手，「常用」组里就已经躺着一个色 —— 他会以为是自己之前用过
+   * 的，信任感就没了。取色器选中、色卡点选这两个也是"用户动作"，但它们
+   * 都不等于"用这个色画过"，所以同样不算。
+   *
+   * 数据从 delta 里取而不是从 currentCodeRef 取：`delta.after` 就是这一笔
+   * 真正写进格子的色号，橡皮的 `after` 是空串（会被过滤掉），油漆桶的
+   * 也是同一个值 —— 全都准确。
+   */
+  const [recentCodes, setRecentCodes] = useState<string[]>([]);
+
+  const [brushWidth, setBrushWidthState] = useState<number>(MIN_BRUSH_WIDTH);
+  const brushWidthRef = useRef(brushWidth);
+  brushWidthRef.current = brushWidth;
   // 事件回调里要读最新工具/色号，但不能让它们进依赖数组（否则每换一次色就重建指针处理器）
   const editToolRef = useRef<EditTool>(editTool);
   editToolRef.current = editTool;
@@ -1614,6 +1713,29 @@ export function usePatternCanvas(
       editsRef.current = next;
       pushUndo({ kind: 'edits', delta: merged });
       onEditsChange(next, deltas);
+      /*
+       * 记「常用」：这一笔真正写了哪些色号。
+       *
+       * 按"最后写的在前"排序 —— merged.after 是按笔画顺序排列的，一笔多色
+       * （拖动中换了色理论上不会发生，但油漆桶之后接着手绘会）取第一个即可
+       * 覆盖绝大多数情况；去重后最多留 18 个。
+       */
+      const painted: string[] = [];
+      for (const code of merged.after) {
+        if (code && !painted.includes(code)) painted.push(code);
+      }
+      if (painted.length > 0) {
+        setRecentCodes((prev) => {
+          const mergedCodes = [...painted, ...prev.filter((c) => !painted.includes(c))];
+          const next = mergedCodes.slice(0, 18);
+          /*
+           * 内容相同时返回原数组，避免无意义的重渲染 —— 这个回调在每一笔
+           * 结束时都会跑，拖动时可能一秒十几次。
+           */
+          if (next.length === prev.length && next.every((c, i) => c === prev[i])) return prev;
+          return next;
+        });
+      }
     },
     [onEditsChange, pushUndo],
   );
@@ -1715,6 +1837,15 @@ export function usePatternCanvas(
       });
     },
     [resetLive],
+  );
+
+  const setBrushWidth = useCallback(
+    (w: number | ((prev: number) => number)) => {
+      setBrushWidthState((prev) =>
+        clampBrushWidth(typeof w === 'function' ? w(prev) : w),
+      );
+    },
+    [],
   );
 
   const setEditTool = useCallback(
@@ -2635,6 +2766,47 @@ export function usePatternCanvas(
       const stroke = editStrokeRef.current;
       // 换工具时（比如擦到一半切回铅笔）不能混在一条笔里：after 不同就另起一条
       if (!stroke || stroke.after !== after) editStrokeRef.current = { cells: [], after };
+      /*
+       * 粗笔：一次落点盖住一个小圆盘，而不是一格。
+       *
+       * 只在 thick 语义下生效（橡皮不跟着变粗 —— 保守起来，避免用户本想
+       * 点掉一颗豆却抹掉一片）。半径 1 时 hypot 阈值取 1.35，四角被切掉，
+       * 得到的是"3×3 去掉四个角"的十字块（5 格）。这个形状在斜边和细线上
+       * 比实心方块自然得多：实心 3×3 画一条竖线会得到 3 格宽的柱子，
+       * 而十字块画出来是带柔边的笔触。
+       *
+       * 走 paintCell 同一套流程，所以：
+       *  - 一条笔内的格子去重、同色不算编辑、撤销栈粒度，全部自动一致
+       *  - 拖动时 Bresenham 补间的每一格都会各自铺一次圆盘，接缝自然重叠
+       */
+      /*
+       * 笔宽 > 1 时一次落点盖住一个小圆盘。
+       *
+       * 圆盘判据用 `hypot(dx, dy) <= radius + 0.35`：对半径 1 得到
+       * "3×3 去掉四个角"的十字块（5 格）—— 实心 3×3 画竖线会变成 3 格宽的
+       * 柱子，十字块画出来才像笔触。半径 2/3 时 +0.35 让圆盘边缘不那么毛糙。
+       *
+       * 走 paintCell 同一套流程，所以一条笔内去重、同色不算编辑、
+       * 撤销栈粒度全部自动一致；拖动时 Bresenham 补间的每一格都会各自铺
+       * 一次圆盘，接缝自然重叠。
+       */
+      const width = brushWidthRef.current;
+      if (width > 1) {
+        const cols = pattern.cols;
+        const c0 = index % cols;
+        const r0 = Math.floor(index / cols);
+        const { lo, hi } = brushSpan(width);
+        for (let dy = lo; dy <= hi; dy++) {
+          for (let dx = lo; dx <= hi; dx++) {
+            if (!brushContains(width, dx, dy)) continue;
+            const c = c0 + dx;
+            const r = r0 + dy;
+            if (c < 0 || r < 0 || c >= cols || r >= pattern.rows) continue;
+            paintCell(r * cols + c, after);
+          }
+        }
+        return;
+      }
       paintCell(index, after);
     },
     [pattern, editEnabled, paintCell, commitDeltas, setCurrentCode],
@@ -2858,11 +3030,20 @@ export function usePatternCanvas(
         );
       }
       /*
-       * 编辑模式下再加一个"当前格"方框。
+       * 编辑模式下画"这一笔会落在哪"的落点预览。
        *
        * hover 的三层环是给"看色号"用的，颜色是陶土；编辑时用户关心的是
-       * "我这一下会落在哪一格"，需要更硬、更方的提示 —— 用金色方框，
+       * "我这一下会盖住哪些格"，需要更硬、更方的提示 —— 用金色，
        * 与手改标记同色系，语义一致（金色 = 我动过/我要动）。
+       *
+       * **形状必须跟笔宽走**（用户要求「笔刷选择过后鼠标预览也跟着变化」）。
+       * 原来只画"当前格"一个方框，笔宽调到 4 时指针还是只框住一格 ——
+       * 用户以为笔没变粗，实际落下去盖了 37 格。现在按同一套圆盘判据
+       * 逐格描边，屏幕上的形状就是真实落笔的形状。
+       *
+       * 描边而不是填充：填充会盖住底下的色号（编辑时经常要看着色号画）。
+       * 只在最外圈描边（判断该格是否有不在圆盘内的邻居），内部格子跳过 ——
+       * 否则 4 格粗时 37 个方框叠在一起是一团金雾。
        */
       if (editEnabled && editCursor) {
         const { cellDev, eff } = metrics;
@@ -2873,15 +3054,39 @@ export function usePatternCanvas(
           ctx.setTransform(1, 0, 0, 1, 0, 0);
           ctx.scale(eff, eff);
           const d = (dev: number) => dev / eff;
-          const x = editCursor.col * cellDev;
-          const y = editCursor.row * cellDev;
-          const w = Math.max(1, Math.round(cellDev * 0.09));
+          const cols = pattern ? pattern.cols : 1;
+          const rows = pattern ? pattern.rows : 1;
+          const bw = brushWidthRef.current;
+          const { lo, hi } = brushSpan(bw);
+          /* 与落笔共用同一套判据 —— 圈住什么就一定涂什么 */
+          const inside = (dx: number, dy: number) => brushContains(bw, dx, dy);
+          const lineW = Math.max(1, Math.round(cellDev * 0.09));
           ctx.globalAlpha = 0.95;
           ctx.fillStyle = tokens.gold;
-          ctx.fillRect(d(x), d(y), d(w), d(cellDev));
-          ctx.fillRect(d(x + cellDev - w), d(y), d(w), d(cellDev));
-          ctx.fillRect(d(x), d(y), d(cellDev), d(w));
-          ctx.fillRect(d(x), d(y + cellDev - w), d(cellDev), d(w));
+          for (let dy = lo; dy <= hi; dy++) {
+            for (let dx = lo; dx <= hi; dx++) {
+              if (!inside(dx, dy)) continue;
+              const c = editCursor.col + dx;
+              const r = editCursor.row + dy;
+              if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
+              // 只描"圆盘边缘"：四邻里有落在圆盘外的，才需要画这个格子
+              const edge =
+                !inside(dx - 1, dy) ||
+                !inside(dx + 1, dy) ||
+                !inside(dx, dy - 1) ||
+                !inside(dx, dy + 1);
+              if (!edge) continue;
+              const x = c * cellDev;
+              const y = r * cellDev;
+              // 逐边判断：邻居在圆盘内就不画这条边，边缘才不会出现内部横线
+              if (!inside(dx, dy - 1)) ctx.fillRect(d(x), d(y), d(cellDev), d(lineW));
+              if (!inside(dx, dy + 1))
+                ctx.fillRect(d(x), d(y + cellDev - lineW), d(cellDev), d(lineW));
+              if (!inside(dx - 1, dy)) ctx.fillRect(d(x), d(y), d(lineW), d(cellDev));
+              if (!inside(dx + 1, dy))
+                ctx.fillRect(d(x + cellDev - lineW), d(y), d(lineW), d(cellDev));
+            }
+          }
           ctx.globalAlpha = 1;
         }
       }
@@ -2902,6 +3107,12 @@ export function usePatternCanvas(
      * hover 恰好变化时偶尔刷新 —— 表现为"画快了才看得到，慢慢画反而没有"。
      */
     editLiveTick,
+    /*
+     * 笔宽变了要立刻重绘一次预览环 —— 回调里读的是 brushWidthRef，
+     * ref 变化不会触发重绘，所以把 state 也放进依赖，让光标形状跟手变化。
+     */
+    brushWidth,
+    pattern,
     codeHex,
   ]);
 
@@ -3232,6 +3443,9 @@ export function usePatternCanvas(
     editEnabled,
     editTool,
     setEditTool,
+    brushWidth,
+    setBrushWidth,
+    recentCodes,
     currentCode,
     setCurrentCode,
     editCursor,

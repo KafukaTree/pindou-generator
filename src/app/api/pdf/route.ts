@@ -14,14 +14,20 @@
  * 5. **封面**：标题、品牌、规格、颜色数、总豆子数、5mm 成品尺寸、日期、
  *    缩略预览、色号速查表。
  * 6. **用料清单**：色块 / 色号 / HEX / 颗数 / 占比 / 建议购买量（+10% 向上取整到 10 的倍数）。
- * 7. **全英文**：jsPDF 内置 helvetica 不含中文字形，任何中文都会变成方块，
- *    因此所有输出字符串都过 toAscii()；品牌名用 ASCII 别名。
+ * 7. **中文可印**：jsPDF 内置 helvetica 不含中文字形，直接输出中文会变方块。
+ *    这里额外注册一份**中文子集字体**（public/fonts/cjk-regular.ttf，从系统
+ *    Arial Unicode 裁出的 GB2312 全集，约 1.7MB），所有文字都走这个字体。
+ *    粗体没有第二个字重文件 —— jsPDF 同时注册两个 TTF 会让内部 glyph pool
+ *    串味（实测 "Cannot use 'in' operator to search for '0'"），因此用
+ *    `renderingMode: 'fillThenStroke'` 描边仿真粗体，靠 FontProxy 自动加。
  * 8. **性能**：色块填充按"同色横向连续 run"合并 + 按颜色分组减少状态切换；
  *    网格线按 3 个 pass 批量画；文字按 (字号, 字色) 分桶批量画。
  *    单元格数 > 14400 时强制只印图例序号，避免字太长排不下。
  */
 
 import { NextRequest, NextResponse } from 'next/server';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { jsPDF } from 'jspdf';
 import { BRANDS, type Brand } from '@/lib/color/palette';
 import { parseHex, readableInkFor, type Rgb } from '@/lib/color/oklab';
@@ -130,12 +136,19 @@ const LINE_BOLD = 0.5;
 const RULER_MINOR = 5;
 const RULER_MAJOR = 10;
 
-const BRAND_ASCII: Record<Brand, string> = {
+/**
+ * 品牌名直接印中文。
+ *
+ * 这几个名字是用户唯一能在豆袋上核对的信息，曾经因为"jsPDF 没有中文字体"
+ * 被降级成 ManMan / PanPan / MiXiaoWo —— 用户拿着图纸去店里说"我要
+ * MiXiaoWo" 没人听得懂。现在 CJK 字体已经在，必须印回原样。
+ */
+const BRAND_LABEL: Record<Brand, string> = {
   MARD: 'MARD',
   COCO: 'COCO',
-  漫漫: 'ManMan',
-  盼盼: 'PanPan',
-  咪小窝: 'MiXiaoWo',
+  漫漫: '漫漫',
+  盼盼: '盼盼',
+  咪小窝: '咪小窝',
 };
 
 // ---------------------------------------------------------------------------
@@ -184,8 +197,16 @@ function badRequest(error: string): NextResponse {
   return NextResponse.json({ error }, { status: 400 });
 }
 
-function toAscii(value: string): string {
-  return value.replace(/[^\x20-\x7E]/g, '?');
+/**
+ * 清掉控制字符与孤立代理项。
+ *
+ * 以前这个位置是 toAscii()，把非 ASCII 全换成 '?' —— 那是"jsPDF 没有中文字体"
+ * 时代的权宜之计。现在注册了 CJK 子集字体（见 makeDoc），中文能正常印出来，
+ * 这个函数只保留"别让用户传进来的怪字符炸掉 PDF"这一层职责。
+ */
+function sanitizeText(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
 }
 
 /** 解析并校验请求体；返回 NextResponse 表示校验失败 */
@@ -193,37 +214,37 @@ function validateBody(raw: IncomingBody): CleanRequest | NextResponse {
   const cols = Number(raw.cols);
   const rows = Number(raw.rows);
   if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
-    return badRequest('cols and rows must be positive integers');
+    return badRequest('cols 与 rows 必须是正整数');
   }
   if (cols > MAX_DIM || rows > MAX_DIM) {
-    return badRequest(`cols and rows must be <= ${MAX_DIM}`);
+    return badRequest(`cols 与 rows 不能大于 ${MAX_DIM}`);
   }
 
   const brandValue = typeof raw.brand === 'string' ? raw.brand : '';
   if (!(BRANDS as readonly string[]).includes(brandValue)) {
-    return badRequest(`brand must be one of: ${BRANDS.join(', ')}`);
+    return badRequest(`brand 必须是以下之一：${BRANDS.join('、')}`);
   }
   const brand = brandValue as Brand;
 
   if (!Array.isArray(raw.palette) || raw.palette.length === 0) {
-    return badRequest('palette must be a non-empty array');
+    return badRequest('palette 不能为空');
   }
   if (raw.palette.length > 256) {
-    return badRequest('palette must not contain more than 256 colors');
+    return badRequest('palette 颜色数不能超过 256');
   }
 
   const palette: CleanPaletteEntry[] = [];
   for (let i = 0; i < raw.palette.length; i++) {
     const entry = raw.palette[i] as IncomingPaletteEntry;
     if (!entry || typeof entry !== 'object') {
-      return badRequest(`palette[${i}] must be an object`);
+      return badRequest(`palette[${i}] 必须是对象`);
     }
     const rgb = typeof entry.hex === 'string' ? parseHex(entry.hex) : null;
     if (!rgb) {
-      return badRequest(`palette[${i}].hex is not a valid #RRGGBB color`);
+      return badRequest(`palette[${i}].hex 不是合法的 #RRGGBB 颜色`);
     }
     const rawCode = typeof entry.code === 'string' ? entry.code : '';
-    const code = toAscii(rawCode).trim().slice(0, 8) || `#${i + 1}`;
+    const code = sanitizeText(rawCode).trim().slice(0, 8) || `#${i + 1}`;
     palette.push({
       index: i,
       hex: normalizeHex(rgb),
@@ -236,14 +257,14 @@ function validateBody(raw: IncomingBody): CleanRequest | NextResponse {
 
   const expected = cols * rows;
   if (!Array.isArray(raw.cells) || raw.cells.length !== expected) {
-    return badRequest(`cells length must equal cols * rows (${expected})`);
+    return badRequest(`cells 长度必须等于 cols * rows（${expected}）`);
   }
 
   const cells = new Int16Array(expected);
   for (let i = 0; i < expected; i++) {
     const value = Number(raw.cells[i]);
     if (!Number.isInteger(value) || value < -1 || value > palette.length - 1) {
-      return badRequest(`cells[${i}] must be an integer in [-1, ${palette.length - 1}]`);
+      return badRequest(`cells[${i}] 必须是 [-1, ${palette.length - 1}] 之间的整数`);
     }
     cells[i] = value;
   }
@@ -273,7 +294,7 @@ function validateBody(raw: IncomingBody): CleanRequest | NextResponse {
     cols,
     rows,
     brand,
-    brandLabel: BRAND_ASCII[brand] ?? 'BRAND',
+    brandLabel: BRAND_LABEL[brand] ?? 'BRAND',
     cells,
     palette,
     totalBeads,
@@ -288,10 +309,113 @@ function normalizeHex(rgb: Rgb): string {
 }
 
 // ---------------------------------------------------------------------------
-// jsPDF 小工具
+// 中文字体
 // ---------------------------------------------------------------------------
 
+/**
+ * 中文字体族名。
+ *
+ * 为什么要自带字体：jsPDF 内置的 14 个标准 PDF 字体（helvetica 等）是
+ * Latin-1 编码，根本没有中文字形。直接 text('拼豆') 印出来是一排方块/乱码。
+ *
+ * 字体文件是 public/fonts/cjk-regular.ttf —— 从 macOS 的 Arial Unicode 裁出的
+ * **GB2312 全集子集**（6763 汉字 + 完整 ASCII + Latin-1 + 通用标点 + 带圈数字，
+ * 共 7777 个码位，1.7MB）。裁过之后 jsPDF 嵌进 PDF 的只会是"这一份里真正用到的
+ * 字形"，所以输出体积几乎不受影响（实测单页 ~40KB）。
+ *
+ * 为什么不直接读系统字体：生产环境是 Linux 容器，macOS 的字体路径不存在。
+ * 把字体放进仓库才能保证 dev/生产印出来的东西一致。
+ *
+ * 为什么只有一个字重：jsPDF 同时 addFont 两个 TTF 会共用内部 glyph pool，
+ * 实测第二个字体在 buildDocument 时抛
+ * "Cannot use 'in' operator to search for '0' in undefined" —— PDF 直接坏掉。
+ * 所以粗体用 renderingMode: 'fillThenStroke' 描边仿真，见 makeDoc()。
+ */
+const CJK_FAMILY = 'PDCJK';
+const CJK_FILE = 'cjk-regular.ttf';
+
+let cachedFontBase64: string | null = null;
+
+function loadCjkFont(): string {
+  if (cachedFontBase64) return cachedFontBase64;
+  // process.cwd() 在 next dev / next start 下都是项目根目录
+  const path = join(process.cwd(), 'public', 'fonts', CJK_FILE);
+  cachedFontBase64 = readFileSync(path).toString('base64');
+  return cachedFontBase64;
+}
+
+/**
+ * Doc = 带字体兜底的 jsPDF 代理。
+ *
+ * 排版代码里到处是 `doc.setFont('helvetica', 'bold')` / `doc.setFont('helvetica',
+ * 'normal')`。与其改 75 处调用点（还容易漏、以后新增又忘），不如在代理层统一
+ * 拦住：任何 setFont 都换成中文字体，'bold' 记成状态位，等下一次 text() 时
+ * 自动加上描边。
+ *
+ * 描边宽度按字号的比例算（3%），这样 3.6pt 的格内小字和 22pt 的封面标题
+ * 都只是"看起来粗了一档"，不会小字糊成一团 / 大字看不出加粗。
+ */
 type Doc = jsPDF;
+
+function makeDoc(): Doc {
+  const raw = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
+  raw.addFileToVFS(CJK_FILE, loadCjkFont());
+  raw.addFont(CJK_FILE, CJK_FAMILY, 'normal');
+
+  const state = { bold: false, fontPt: 10, ink: [0, 0, 0] as RgbTuple };
+
+  const handle: ProxyHandler<jsPDF> = {
+    get(target, prop, receiver) {
+      switch (prop) {
+        case 'setFont':
+          return (_family?: string, style?: string) => {
+            state.bold = style === 'bold' || style === 'bolditalic';
+            target.setFont(CJK_FAMILY, 'normal');
+            return receiver;
+          };
+        case 'setFontSize':
+          return (pt: number) => {
+            state.fontPt = pt;
+            target.setFontSize(pt);
+            return receiver;
+          };
+        case 'setTextColor':
+          return (r: number, g: number, b: number) => {
+            state.ink = [r, g, b];
+            target.setTextColor(r, g, b);
+            return receiver;
+          };
+        case 'text':
+          return (text: string | string[], x: number, y: number, opts?: unknown) => {
+            if (!state.bold) return Reflect.apply(target.text, target, [text, x, y, opts]);
+
+            const options = (opts ? { ...(opts as Record<string, unknown>) } : {}) as Record<
+              string,
+              unknown
+            >;
+            // 调用点显式指定 renderingMode 时尊重调用点（例如强调条里的字）
+            if (options.renderingMode === undefined) {
+              // 线宽要跟着字号走；target 的 setLineWidth 不改字色，但描边用的是
+              // setDrawColor，必须先把当前文字色同步成描边色 —— 否则深底白字
+              // 会描出一圈黑边。
+              target.setLineWidth(Math.max(0.02, state.fontPt * 0.03));
+              target.setDrawColor(state.ink[0], state.ink[1], state.ink[2]);
+              options.renderingMode = 'fillThenStroke';
+            }
+            return Reflect.apply(target.text, target, [text, x, y, options]);
+          };
+        default: {
+          const value = Reflect.get(target, prop, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }
+      }
+    },
+  };
+
+  // getTextWidth / splitTextToSize 在代理下会走 get 分支拿到绑定好的函数，
+  // 内部用的是已经注册的 CJK 字体，宽度计算正确。
+  return new Proxy(raw, handle) as Doc;
+}
 
 function setFill(doc: Doc, c: RgbTuple): void {
   doc.setFillColor(c[0], c[1], c[2]);
@@ -340,11 +464,11 @@ function drawPageHeader(doc: Doc, title: string, subtitle: string, accent = true
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(15);
-  doc.text(toAscii(title), M + 6, 21.5);
+  doc.text(sanitizeText(title), M + 6, 21.5);
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
-  doc.text(toAscii(subtitle), M + 6, 27.5);
+  doc.text(sanitizeText(subtitle), M + 6, 27.5);
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +640,7 @@ function buildLabelSpecs(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
   const refWidths = palette.map((entry) => ({
-    code: Math.max(0.1, doc.getTextWidth(toAscii(entry.code))),
+    code: Math.max(0.1, doc.getTextWidth(sanitizeText(entry.code))),
     index: Math.max(0.1, doc.getTextWidth(String(entry.index + 1))),
   }));
 
@@ -531,7 +655,7 @@ function buildLabelSpecs(
     const candidates: Array<{ text: string; widthAt10: number }> = forceIndexOnly
       ? [{ text: String(entry.index + 1), widthAt10: ref.index }]
       : [
-          { text: toAscii(entry.code), widthAt10: ref.code },
+          { text: sanitizeText(entry.code), widthAt10: ref.code },
           { text: String(entry.index + 1), widthAt10: ref.index },
         ];
 
@@ -589,7 +713,7 @@ function drawTileMiniMap(
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(5.5);
-  doc.text(`${plan.tiles.length} TILES`, rightX, y0 + totalH + 3.4, { align: 'right' });
+  doc.text(`共 ${plan.tiles.length} 块`, rightX, y0 + totalH + 3.4, { align: 'right' });
 }
 
 function drawPatternTile(
@@ -618,8 +742,8 @@ function drawPatternTile(
 
   drawPageHeader(
     doc,
-    tileTotal > 1 ? `PATTERN - TILE ${tileIndex + 1} / ${tileTotal}` : 'PATTERN',
-    `Cols ${colA}-${colB}  |  Rows ${rowA}-${rowB}  |  Grid ${cols} x ${req.rows}  |  Brand ${req.brandLabel}`,
+    tileTotal > 1 ? `图纸 · 第 ${tileIndex + 1} 块 / 共 ${tileTotal} 块` : '图纸',
+    `列 ${colA}–${colB}   |   行 ${rowA}–${rowB}   |   网格 ${cols} × ${req.rows}   |   品牌 ${req.brandLabel}`,
   );
 
   if (tileTotal > 1) {
@@ -635,8 +759,8 @@ function drawPatternTile(
     doc.setFontSize(6.8);
     doc.text(
       forceIndexOnly
-        ? 'One number per color block = COLOR LEGEND index. Dashed line = overlap.'
-        : 'One code per color block. Use the Col / Row rulers for exact position.',
+        ? '每个大色块标一个数字 = 色号图例序号。品红虚线是相邻页的重叠带。'
+        : '每个大色块只标一次色号。精确定位请看上方列号 / 左侧行号。',
       GRID_LEFT,
       gy - 9.6,
     );
@@ -644,7 +768,7 @@ function drawPatternTile(
     setInk(doc, INK_SOFT);
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.8);
-    doc.text('Overlapping tiles - see ASSEMBLY GUIDE at the bottom of this sheet.', GRID_LEFT, gy - 9.6);
+    doc.text('相邻页有重叠，拼接方法见本页底部「拼接指引」。', GRID_LEFT, gy - 9.6);
   }
 
   // ---- 单元格填充（同色横向 run 合并 + 按颜色分组） ----
@@ -819,8 +943,8 @@ function drawPatternTile(
   setInk(doc, INK_FAINT);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(5.2);
-  doc.text('COLS', gx + gridW, gy - TOP_RULER_H - 1.0, { align: 'right' });
-  doc.text('ROWS', gx - 0.8, gy - TOP_RULER_H - 1.0, { align: 'right' });
+  doc.text('列', gx + gridW, gy - TOP_RULER_H - 1.0, { align: 'right' });
+  doc.text('行', gx - 0.8, gy - TOP_RULER_H - 1.0, { align: 'right' });
 
   // ---- 色号标注 ----
   //
@@ -959,11 +1083,11 @@ function drawPatternTile(
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(7.6);
-    doc.text('COLORS ON THIS TILE', GRID_LEFT, startY);
+    doc.text('本页用到的颜色', GRID_LEFT, startY);
     setInk(doc, INK_FAINT);
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(5.8);
-    doc.text(`${list.length} of ${req.palette.filter((e) => e.count > 0).length} colors`, GRID_LEFT + 34, startY);
+    doc.text(`本页 ${list.length} 色 / 全图 ${req.palette.filter((e) => e.count > 0).length} 色`, GRID_LEFT + 34, startY);
 
     // 底部左侧区块：只占 ASSEMBLY GUIDE 左边的宽度，绝不越界压到右侧文字
     const badgeX = 116;
@@ -1008,7 +1132,7 @@ function drawPatternTile(
       setInk(doc, INK);
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(chipFs);
-      doc.text(toAscii(entry.code), cx + chipH + 1.0, cy + chipH * 0.68);
+      doc.text(sanitizeText(entry.code), cx + chipH + 1.0, cy + chipH * 0.68);
     });
 
     // 右侧拼接指引：相邻块编号（行优先顺序）
@@ -1016,7 +1140,7 @@ function drawPatternTile(
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(7.6);
-    doc.text('ASSEMBLY GUIDE', badgeX, badgeY);
+    doc.text('拼接指引', badgeX, badgeY);
 
     const nbr = (tx: number, ty: number) =>
       ty * plan.tilesX + tx + 1 >= 1 &&
@@ -1028,10 +1152,10 @@ function drawPatternTile(
         : '-';
 
     const guide: Array<[string, string]> = [
-      ['Above', nbr(tile.tx, tile.ty - 1)],
-      ['Below', nbr(tile.tx, tile.ty + 1)],
-      ['Left', nbr(tile.tx - 1, tile.ty)],
-      ['Right', nbr(tile.tx + 1, tile.ty)],
+      ['上方', nbr(tile.tx, tile.ty - 1)],
+      ['下方', nbr(tile.tx, tile.ty + 1)],
+      ['左侧', nbr(tile.tx - 1, tile.ty)],
+      ['右侧', nbr(tile.tx + 1, tile.ty)],
     ];
 
     doc.setFont('helvetica', 'normal');
@@ -1042,18 +1166,18 @@ function drawPatternTile(
       doc.text(`${label}:`, badgeX, gyy);
       setInk(doc, INK);
       doc.setFont('helvetica', 'bold');
-      doc.text(value === '-' ? 'edge' : `Tile ${value}`, badgeX + 12, gyy);
+      doc.text(value === '-' ? '无（边缘）' : `第 ${value} 块`, badgeX + 12, gyy);
       doc.setFont('helvetica', 'normal');
     });
 
     // 注记：从下往上排，保证最后一行的基线始终在页脚之上，绝不压页脚
-    const notes: string[] = ['Count cells from the bold 10-lines.'];
+    const notes: string[] = ['从加粗的 10 格主线开始数格子。'];
     if (tileTotal > 1) {
       notes.unshift(
-        `Neighbours share at least ${plan.overlapX} cols / ${plan.overlapY} rows.`,
+        `相邻页之间至少重叠 ${plan.overlapX} 列 / ${plan.overlapY} 行。`,
       );
     }
-    notes.unshift('Dashed line = overlapping strip.');
+    notes.unshift('品红虚线 = 与相邻页重叠的部分。');
 
     const noteFs = 5.6;
     const noteStep = 3.6;
@@ -1094,8 +1218,8 @@ function drawPatternOverview(doc: Doc, req: CleanRequest, plan: PagePlan): void 
 
   drawPageHeader(
     doc,
-    'PATTERN OVERVIEW',
-    `Grid ${cols} x ${rows}  |  Brand ${req.brandLabel}  |  ${plan.tiles.length} tiles  |  overview only - build from the tile pages`,
+    '图纸总览',
+    `网格 ${cols} × ${rows}   |   品牌 ${req.brandLabel}   |   共 ${plan.tiles.length} 块   |   本页仅总览，实际拼装请看后面的分块图纸`,
   );
 
   // 布局：上半张概览图，下半张"色号索引 + 各 tile 行列范围表"。
@@ -1167,8 +1291,8 @@ function drawPatternOverview(doc: Doc, req: CleanRequest, plan: PagePlan): void 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(6.8);
   const notes = [
-    'Overview only - the numbered tiles below are what you build from. Each tile page reprints',
-    'that area at a readable scale with global Cols / Rows rulers and one code per color block.',
+    '本页只用来纵览全局。真正动手拼时请看后面带编号的分块图纸 —— 每一页都会把',
+    '该区域放大重印，带全局列号 / 行号标尺，并按实际格子大小标好色号。',
   ];
   for (const note of notes) {
     if (y > PAGE_H - BOTTOM_RESERVE - 2) break;
@@ -1187,16 +1311,16 @@ function drawPatternOverview(doc: Doc, req: CleanRequest, plan: PagePlan): void 
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.0);
-  doc.text('COLOR INDEX', M, y);
+  doc.text('色号索引', M, y);
   setInk(doc, INK_FAINT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(5.6);
-  doc.text('numbers match the legend page', M + 21, y);
+  doc.text('数字与色号图例页一一对应', M + 21, y);
 
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.0);
-  doc.text('TILE INDEX', midX, y);
+  doc.text('分块索引', midX, y);
 
   const cy = y + 5.4;
   const chipH = 3.0;
@@ -1224,7 +1348,7 @@ function drawPatternOverview(doc: Doc, req: CleanRequest, plan: PagePlan): void 
     doc.text(`${entry.index + 1}`, cx + chipH + 0.8, rowY);
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
-    doc.text(toAscii(entry.code), cx + chipH + 4.2, rowY);
+    doc.text(sanitizeText(entry.code), cx + chipH + 4.2, rowY);
     setInk(doc, INK_FAINT);
     doc.setFont('helvetica', 'normal');
     doc.text(`x${entry.count}`, cx + stepX - 1.6, rowY, { align: 'right' });
@@ -1277,21 +1401,21 @@ function drawCoverGlance(
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.5);
-  doc.text('AT A GLANCE', x, top - 5);
+  doc.text('一览', x, top - 5);
 
   setDraw(doc, RULE);
   doc.setLineWidth(0.3);
   doc.rect(x, top, width, 82, 'S');
 
   const lines: Array<[string, string]> = [
-    ['Tiles to print', String(plan.tiles.length)],
-    ['Cell size on paper', `${plan.cell.toFixed(1)} mm`],
-    ['Cell size (px @300dpi)', `${Math.round((plan.cell / 25.4) * 300)} px`],
-    ['Grid', `${cols} x ${rows}`],
-    ['Beads needed', String(totalBeads)],
-    ['Buy (with 10% buffer)', String(buyTotal)],
-    ['Blank cells', String(blankCells)],
-    ['Colors', String(used.length)],
+    ['需打印块数', String(plan.tiles.length)],
+    ['纸面单格边长', `${plan.cell.toFixed(1)} mm`],
+    ['单格像素（300dpi）', `${Math.round((plan.cell / 25.4) * 300)} px`],
+    ['网格规格', `${cols} x ${rows}`],
+    ['需要豆子', String(totalBeads)],
+    ['建议购买（含 10% 余量）', String(buyTotal)],
+    ['空白格', String(blankCells)],
+    ['颜色数', String(used.length)],
   ];
 
   let y = top + 6.5;
@@ -1314,7 +1438,7 @@ function drawCoverGlance(
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(6.2);
-  doc.text('TOP 3 COLORS', x + 3, y + 2.2);
+  doc.text('用得最多的 3 个颜色', x + 3, y + 2.2);
 
   let ty = y + 7;
   heaviest.forEach((entry) => {
@@ -1326,7 +1450,7 @@ function drawCoverGlance(
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(6.4);
-    doc.text(toAscii(entry.code), x + 8, ty);
+    doc.text(sanitizeText(entry.code), x + 8, ty);
     setInk(doc, INK_SOFT);
     doc.setFont('helvetica', 'normal');
     doc.text(`x${entry.count}`, x + width - 3, ty, { align: 'right' });
@@ -1345,12 +1469,12 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(25);
-  doc.text('PERLER BEAD PATTERN', M, 30);
+  doc.text('拼豆图纸', M, 30);
 
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10.5);
-  doc.text('Printable pattern sheet - cover, tiled pattern, bill of materials', M, 38);
+  doc.text('可打印图纸 · 封面 / 分块图纸 / 用料清单', M, 38);
 
   rule(doc, M, 43.5, PAGE_W - M, RULE, 0.4);
 
@@ -1361,27 +1485,27 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
   const scaledDown = plan.cell < TRUE_SCALE_CELL;
 
   const rowsData: Array<[string, string]> = [
-    ['Brand', brandLabel],
-    ['Grid', `${cols} cols x ${rows} rows  (${cols * rows} cells)`],
-    ['Colors used', `${palette.filter((entry) => entry.count > 0).length}`],
-    ['Total beads', `${totalBeads}`],
-    ['Blank cells', `${blankCells}  (no bead)`],
-    ['Finished size', `approx. ${finishedW} x ${finishedH} cm  (5 mm beads)`],
+    ['品牌', brandLabel],
+    ['网格规格', `${cols} 列 × ${rows} 行（共 ${cols * rows} 格）`],
+    ['颜色数', `${palette.filter((entry) => entry.count > 0).length}`],
+    ['总豆子数', `${totalBeads}`],
+    ['空白格', `${blankCells} 格（不拼豆）`],
+    ['成品尺寸', `5mm 豆，成品约 ${finishedW} × ${finishedH} cm`],
     [
-      'Pattern pages',
+      '图纸页数',
       totalTiles === 1
-        ? '1 sheet (A4)'
-        : `${totalTiles} tiles on A4, overlap ${OVERLAP} rows/cols`,
+        ? '1 页（A4）'
+        : `${totalTiles} 块（A4），相邻重叠 ${OVERLAP} 行 / ${OVERLAP} 列`,
     ],
-    ['Generated', formatUtc(req.generatedAt)],
+    ['生成日期', formatUtc(req.generatedAt)],
   ];
 
   // 只有"纸面已经缩到非 1:1"的大图才追加这两行 —— 50x50 / 100x100
   // 的封面必须和验收时逐字节一致，不能因为新需求多出一行而整体位移。
   if (scaledDown) {
     rowsData.splice(rowsData.length - 1, 0, [
-      'Pages at 100%',
-      `${trueScalePages} sheets at 5.00 mm/cell (true 1:1) - not used`,
+      '1:1 打印需',
+      `${trueScalePages} 页（单格 5.00mm 真实 1:1 尺寸）`,
     ]);
   }
 
@@ -1402,7 +1526,7 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
     doc.text(label.toUpperCase(), M + 3, y);
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
-    const text = toAscii(value);
+    const text = sanitizeText(value);
     let fs = 9.5;
     doc.setFontSize(fs);
     while (fs > 6.5 && doc.getTextWidth(text) > valueMaxW) {
@@ -1425,14 +1549,14 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
     setInk(doc, ACCENT);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(6.6);
-    doc.text('SCALE HINT', M + 4.4, bandTop + 4.6);
+    doc.text('比例提示', M + 4.4, bandTop + 4.6);
 
     setInk(doc, INK);
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.6);
-    const hint = toAscii(
-      `This pattern needs ${totalTiles} pages at ${plan.cell.toFixed(2)} mm/cell. ` +
-        `For a 1:1 build, print at 200% on 4 sheets or follow the digital view.`,
+    const hint = sanitizeText(
+      `这份图案在纸面上单格 ${plan.cell.toFixed(2)}mm，共 ${totalTiles} 块。` +
+        `如需 1:1 照着摆豆子，请按 200% 放大打印，或以屏幕上的图案为准。`,
     );
     const wrapped = doc.splitTextToSize(hint, PAGE_W - 2 * M - 9) as string[];
     let hy = bandTop + 8.4;
@@ -1454,7 +1578,7 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
   setInk(doc, INK_SOFT);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.5);
-  doc.text('PREVIEW', M, previewTop);
+  doc.text('预览', M, previewTop);
 
   const boxTop = previewTop + 3;
   setDraw(doc, RULE);
@@ -1519,11 +1643,11 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9.5);
-  doc.text('COLOR QUICK REFERENCE', M, quickTop);
+  doc.text('色号速查表', M, quickTop);
   setInk(doc, INK_FAINT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(6.6);
-  doc.text('Full quantities: Bill of Materials  |  Index numbers: Color Legend', M, quickTop + 4);
+  doc.text('各色用量见「用料清单」   |   图例序号对照见「色号图例」', M, quickTop + 4);
 
   const itemW = 29;
   const itemH = 5.0;
@@ -1550,7 +1674,7 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(7);
-    doc.text(toAscii(entry.code), cx + 9.4, cy + 3.3);
+    doc.text(sanitizeText(entry.code), cx + 9.4, cy + 3.3);
   });
 
   if (palette.length > shown.length) {
@@ -1558,7 +1682,7 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.5);
     doc.text(
-      `+${palette.length - shown.length} more colors - see Color Legend page`,
+      `还有 ${palette.length - shown.length} 个颜色未列出，见「色号图例」`,
       M,
       PAGE_H - BOTTOM_RESERVE - 2,
     );
@@ -1580,25 +1704,25 @@ function finishCoverWithHowTo(doc: Doc, top: number, tileTotal: number): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9.5);
-  doc.text('HOW TO USE THIS SHEET', M, top + 2);
+  doc.text('怎么用这份图纸', M, top + 2);
 
   // 先用 getTextWidth 实测完整版需要多高：放得下就走完整版（小/中图封面靠它填满），
   // 放不下才退化成"每页一行"的紧凑版。不能用固定阈值猜——100x100 和 320x270
   // 的可用高度只差几毫米，猜错一边就会留下大片空白。
   const fullItems: Array<[string, ...string[]]> = [
     [
-      '1. Print at 100% (no "fit to page") so 1 grid cell keeps the same size on paper.',
-      'Use A4 portrait, single-sided. Check the ruler on the next pages matches your print.',
+      '1. 打印时选「实际大小 / 100%」，不要勾「适应页面」，否则格子会被缩放。',
+      '用 A4 竖版、单面打印。印完先用尺量一下后面几页的标尺刻度对不对。',
     ],
     [
-      '2. Each pattern page covers one tile and prints its global Cols / Rows range.',
-      'Neighbouring tiles share a 2-cell strip so you can line them up; the dashed line',
-      'marks the overlap. Numbers on the rulers are global (1..N), never local to a page.',
+      '2. 每张图纸页只画一块区域，页眉写明它覆盖的全局列号 / 行号范围。',
+      '相邻两块之间重叠 2 行 2 列，方便对齐；品红虚线就是重叠带。',
+      '标尺上的数字是全局行列号（1..N），不是本页局部编号，跨页能直接对上。',
     ],
     [
-      '3. Cell text is the brand color code (e.g. A01). If a code does not fit, the cell',
-      'prints a legend index number instead - look that number up on the Color Legend page.',
-      'A small dot in a cell means "leave empty, no bead".',
+      '3. 格子里的字就是色号（例如 A01），照着买就是这个颜色。',
+      '色号太长放不下时，格子里改印图例序号 —— 拿这个数字去「色号图例」页对照。',
+      '格子中间只有一个小点，表示这一格不拼豆，留空。',
     ],
   ];
   const fullW = PAGE_W - 2 * M - 4;
@@ -1613,9 +1737,9 @@ function finishCoverWithHowTo(doc: Doc, top: number, tileTotal: number): void {
 
   if (top + fullNeed > limit) {
     const compact: string[] = [
-      `Print at 100% on A4 portrait. ${tileTotal} pattern pages follow, each with global Col / Row rulers.`,
-      'Codes or legend numbers are printed per color block on large patterns; dashed line = overlap strip.',
-      'A dot in a cell means no bead. Quantities and buy amounts are on the last pages.',
+      `A4 竖版按 100% 打印。后面是 ${tileTotal} 张分块图纸，每张都带全局列号 / 行号标尺。`,
+      '大图上色号按大色块标一次；品红虚线是相邻页的重叠带。格内小点表示不拼豆。',
+      '各色用量与建议购买量在最后几页。',
     ];
     let cy = top + 7.5;
     setInk(doc, INK_SOFT);
@@ -1695,7 +1819,7 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
 
     drawPageHeader(
       doc,
-      chunkIndex === 0 ? 'BILL OF MATERIALS' : 'BILL OF MATERIALS (CONT.)',
+      chunkIndex === 0 ? '用料清单' : '用料清单（续）',
       `Brand ${brandLabel}  |  Grid ${cols} x ${rows}  |  ${usedColors.length} colors  |  ${totalBeads} beads`,
     );
 
@@ -1703,13 +1827,13 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
     setInk(doc, INK);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(7.6);
-    doc.text('NO.', colNo, bodyTop - 4);
-    doc.text('COLOR', colSwatch, bodyTop - 4);
-    doc.text('CODE', colCode, bodyTop - 4);
+    doc.text('序号', colNo, bodyTop - 4);
+    doc.text('色块', colSwatch, bodyTop - 4);
+    doc.text('色号', colCode, bodyTop - 4);
     doc.text('HEX', colHex, bodyTop - 4);
-    doc.text('BEADS', colBeads, bodyTop - 4, { align: 'right' });
-    doc.text('SHARE', colShare, bodyTop - 4, { align: 'right' });
-    doc.text('BUY (pcs)', colBuy, bodyTop - 4, { align: 'right' });
+    doc.text('颗数', colBeads, bodyTop - 4, { align: 'right' });
+    doc.text('占比', colShare, bodyTop - 4, { align: 'right' });
+    doc.text('建议购买', colBuy, bodyTop - 4, { align: 'right' });
     rule(doc, tableLeft, bodyTop - 2, tableRight, RULE, 0.35);
 
     chunk.forEach((entry, i) => {
@@ -1733,7 +1857,7 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
       setInk(doc, INK);
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(8.2);
-      doc.text(toAscii(entry.code), colCode, y);
+      doc.text(sanitizeText(entry.code), colCode, y);
 
       setInk(doc, INK_SOFT);
       doc.setFont('helvetica', 'normal');
@@ -1757,7 +1881,7 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
       setInk(doc, INK);
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(9);
-      doc.text('TOTAL', colNo, yTotal);
+      doc.text('合计', colNo, yTotal);
       doc.text(String(usedColors.length), colCode, yTotal);
       doc.text(String(totalBeads), colBeads, yTotal, { align: 'right' });
       doc.text('100.0%', colShare, yTotal, { align: 'right' });
@@ -1767,12 +1891,12 @@ function drawMaterialsPages(doc: Doc, req: CleanRequest): void {
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(6.8);
       doc.text(
-        'BUY = beads + 10% buffer, rounded up to the next multiple of 10.',
+        '建议购买 = 实际颗数 + 10% 余量，向上取整到 10 的倍数。',
         tableLeft,
         yTotal + 6,
       );
       doc.text(
-        'BEADS = beads actually needed (no buffer). SHARE = portion of all beads.',
+        '颗数 = 实际需要的数量（不含余量）。占比 = 该色占总豆子数的比例。',
         tableLeft,
         yTotal + 10,
       );
@@ -1799,13 +1923,13 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9.5);
-  doc.text('SHOPPING SUMMARY', M, top);
+  doc.text('采购小结', M, top);
 
   const cards: Array<[string, string, string]> = [
-    ['TOTAL PACKS', `${used.length}`, 'distinct colors to buy'],
-    ['TOTAL PIECES', `${totalBuy}`, `covers ${totalBeads} beads + 10%`],
-    ['FINISHED SIZE', `${((cols * 5) / 10).toFixed(1)} x ${((rows * 5) / 10).toFixed(1)} cm`, '5 mm midi beads'],
-    ['PEGBOARDS', `${Math.ceil(cols / 29)} x ${Math.ceil(rows / 29)}`, '29 x 29 peg large boards'],
+    ['总包数', `${used.length}`, '需要购买的颜色种数'],
+    ['总颗数', `${totalBuy}`, `covers ${totalBeads} beads + 10%`],
+    ['成品尺寸', `${((cols * 5) / 10).toFixed(1)} x ${((rows * 5) / 10).toFixed(1)} cm`, '5mm 中豆'],
+    ['豆板数', `${Math.ceil(cols / 29)} x ${Math.ceil(rows / 29)}`, '按 29×29 大板计算'],
   ];
 
   const gap = 3;
@@ -1839,12 +1963,12 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(6.8);
   doc.text(
-    'Tip: bead bags are usually sold in 100 or 500 pcs. Round BUY up to the nearest bag size when ordering.',
+    '提示：豆子一般按 100 颗或 500 颗一包卖，下单时按整包向上取整即可。',
     M,
     top + 30,
   );
   doc.text(
-    'Quantities already include a 10% buffer for dropped or damaged beads during ironing.',
+    '以上数量已经包含 10% 余量，用于补熨烫过程中掉落或烫坏的豆子。',
     M,
     top + 34,
   );
@@ -1861,11 +1985,11 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(8.0);
-  doc.text('COLOR MIX', M, barY - 1.0);
+  doc.text('色彩构成', M, barY - 1.0);
   setInk(doc, INK_FAINT);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(6.2);
-  doc.text('share of all beads - widest bar = most used color', M + 22, barY - 1.0);
+  doc.text('条越长占比越高 —— 最宽的就是用得最多的颜色', M + 22, barY - 1.0);
 
   const barW = PAGE_W - 2 * M;
   const big = used.filter((entry) => entry.ratio >= 0.007);
@@ -1880,7 +2004,7 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
       setInk(doc, inkTuple(readableInkFor(entry.rgb)));
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(5.2);
-      doc.text(toAscii(entry.code), bx + w / 2, barY + barH / 2 + 0.6, { align: 'center' });
+      doc.text(sanitizeText(entry.code), bx + w / 2, barY + barH / 2 + 0.6, { align: 'center' });
     }
     bx += w;
   });
@@ -1901,7 +2025,7 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
     setInk(doc, INK_SOFT);
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(chipFs);
-    doc.text(toAscii(entry.code), cx + 3.2, chipsTop + 2.1);
+    doc.text(sanitizeText(entry.code), cx + 3.2, chipsTop + 2.1);
   });
 }
 
@@ -1960,7 +2084,7 @@ function drawLegendPages(doc: Doc, req: CleanRequest): void {
 
     drawPageHeader(
       doc,
-      chunkIndex === 0 ? 'COLOR LEGEND' : 'COLOR LEGEND (CONT.)',
+      chunkIndex === 0 ? '色号图例' : '色号图例（续）',
       `Brand ${brandLabel}  |  Grid ${cols} x ${rows}  |  ${usedColors.length} colors  |  ${totalBeads} beads`,
     );
 
@@ -1969,12 +2093,12 @@ function drawLegendPages(doc: Doc, req: CleanRequest): void {
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(7.6);
       doc.text(
-        'Grid cells show the brand color code (e.g. A01). When a code is too long for a cell,',
+        '格子里的字是这个品牌的色号（例如 A01）。当色号太长、格子里放不下时，',
         M,
         gridTop - 9,
       );
       doc.text(
-        'a legend index number (1, 2, 3 ...) is printed instead - match it to the NO. on this page.',
+        '会改印图例序号（1、2、3…）—— 把那个数字对照到本页的「序号」即可。',
         M,
         gridTop - 5,
       );
@@ -2015,7 +2139,7 @@ function drawLegendPages(doc: Doc, req: CleanRequest): void {
       setInk(doc, INK);
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(Math.max(7.4, 8.6 * sc));
-      doc.text(toAscii(entry.code), tx, cy + 1.6 + lineH);
+      doc.text(sanitizeText(entry.code), tx, cy + 1.6 + lineH);
 
       setInk(doc, INK_SOFT);
       doc.setFont('helvetica', 'normal');
@@ -2053,13 +2177,13 @@ function drawLegendNotes(doc: Doc, req: CleanRequest, top: number): void {
   setInk(doc, INK);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(8.5);
-  doc.text('READING THE PATTERN PAGES', M, top + 5.5);
+  doc.text('怎么看图纸页', M, top + 5.5);
 
   const notes: Array<[string, string]> = [
-    ['COLOR CODE', 'Cell text such as "A01" is the brand color code - buy exactly this code.'],
-    ['INDEX NUMBER', 'If the code does not fit, the cell shows this page NO. (1, 2, 3 ...) instead.'],
-    ['BLANK CELL', 'A small centre dot means no bead there - leave the peg empty.'],
-    ['POSITION', 'Ruler numbers are global: Cols 1..N, Rows 1..N. Bold lines every 10 cells.'],
+    ['色号', '格子里的「A01」这样的字就是品牌色号，买这个色号即可。'],
+    ['图例序号', '色号太长放不下时，格子里改印本页序号（1、2、3…），对照本页查色号。'],
+    ['空白格', '格子中间只有一个小点，表示这一格不拼豆，空着就行。'],
+    ['定位', '标尺数字是全局行列号：列 1..N，行 1..N。每 10 格有一条加粗主线。'],
   ];
 
   let y = top + 11;
@@ -2085,7 +2209,7 @@ function drawLegendNotes(doc: Doc, req: CleanRequest, top: number): void {
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.4);
     doc.text(
-      'On dark beads the label is printed in light ink, and on light beads in dark ink, so both stay readable.',
+      '深色豆子上用浅色字、浅色豆子上用深色字，两种底色都能看清。',
       M,
       y + 2,
     );
@@ -2124,7 +2248,7 @@ export async function POST(request: NextRequest) {
   try {
     raw = (await request.json()) as IncomingBody;
   } catch {
-    return badRequest('Request body must be valid JSON');
+    return badRequest('请求体不是合法 JSON');
   }
 
   const validated = validateBody(raw);
@@ -2142,16 +2266,11 @@ export async function POST(request: NextRequest) {
     }
     const forceIndexOnly = req.cols * req.rows > MAX_CELLS_WITH_CODES;
 
-    const doc = new jsPDF({
-      orientation: 'portrait',
-      unit: 'mm',
-      format: 'a4',
-      compress: true,
-    });
+    const doc = makeDoc();
     doc.setProperties({
-      title: toAscii(`Perler Bead Pattern ${req.cols}x${req.rows} - ${req.brandLabel}`),
-      subject: 'Tiled perler bead pattern sheet',
-      creator: 'Perler Bead Generator',
+      title: sanitizeText(`拼豆图纸 ${req.cols}x${req.rows} · ${req.brandLabel}`),
+      subject: '拼豆图纸（分页图纸 / 用料清单 / 色号图例）',
+      creator: '拼豆图案生成器',
     });
 
     // 封面
@@ -2194,22 +2313,22 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error('PDF generation error:', error);
-    return NextResponse.json({ error: 'Failed to generate PDF' }, { status: 500 });
+    return NextResponse.json({ error: 'PDF 生成失败' }, { status: 500 });
   }
 }
 
 export async function GET() {
   return NextResponse.json({
-    message: 'POST a pattern payload to generate the PDF sheet.',
+    message: 'POST 一份图案数据，生成可打印的图纸 PDF。',
     body: {
-      cols: `integer 1-${MAX_DIM}`,
-      rows: `integer 1-${MAX_DIM}`,
+      cols: `整数 1-${MAX_DIM}`,
+      rows: `整数 1-${MAX_DIM}`,
       brand: BRANDS,
-      cells: 'number[] length cols*rows, palette index or -1 for blank',
+      cells: 'number[]，长度 cols*rows，值是 palette 下标，-1 表示空白',
       palette: '[{ hex: "#RRGGBB", code: "A01", count: number, ratio: number }]',
-      totalBeads: 'number (informational; recomputed from cells)',
-      generatedAt: 'ISO date string',
+      totalBeads: '数字（仅作参考，服务端会按 cells 重算）',
+      generatedAt: 'ISO 日期字符串',
     },
-    output: 'Tiled A4 PDF: cover, pattern tiles, bill of materials, color legend',
+    output: 'A4 分页图纸 PDF：封面 / 图纸总览 / 分块图纸 / 用料清单 / 色号图例',
   });
 }
