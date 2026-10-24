@@ -330,14 +330,47 @@ export default function Home() {
   /* ---------------------------------------------------------------
    * 历史：只在"图案真的变了"之后记一条
    * --------------------------------------------------------------- */
+  /*
+   * 用户眼里的图纸 = 引擎结果 + 手工覆盖层。
+   *
+   * 单点真相：页面上**所有**展示与导出都读这个，绝不读裸 pattern。
+   * 手改的格子会连带影响颗数、色数、用料清单、PDF 图例 —— 那些数字
+   * 必须跟着变，否则"我明明加了两颗红"的账对不上。画布内部虽然也
+   * 自己算过一份叠加结果，但父层（图例/统计/导出/历史）读的是裸
+   * pattern，于是会出现"画得出来、清单不涨"的不一致。
+   *
+   * 没有手工改动时（最常见）直接返回原对象，不做无谓的克隆：
+   * applyEdits 会整份复制 cells，而 320 格图是 8.7 万个格，
+   * 每次渲染复制一遍纯属浪费。
+   *
+   * 位置说明：必须定义在历史记录的 effect **之前** —— 那个 effect 的
+   * deps 数组在渲染期就求值，若 displayPattern 还在这行之下，
+   * 访问到的是尚未初始化的 const（TDZ 直接抛 ReferenceError）。
+   */
+  const editedCount = useMemo(() => editCount(edits), [edits]);
+  const displayPattern = useMemo(() => {
+    if (!pattern) return null;
+    if (editedCount === 0) return pattern;
+    return applyEdits(pattern, edits, options.brand);
+  }, [pattern, edits, editedCount, options.brand]);
+
+  /*
+   * 历史签名 = 参数 + 网格 + 颗数 + **手改格数**。
+   *
+   * 加上手改格数是为了让"涂了几笔"也能落进历史：不加快照的话，
+   * 用户在图上涂了半天，历史里存的还是刚生成时的样子，恢复回来
+   * 一片空白 —— 而且列表上显示的颗数也还是改之前的。
+   * 用格数而不是完整 EditMap 做签名：涂一百格只是慢慢加数字，
+   * 不会因为"涂的位置变了"就误判成一次全新记录。
+   */
   const lastRecordedRef = useRef<string>('');
   useEffect(() => {
-    if (!pattern || !imageInfo || !sourceDataUrl) return;
-    const signature = `${optionsKey}|${pattern.cols}x${pattern.rows}|${pattern.totalBeads}`;
+    if (!displayPattern || !imageInfo || !sourceDataUrl) return;
+    const signature = `${optionsKey}|${displayPattern.cols}x${displayPattern.rows}|${displayPattern.totalBeads}|e${editedCount}`;
     if (lastRecordedRef.current === signature) return;
     lastRecordedRef.current = signature;
 
-    const preview = patternToThumbnail(pattern, 132);
+    const preview = patternToThumbnail(displayPattern, 132);
     if (!preview) return;
 
     /*
@@ -369,13 +402,15 @@ export default function Home() {
         previewUrl: preview,
         sourceDataUrl: compact,
         settings: options,
-        cols: pattern.cols,
-        rows: pattern.rows,
-        totalBeads: pattern.totalBeads,
-        colorCount: pattern.palette.length,
+        cols: displayPattern.cols,
+        rows: displayPattern.rows,
+        totalBeads: displayPattern.totalBeads,
+        colorCount: displayPattern.palette.length,
         sourceMeta: imageInfo
           ? { width: imageInfo.width, height: imageInfo.height, name: imageInfo.name }
           : undefined,
+        // 手改覆盖层跟着版本走，恢复历史时能一起恢复回来
+        ...(editedCount > 0 ? { edits } : {}),
       });
       if (result === 'trimmed') {
         toast.warning('历史已满，最旧的一条记录被挤掉了');
@@ -387,7 +422,16 @@ export default function Home() {
       cancelled = true;
     };
     // imageInfo 只用来保证"有图"，不参与签名
-  }, [pattern, options, optionsKey, sourceDataUrl, addToHistory, imageInfo]);
+  }, [
+    displayPattern,
+    editedCount,
+    edits,
+    options,
+    optionsKey,
+    sourceDataUrl,
+    addToHistory,
+    imageInfo,
+  ]);
 
   /*
    * 恢复历史：可带第二参数指定"恢复哪一版"。
@@ -415,9 +459,15 @@ export default function Home() {
             : { width: 0, height: 0, name: '历史图案' }),
       );
       setBrushes([]);
-      // 历史里不存手工覆盖层（它是按格子下标存的，跨图无意义），
-      // 恢复历史即恢复"引擎原始结果"，覆盖层必须清掉
-      setEdits(EMPTY_EDITS);
+      /*
+       * 恢复该版本上的手工编辑。
+       *
+       * 早先这里写死 `setEdits(EMPTY_EDITS)`，理由是"覆盖层按格子下标存，
+       * 跨图无意义" —— 但我们本来就不会跨图复用：edits 现在跟着
+       * version 一起存，同一个 version 的 cols/rows 与它自己的 edits
+       * 严格对应。清掉它等于让用户涂了一小时的图恢复回来是空白的。
+       */
+      setEdits(v.edits ?? EMPTY_EDITS);
       // 恢复时不要被"签名相同"挡住
       lastRecordedRef.current = '';
       toast.success(`已恢复 ${v.cols} × ${v.rows} 的图纸`);
@@ -435,26 +485,6 @@ export default function Home() {
   }, []);
 
   const hasImage = Boolean(sourceDataUrl);
-
-  /*
-   * 用户眼里的图纸 = 引擎结果 + 手工覆盖层。
-   *
-   * 单点真相：页面上**所有**展示与导出都读这个，绝不读裸 pattern。
-   * 手改的格子会连带影响颗数、色数、用料清单、PDF 图例 —— 那些数字
-   * 必须跟着变，否则"我明明加了两颗红"的账对不上。画布内部虽然也
-   * 自己算过一份叠加结果，但父层（图例/统计/导出/历史）读的是裸
-   * pattern，于是会出现"画得出来、清单不涨"的不一致。
-   *
-   * 没有手工改动时（最常见）直接返回原对象，不做无谓的克隆：
-   * applyEdits 会整份复制 cells，而 320 格图是 8.7 万个格，
-   * 每次渲染复制一遍纯属浪费。
-   */
-  const editedCount = useMemo(() => editCount(edits), [edits]);
-  const displayPattern = useMemo(() => {
-    if (!pattern) return null;
-    if (editedCount === 0) return pattern;
-    return applyEdits(pattern, edits, options.brand);
-  }, [pattern, edits, editedCount, options.brand]);
 
   const sizeCm = pattern?.meta.sizeCm ?? null;
 

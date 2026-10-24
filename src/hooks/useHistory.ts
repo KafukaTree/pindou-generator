@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useSyncExternalStore } from 'react';
 import type { GenerateOptions, PatternResult } from '@/lib/pattern/generate';
+import type { EditMap } from '@/lib/pattern/edits';
 import { readStorage, writeRawStorage } from './useLocalStorage';
 
 /**
@@ -76,6 +77,19 @@ export interface HistoryVersion {
   previewUrl: string;
 
   /**
+   * 该版本上的手工编辑覆盖层（稀疏，`格子下标 -> 色号`，空串=擦除）。
+   *
+   * 为什么必须存进来：手改会改变颗数、色数和用料清单，如果只存"引擎参数"，
+   * 恢复历史就等于把用户辛苦涂的一百笔全丢掉，而且列表上显示的颗数也是
+   * 改之前的 —— 用户会以为历史坏了。存在版本上（而不是主记录上）是因为
+   * 不同参数版本对应不同网格尺寸，格子下标不能跨版本复用。
+   *
+   * 体积可忽略：一条编辑的 JSON 约 13 字节（`"1234":"A01",`），
+   * 涂满 2000 格也才 26KB，相比主记录的 ~58KB 不是量级。
+   */
+  edits?: EditMap;
+
+  /**
    * 用户手动收藏（钉住），钉住的版本不参与版本裁剪。
    * 本轮只保留字段与裁剪保护，**UI 入口下一轮再做**（范围控制）。
    */
@@ -128,6 +142,8 @@ export interface HistoryInput {
   totalBeads: number;
   colorCount: number;
   sourceMeta?: { width: number; height: number; name: string };
+  /** 该版本上的手工编辑覆盖层（没有手改时省略，省字节） */
+  edits?: EditMap;
 }
 
 export interface UseHistoryResult {
@@ -167,10 +183,16 @@ export const MAX_VERSIONS_PER_ITEM = 6;
  * 必须存一份原图，否则"恢复历史"只能还原参数、还原不了图案。
  * 但不能存原样的大 PNG：一张 512×512 PNG 的 dataURL 有 185,670 字符，
  * 12 条就 2.2MB，逼近 5MB 配额。
- * 640 长边 + JPEG 0.75 后 21–58KB（实测），对 120 格图案仍有 5.3px/格。
+ *
+ * 折中：长边压到 640 后**先试 PNG**（512×512 走这条路直接原样返回），
+ * 超过 `SOURCE_PNG_BUDGET` 才退 JPEG 0.75（21–58KB）。缘由见
+ * `compressSourceDataUrl` 的注释：JPEG 的有损会在超采样里放大成
+ * 真实的色块差异，恢复出来的图纸和刚才不一样。
  */
 export const SOURCE_MAX_EDGE = 640;
 export const SOURCE_JPEG_QUALITY = 0.75;
+/** PNG 超过这个字符数就放弃无损、退 JPEG。单张 150KB ≈ 12 张 1.8MB */
+export const SOURCE_PNG_BUDGET = 200_000;
 const THUMB_SIZE = 120;
 
 /* -------------------------------------------------------------------------
@@ -295,6 +317,11 @@ function withProjection(
  * 往主记录里 upsert 一个版本（**换新引用，不 in-place mutate**）。
  * 内层去重用 `settingsSignature`：同一套参数重复生成只刷新时间/缩略图，
  * 不新增版本。裁剪后投影跟着最新版本走。
+ *
+ * 手工编辑**不进签名**：同一套参数下涂抹一百格不该多出一个版本（否则
+ * 调色板里每涂一笔就多一版，把 6 个版本槽瞬间占满）。画笔的落点变化
+ * 只覆盖当前版本里的 `edits`，颗粒数/色数随之更新 —— 这正是用户预期的
+ * "我在这张图上的成果"。
  */
 function upsertVersion(item: HistoryItem, ver: HistoryVersion): HistoryItem {
   const sig = settingsSignature(ver.settings);
@@ -328,20 +355,31 @@ function loadImage(src: string): Promise<HTMLImageElement> {
  * ---------------------------------------------------------------------- */
 
 /**
- * 把任意图片 dataURL 压成"可持久化"的版本：长边 ≤ maxEdge 的 JPEG。
+ * 把任意图片 dataURL 压成"可持久化"的版本：长边 ≤ maxEdge。
  * 必须在把图片塞进历史记录之前调用，否则 localStorage 会被原图撑爆。
  * 透明区域铺白底（拼豆图案本来就按白纸处理）。
+ *
+ * **优先无损**：先试 PNG，只有 PNG 太大（超过 budget 字符）才退到 JPEG。
+ *
+ * 为什么值得多花这点字节：历史记录存的是"重新生成图案所需的源图"，
+ * 用户点恢复会拿它再跑一遍引擎。JPEG 的块效应会在超采样时被放大成
+ * 真实的色块差异 —— 实测同一张鸭子图，源图用 512px JPEG(q0.75) 恢复
+ * 出来是 1565 颗 / 8 色，而原始 PNG 是 1552 颗 / 9 色。用户看到的是
+ * "我恢复出来的图和刚才不一样"，这比多占 100KB 难受得多。
+ * 预算也撑得住：一张图的 PNG base64 约 140KB，12 张 1.7MB，
+ * 上限是 4.2MB。
  */
 export async function compressSourceDataUrl(
   dataUrl: string,
   maxEdge = SOURCE_MAX_EDGE,
   quality = SOURCE_JPEG_QUALITY,
+  pngBudget = SOURCE_PNG_BUDGET,
 ): Promise<string> {
   // 已经是"小图"就不重复编码，避免二次损失
   try {
     const img = await loadImage(dataUrl);
     const long = Math.max(img.naturalWidth, img.naturalHeight);
-    if (long <= maxEdge && dataUrl.startsWith('data:image/jpeg')) {
+    if (long <= maxEdge && (dataUrl.startsWith('data:image/jpeg') || dataUrl.startsWith('data:image/png'))) {
       return dataUrl;
     }
     const scale = Math.min(1, maxEdge / long);
@@ -357,6 +395,9 @@ export async function compressSourceDataUrl(
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
+    // 无损优先：同一份像素先试 PNG，只在超预算时才接受 JPEG 的有损
+    const png = canvas.toDataURL('image/png');
+    if (png.length <= pngBudget) return png;
     return canvas.toDataURL('image/jpeg', quality);
   } catch {
     // 压缩失败就用原图（总比没有强，字节裁剪会兜住）
@@ -402,19 +443,61 @@ export function renderPatternThumbnail(
  * 数据校验 / 迁移
  * ---------------------------------------------------------------------- */
 
+/**
+ * 把磁盘上任意形状的 `edits` 洗成可用的 `EditMap`。
+ *
+ * 为什么要洗：这是会进 localStorage 的字段，可能被手工改过、被旧版本
+ * 写成别的形状、或者在配额压力下被截断成半截 JSON。直接信任它会让
+ * `applyEdits` 在渲染里抛异常（那是最难查的一类白屏）。
+ *
+ * 过滤规则与 `applyEdits` 保持一致：
+ *  - 键必须是**规范十进制下标**（`"007"` 这种和 `"7"` 不是同一个键，
+ *    放进去会变成两个互相覆盖的条目）
+ *  - 值必须是字符串色号（空串保留，那代表"擦除成透明格"）
+ *  - 同时丢掉越界下标（`>= cols*rows`），否则恢复旧图时会跳到别的格
+ */
+function sanitizeEdits(raw: unknown, cols: number, rows: number): EditMap | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const limit = cols > 0 && rows > 0 ? cols * rows : Infinity;
+  const out: EditMap = {};
+  let n = 0;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'string' || v.length > 16) continue;
+    if (!/^(0|[1-9]\d*)$/.test(k)) continue;
+    const idx = Number(k);
+    if (!Number.isSafeInteger(idx) || idx < 0 || idx >= limit) continue;
+    out[idx] = v;
+    if (++n >= 200_000) break; // 上限保护：正常图案最多几万格
+  }
+  return n > 0 ? out : undefined;
+}
+
 function normalizeVersion(raw: unknown): HistoryVersion | null {
   if (!raw || typeof raw !== 'object') return null;
   const v = raw as Record<string, unknown>;
   if (typeof v.timestamp !== 'number' || !v.settings) return null;
+  const cols = typeof v.cols === 'number' ? v.cols : 0;
+  const rows = typeof v.rows === 'number' ? v.rows : 0;
+  /*
+   * 注意这里**必须把 edits 带上**。
+   *
+   * 曾经的 bug：写入侧把 edits 存进了 localStorage，但读取侧
+   * （normalizeVersion）不认识这个字段，刷新一次就被丢掉。表现是
+   * "涂完立刻看历史有手改，刷新后恢复回来变空白" —— 而且不报错，
+   * 因为两个方向在类型上都合法（可选字段）。只加写入不加读取是最
+   * 典型的半截改动。
+   */
+  const edits = sanitizeEdits(v.edits, cols, rows);
   return {
     id: typeof v.id === 'string' && v.id ? v.id : makeId(),
     timestamp: v.timestamp,
     settings: v.settings as GenerateOptions,
-    cols: typeof v.cols === 'number' ? v.cols : 0,
-    rows: typeof v.rows === 'number' ? v.rows : 0,
+    cols,
+    rows,
     totalBeads: typeof v.totalBeads === 'number' ? v.totalBeads : 0,
     colorCount: typeof v.colorCount === 'number' ? v.colorCount : 0,
     previewUrl: typeof v.previewUrl === 'string' ? v.previewUrl : '',
+    ...(edits ? { edits } : {}),
     ...(v.pinned === true ? { pinned: true } : {}),
   };
 }
@@ -645,6 +728,11 @@ export function useHistory(): UseHistoryResult {
       totalBeads: item.totalBeads,
       colorCount: item.colorCount,
       previewUrl: item.previewUrl,
+      // 没有手改时**不写这个键**（而不是写 {}），一条记录能省 10 字节；
+      // 数量少但 12 条 × 6 版都带一个空对象也是白占预算
+      ...(item.edits && Object.keys(item.edits).length > 0
+        ? { edits: item.edits }
+        : {}),
     };
 
     return mutate((prev) => {
