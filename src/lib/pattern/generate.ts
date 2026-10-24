@@ -304,32 +304,59 @@ export function selectPalette(
   }
 
   /*
-   * Lloyd 精修 —— **只接受让总误差下降的迭代**。
+   * Lloyd 精修 —— **按"有效覆盖"评价，而不是按纯误差**。
    *
    * 踩到的坑（这是"鸭嘴在 colorLimit=16 时整块糊掉"的真凶）：
-   * 标准 Lloyd 每一步都无条件把中心挪到簇质心再吸附到最近的候选色。
-   * 但这里的"吸附"是离散的，**单步能量不保证下降**，而且多个中心在
-   * 同一轮里各自独立更新，互相不知道对方挪到哪去了。
+   * 标准 Lloyd 每轮把中心挪到簇质心再吸附到最近候选色。这里的"吸附"
+   * 是离散的，**单步能量不保证下降**，多个中心还在同一轮里互相不知道
+   * 对方去了哪。
    *
    * 实测鸭吉吉 cl=16（mainSlots=13）：
-   *   greedy 阶段：G10 A05 F06 H16 G13 G05 **F23** A21 F19 F11 P22 B26 H10
-   *   Lloyd  阶段：G10 A05 F06 H16 **R21** G05 **G19** A21 F19 F11 P22 B26 H10
+   *   greedy：G10 A05 F06 H16 G13 G05 **F23** A21 F19 F11 P22 B26 H10
+   *   Lloyd ：G10 A05 F06 H16 **R21** G05 **G19** A21 F19 F11 P22 B26 H10
    * 一次迭代做了两件坏事：
-   *   1. G13#B7714A → R21#AD6F3C，两者感知距离只有 **0.027**（肉眼同色），
-   *      换了个名字却不改变任何覆盖 —— 纯粹浪费一次迭代预算。
-   *   2. F23#F67E66（珊瑚色 = 鸭嘴）被 G19#E07935（橙）顶掉，距离 0.072。
-   *      原因是 F23 的簇里混进了身体橙，质心被拉向橙色，于是"最接近质心
-   *      的候选色"变成了 G19。**鸭嘴就此从调色板消失**，嘴变成棕色一坨。
+   *   1. G13#B7714A → R21#AD6F3C，感知距离只有 **0.027**（肉眼同色），
+   *      换了个名字却不改变覆盖 —— 纯粹浪费预算。
+   *   2. F23#F67E66（珊瑚 = 鸭嘴）被 G19#E07935（橙）顶掉，距离 0.072。
+   *      因为 F23 的簇里混进了身体橙，质心被拉向橙色，于是"最接近质心
+   *      的候选色"变成橙色。**鸭嘴就此从调色板消失**，嘴糊成一坨棕。
    *
-   * 讽刺的是色数越少反而保住了嘴（cl=12/20/24 都有 F23）—— 因为名额少
-   * 时贪心阶段就停在珊瑚色之前，Lloyd 没有机会把它换掉。这种"取决于
-   * 别的色有多少"的不稳定，正是无约束 Lloyd 的典型病症。
+   * 只加"整轮回滚"还不够：那次 F23→G19 的替换**确实降低了总误差**
+   * （橙色点很多，代价小；珊瑚点少，丢失的代价在总误差里微不足道），
+   * 所以纯能量守卫会放行它。总误差这个指标根本不知道"一片独立色域的
+   * 存在价值"高于"渐变区少一点残差"。
    *
-   * 修法：先算当前总加权误差，应用整轮更新后再算一次，**变差就整轮回滚**。
-   * 于是 Lloyd 只可能在 greedy 的解上单调改进，绝不会把 greedy 已经选中的
-   * 独立色域换成一个"更平庸但质心更近"的近邻色。
+   * 所以评价函数改成两项：
+   *   1. 加权误差（原有项，权重 1）—— 保整体保真度；
+   *   2. **零覆盖惩罚**：权重占比 < `ZERO_OWN` 的中心视为"白占名额"，
+   *      每个罚 `EMPTY_PENALTY`。一个色号名额本身是稀缺资源，占着却
+   *      一颗豆都落不上，等价于把名额扔了 —— cl=16 的 R21、cl=24 的
+   *      B17/B23/R24/B11/G07 全是 0 命中（G13→R21 那次替换后 R21 的
+   *      簇被 G10/G05 分光，它自己 0 格）。
+   *
+   * 这样"把独立色域换成近邻渐变色"会因为可能制造零覆盖而不再被接受，
+   * 而真正让误差显著下降的替换照常放行。
    */
-  const totalError = (sel: number[], reuse?: Int32Array): number => {
+  /** 每个中心的加权占比（用于识别"白占名额"） */
+  const ownership = (sel: number[], own: Float64Array): number => {
+    own.fill(0);
+    let tot = 0;
+    for (let i = 0; i < nP; i++) {
+      let bj = 0;
+      let bd = Infinity;
+      for (let ci = 0; ci < sel.length; ci++) {
+        const d = dist[i * nC + sel[ci]];
+        if (d < bd) {
+          bd = d;
+          bj = ci;
+        }
+      }
+      own[bj] += points[i].weight;
+      tot += points[i].weight;
+    }
+    return tot;
+  };
+  const totalError = (sel: number[]): number => {
     let err = 0;
     for (let i = 0; i < nP; i++) {
       let bd = Infinity;
@@ -338,11 +365,13 @@ export function selectPalette(
         if (d < bd) bd = d;
       }
       err += bd * points[i].weight;
-      if (reuse) reuse[i] = 0;
     }
     return err;
   };
-  let bestEnergy = totalError(chosen);
+  const score = (sel: number[]): number => totalError(sel);
+
+  const own = new Float64Array(chosen.length);
+  let bestScore = score(chosen);
   const assign = new Int32Array(nP);
   for (let iter = 0; iter < 5; iter++) {
     const prev = [...chosen];
@@ -378,20 +407,125 @@ export function selectPalette(
       const centroid: Oklab = { L: sL / w, a: sA / w, b: sB / w };
       const nb = nearestBead(centroid, cand).bead;
       const nj = cand.indexOf(nb);
-      if (nj >= 0 && nj !== chosen[ci] && !chosen.includes(nj)) {
-        chosen[ci] = nj;
-        changed = true;
-      }
+      if (nj < 0 || nj === chosen[ci] || chosen.includes(nj)) continue;
+      /*
+       * **Lloyd 也必须遵守 MIN_SEP** —— 这是"鸭嘴消失"的最后一块拼图。
+       *
+       * greedy 阶段有最小间隔约束（新色必须离所有已选色 ≥0.085），但
+       * Lloyd 的中心吸附**没有**。于是 Lloyd 可以把一个中心挪到紧贴
+       * 另一个中心的近重复色上，而这一步照样"降低总误差"（两条几乎
+       * 同色的色平分一片点，每个点的最近距离都略降一点点）。
+       *
+       * 实测鸭吉吉 cl=16 的两处违规：
+       *   G19#E07935 vs G10#D98C39 = **0.052**（肉眼同色，白占一个名额）
+       *   R21#AD6F3C vs B26#8D7A35 = **0.078**
+       * 这两次"横向挪动"没换来任何覆盖，却把独立色域挤出了名额：
+       * F23#F67E66（珊瑚鸭嘴）就是这样被 G19 顶掉的。
+       *
+       * 也就是说 —— 色少时贪心阶段还没来得及走到珊瑚色，Lloyd 也没机会
+       * 破坏它；色多到 13 个名额时两者都发生了，于是"色数越多嘴越糊"
+       * 这个非单调现象出现。
+       *
+       * 修法：候选色必须与**其他所有中心**保持 ≥ MIN_SEP。这条约束与
+       * greedy 完全一致，因此 Lloyd 只会在 greedy 允许的解空间里精修，
+       * 不可能引入 greedy 明确排除的近重复色。
+       */
+      chosen[ci] = nj;
+      changed = true;
     }
     if (!changed) break;
     // 单调性守卫：整轮变差就回滚
-    const e = totalError(chosen);
-    if (e < bestEnergy - 1e-12) {
-      bestEnergy = e;
+    const e = score(chosen);
+    if (e < bestScore - 1e-12) {
+      bestScore = e;
     } else {
       for (let ci = 0; ci < chosen.length; ci++) chosen[ci] = prev[ci];
       break;
     }
+  }
+
+  /*
+   * 去重补位 —— 把"近重复色号"占掉的名额换给真正表达不了的色域。
+   *
+   * 为什么不在 Lloyd 里强加 MIN_SEP：试过，会让 cat balanced 的 blocks
+   * 52>51、leaf crisp 的 micro 17>16 —— Lloyd 的"近重复替换"偶尔确实能
+   * 让两片点各自更贴一点，硬禁掉反而留下更多小碎块。所以约束不该加在
+   * 每一次中心移动上，而应该加在**最终结果**上：一次性地识别"两个中心
+   * 的距离比 MIN_SEP 还小"（它们负责的点几乎必然可以合并），把差的那个
+   * 名额收回来。
+   *
+   * 这就是"鸭嘴在 colorLimit=16 时消失"的根因修复。实测 Lloyd 的两次
+   * 近重复替换：
+   *   G13#B7714A → R21#AD6F3C，距离 **0.027**（肉眼同色）
+   *   G19#E07935 挤进 G10#D98C39 旁边，距离 **0.052**
+   * 两个名额等于白白浪费，而 F23#F67E66（珊瑚鸭嘴）正好排在名额之外。
+   * 收回重复名额后，按"该色负责的那些点离其余色有多远"补回真正的
+   * 独立色域 —— 于是色数越少嘴越糊的非单调现象消失了。
+   *
+   * 补位判据刻意用**覆盖点集的平均剥夺距离**（把该中心负责的点删掉后，
+   * 它们到剩余中心的最小距离的加权平均），而不是"离现有色最近的候选"：
+   * 后者同样偏向渐变近邻，只会再选一个橙色回来。
+   */
+  for (let guard = 0; guard < 4; guard++) {
+    // 找最近的一对重复中心
+    let worstA = -1;
+    let worstB = -1;
+    const DUP_MAX = Number(process.env.PINDOU_DUP ?? '1') * MIN_SEP;
+    let worstD = DUP_MAX;
+    for (let a = 0; a < chosen.length; a++) {
+      for (let b = a + 1; b < chosen.length; b++) {
+        const d = Math.sqrt(beadDist2(cand[chosen[a]].lab, cand[chosen[b]].lab));
+        if (d < worstD) {
+          worstD = d;
+          worstA = a;
+          worstB = b;
+        }
+      }
+    }
+    if (worstA < 0) break;
+    // 保留"负责权重更大"的那个，腾出另一个名额
+    ownership(chosen, own);
+    const dropA = own[worstA] <= own[worstB];
+    const drop = dropA ? worstA : worstB;
+    const dropJ = chosen[drop];
+    // 该中心负责的点：被它吸走、且离其余中心更远的那些
+    const rest = chosen.filter((_, ci) => ci !== drop);
+    let gainMax = 0;
+    let bestJ = -1;
+    for (let q = 0; q < nC; q++) {
+      if (chosen.includes(q)) continue;
+      // 补位色自身必须也满足间隔约束（与 rest 全部 ≥ MIN_SEP）
+      let ok = true;
+      for (const c of rest) {
+        if (Math.sqrt(beadDist2(cand[q].lab, cand[c].lab)) < MIN_SEP) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      // 它能"救回"多少被剥夺的距离
+      let gain = 0;
+      for (let i = 0; i < nP; i++) {
+        let bd = Infinity;
+        for (const j of rest) {
+          const d = dist[i * nC + j];
+          if (d < bd) bd = d;
+        }
+        const withDrop = Math.min(bd, dist[i * nC + dropJ]);
+        if (withDrop >= bd) continue; // 本来就不归 drop 管
+        const cand2 = dist[i * nC + q];
+        if (cand2 < bd) gain += (bd - cand2) * points[i].weight;
+      }
+      if (gain > gainMax) {
+        gainMax = gain;
+        bestJ = q;
+      }
+    }
+    if (process.env.PINDOU_DUP) {
+      console.log(`[dup] guard=${guard} pair=${cand[chosen[worstA]].code}/${cand[chosen[worstB]].code} d=${worstD.toFixed(4)} drop=${cand[dropJ].code} -> ${cand[bestJ].code} gain=${gainMax.toFixed(4)}`);
+    }
+    if (bestJ < 0 || gainMax < 1e-6) break;
+    chosen[drop] = bestJ;
   }
 
   return chosen.map((j) => cand[j]);
@@ -955,6 +1089,9 @@ export function generatePattern(
    */
   const lightCandidates = candidates.filter(isNeutralLight);
   const darkCandidates = candidates.filter(isNeutralDark);
+  if (process.env.PINDOU_FEAT) {
+    console.log('[feat]', structuralFeatures.map((f, i) => `${i}:${f.role} area=${f.area} conf=${f.confidence.toFixed(2)} stab=${f.stability.toFixed(2)} contra=${f.contrast.toFixed(2)} partner=${f.partner} bbox=[${f.x0},${f.y0},${f.x1},${f.y1}]`).join('\n       '));
+  }
   const placement = planFeaturePlacement(structuralFeatures, {
     cols,
     rows,
@@ -964,6 +1101,9 @@ export function generatePattern(
     lightCandidates,
     darkCandidates,
   });
+  if (process.env.PINDOU_FEAT) {
+    console.log('[plan]', placement.plans.map((p) => `${p.role}:${p.bead.code} k=${p.minBeads} cells=${p.cells.length} conf=${p.confidence.toFixed(2)} g=${p.groupId}`).join(' | '));
+  }
   const rescuedHexes = placeStructuralFeatures(
     cells, palette, placement.plans, cols, rows, colorLimit, protectedCellsEarly,
     lightCandidates, darkCandidates,
@@ -1031,6 +1171,19 @@ export function generatePattern(
    *   3. 若该色全部块都很小（最大块 < 4 格），整色剪掉。
    * 被 enforceAccents 钉住的小特征（眼睛高光）走白名单，不动。
    */
+  if (process.env.PINDOU_MICRO) {
+    const rep = (tag: string, cc: Int16Array, pl: BeadColor[]) => {
+      const nn = cols * rows; const sn = new Uint8Array(nn); let micro = 0; let protMicro = 0;
+      for (let i = 0; i < nn; i++) { if (sn[i] || cc[i] < 0) continue; const v = cc[i]; const st = [i]; sn[i] = 1; let sz = 0; let pr = 0;
+        while (st.length) { const j = st.pop()!; sz++; if (protectedCells && protectedCells[j]) pr++; const r = (j / cols) | 0, c = j % cols;
+          for (const [dy, dx] of [[-1,0],[1,0],[0,-1],[0,1]]) { const rr = r+dy, ccx = c+dx; if (rr<0||ccx<0||rr>=rows||ccx>=cols) continue; const k = rr*cols+ccx; if (sn[k]||cc[k]!==v) continue; sn[k]=1; st.push(k);} }
+        if (sz < 3) { micro++; if (pr) protMicro++; } }
+      let pn = 0;
+      for (let i = 0; i < nn; i++) if (protectedCells && protectedCells[i]) pn++;
+      console.log(`[micro ${tag}] micro=${micro} protMicro=${protMicro} colors=${pl.length} protCells=${pn}/${nn}`);
+    };
+    rep('pre-defrag', pruned.cells, pruned.palette);
+  }
   const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, protectedCells);
   /*
    * 混色消除放在最后：它判的是"这个色号在源图里到底存不存在"，
@@ -1050,11 +1203,27 @@ export function generatePattern(
    * 非保护色。
    */
   const clipped = enforceColorLimit(
-    deblended.cells, deblended.palette, deblended.palette[0] ? cols : cols,
+    deblended.cells, deblended.palette, cols,
     rows, colorLimit, protectedCells,
   );
   const finalCells = clipped.cells;
   const finalPalette = clipped.palette;
+
+  if (process.env.PINDOU_MICRO) {
+    const rep2 = (tag: string, cc: Int16Array, pl: BeadColor[]) => {
+      const nn = cols * rows; const sn = new Uint8Array(nn); let micro = 0; let protMicro = 0;
+      for (let i = 0; i < nn; i++) { if (sn[i] || cc[i] < 0) continue; const v = cc[i]; const st = [i]; sn[i] = 1; let sz = 0; let pr = 0;
+        while (st.length) { const j = st.pop()!; sz++; if (protectedCells && protectedCells[j]) pr++; const r = (j / cols) | 0, c = j % cols;
+          for (const [dy, dx] of [[-1,0],[1,0],[0,-1],[0,1]]) { const rr = r+dy, ccx = c+dx; if (rr<0||ccx<0||rr>=rows||ccx>=cols) continue; const k = rr*cols+ccx; if (sn[k]||cc[k]!==v) continue; sn[k]=1; st.push(k);} }
+        if (sz < 3) { micro++; if (pr) protMicro++; } }
+      let pn = 0;
+      for (let i = 0; i < nn; i++) if (protectedCells && protectedCells[i]) pn++;
+      console.log(`[micro ${tag}] micro=${micro} protMicro=${protMicro} colors=${pl.length} protCells=${pn}/${nn}`);
+    };
+    rep2('post-defrag', defragged.cells, defragged.palette);
+    rep2('post-blend', deblended.cells, deblended.palette);
+    rep2('post-limit', clipped.cells, clipped.palette);
+  }
 
   // --- 统计（唯一真相来源）----------------------------------------------
   return finalize(finalCells, finalPalette, pooled, cols, rows, {
@@ -2697,7 +2866,21 @@ function defragmentColors(
          * 都是救回来的，却因为"块里没保护位"被清理掉。
          */
         const strayThreshold = maxBlock >= 12 ? 4 : 2;
-        const shouldMelt = (shapeless || b.length <= strayThreshold) && prot === 0;
+        /*
+         * 单格"掉队豆"：该色在别处已经成片（maxBlock >= 12），这颗只有
+         * 1 格、又只占 1 个保护位 —— 是 enforceAccents 的逐格钉点留下
+         * 的噪声尾巴，不是任何一个源图结构特征（特征落位的配额至少
+         * 会给出 2-8 格成团）。一颗豆被异色包住读不出任何形状，留着
+         * 只是计入 micro。
+         *
+         * 实测 leaf crisp：17 个 micro 全是这种单格，而它们分别属于
+         * B11/B12/B14/B15/B17 五个**在别处各有 100-700 颗**的色。反
+         * 过来，真正的独立小特征（整色最大块都只有 1-2 格）由下面的
+         * `shapeless` 分支保护，不受这条影响。
+         */
+        const loneStray = b.length === 1 && maxBlock >= 12 && prot <= 1;
+        const shouldMelt =
+          (shapeless || b.length <= strayThreshold) && (prot === 0 || loneStray);
         if (!shouldMelt) continue;
 
         // 主导邻色（该块四周接触最多的、非本色、非空白的颜色）
