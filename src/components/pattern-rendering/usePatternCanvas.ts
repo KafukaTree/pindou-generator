@@ -2632,7 +2632,18 @@ export function usePatternCanvas(
   // ==========================================================================
 
   /** 正在拖的编辑笔（cellIndex 集合，抬手时一次性提交成一条 delta） */
-  const editStrokeRef = useRef<{ cells: number[]; after: string } | null>(null);
+  /*
+   * 一条笔。
+   *
+   * `anchor` 是**笔心**最后落到的格子下标，拖动插值拿它当起点 —— 不能用
+   * `cells[cells.length - 1]`：粗笔一次盖章会往 cells 里塞一整片格子，最后
+   * 那个必然是笔头右下角而不是光标所在格。拿它当起点，下一段 Bresenham 就
+   * 从一个偏移 (radius, radius) 的错误位置出发，笔画会越拖越歪、越拖越胖
+   * （实测 w=8 时纵向厚度从 8 格涨到 20 格）。
+   */
+  const editStrokeRef = useRef<{ cells: number[]; after: string; anchor: number } | null>(
+    null,
+  );
   const [editCursor, setEditCursor] = useState<{ col: number; row: number } | null>(null);
 
   /**
@@ -2737,6 +2748,42 @@ export function usePatternCanvas(
    * 取色器不写数据：读出该格当前色号、设为当前画笔色，然后**不产生 delta**。
    * 空白格用取色器时保持原色不变（不能把画笔设成"空"—— 那用户就没法画了）。
    */
+  /**
+   * 在一个格子上"盖章"：按当前笔宽把笔头形状盖上去。
+   *
+   * **落笔和拖动必须都走这里**。曾经拖动是直接 `paintCell(index)` 单格的，
+   * 于是画出来的笔迹是「点一下是粗圆点，一拖就变回 1 格细线」——
+   * 用户报的就是这个：「笔粗的时候，点击的一瞬间是粗的，但是拖动的时候
+   * 留下的痕迹还是细的」。
+   *
+   * 拖动的插值（Bresenham）会逐格调用本函数，所以快速拖动时相邻两格各自
+   * 盖一个圆盘、自然重叠，不会出现"珠子串"式的断续。
+   */
+  const stampBrush = useCallback(
+    (index: number, after: string) => {
+      if (!pattern) return;
+      const width = brushWidthRef.current;
+      if (width <= 1) {
+        paintCell(index, after);
+        return;
+      }
+      const cols = pattern.cols;
+      const c0 = index % cols;
+      const r0 = Math.floor(index / cols);
+      const { lo, hi } = brushSpan(width);
+      for (let dy = lo; dy <= hi; dy++) {
+        for (let dx = lo; dx <= hi; dx++) {
+          if (!brushContains(width, dx, dy)) continue;
+          const c = c0 + dx;
+          const r = r0 + dy;
+          if (c < 0 || r < 0 || c >= cols || r >= pattern.rows) continue;
+          paintCell(r * cols + c, after);
+        }
+      }
+    },
+    [pattern, paintCell],
+  );
+
   const applyToolAt = useCallback(
     (index: number) => {
       if (!pattern || !editEnabled) return;
@@ -2765,7 +2812,8 @@ export function usePatternCanvas(
       const after = tool === 'eraser' ? '' : code;
       const stroke = editStrokeRef.current;
       // 换工具时（比如擦到一半切回铅笔）不能混在一条笔里：after 不同就另起一条
-      if (!stroke || stroke.after !== after) editStrokeRef.current = { cells: [], after };
+      if (!stroke || stroke.after !== after) editStrokeRef.current = { cells: [], after, anchor: index };
+      else stroke.anchor = index;
       /*
        * 粗笔：一次落点盖住一个小圆盘，而不是一格。
        *
@@ -2779,37 +2827,9 @@ export function usePatternCanvas(
        *  - 一条笔内的格子去重、同色不算编辑、撤销栈粒度，全部自动一致
        *  - 拖动时 Bresenham 补间的每一格都会各自铺一次圆盘，接缝自然重叠
        */
-      /*
-       * 笔宽 > 1 时一次落点盖住一个小圆盘。
-       *
-       * 圆盘判据用 `hypot(dx, dy) <= radius + 0.35`：对半径 1 得到
-       * "3×3 去掉四个角"的十字块（5 格）—— 实心 3×3 画竖线会变成 3 格宽的
-       * 柱子，十字块画出来才像笔触。半径 2/3 时 +0.35 让圆盘边缘不那么毛糙。
-       *
-       * 走 paintCell 同一套流程，所以一条笔内去重、同色不算编辑、
-       * 撤销栈粒度全部自动一致；拖动时 Bresenham 补间的每一格都会各自铺
-       * 一次圆盘，接缝自然重叠。
-       */
-      const width = brushWidthRef.current;
-      if (width > 1) {
-        const cols = pattern.cols;
-        const c0 = index % cols;
-        const r0 = Math.floor(index / cols);
-        const { lo, hi } = brushSpan(width);
-        for (let dy = lo; dy <= hi; dy++) {
-          for (let dx = lo; dx <= hi; dx++) {
-            if (!brushContains(width, dx, dy)) continue;
-            const c = c0 + dx;
-            const r = r0 + dy;
-            if (c < 0 || r < 0 || c >= cols || r >= pattern.rows) continue;
-            paintCell(r * cols + c, after);
-          }
-        }
-        return;
-      }
-      paintCell(index, after);
+      stampBrush(index, after);
     },
-    [pattern, editEnabled, paintCell, commitDeltas, setCurrentCode],
+    [pattern, editEnabled, stampBrush, commitDeltas, setCurrentCode],
   );
 
   /** 抬手：把这一条笔提交成一条 delta */
@@ -3199,13 +3219,23 @@ export function usePatternCanvas(
       // 夹紧到边界太远会画成一条穿图的直线 —— 用上一个格子和当前格子
       // 做直线插值（Bresenham），这样快速拖动也不会漏格
       const stroke = editStrokeRef.current;
-      const last = stroke.cells[stroke.cells.length - 1];
-      if (last === undefined || !pattern) {
-        paintCell(index, stroke.after);
+      /*
+       * 起点用 anchor（上一笔的**笔心**），不是 cells 的末尾。
+       * 粗笔一次盖章写进 cells 的是一整片格子，末尾是笔头右下角；
+       * 拿它插值会让下一段从偏移 (radius, radius) 的位置开始。
+       */
+      const last = stroke.anchor;
+      if (!pattern) {
+        stampBrush(index, stroke.after);
         return;
       }
       if (last !== index) {
-        // 走一遍两点之间的格子，避免快速拖动跳过中间格（相邻时就是它自己）
+        /*
+         * 走一遍两点之间的格子，避免快速拖动跳过中间格（相邻时就是它自己）。
+         *
+         * 每个中间格都用 stampBrush 盖章（而不是 paintCell 单格）—— 否则
+         * 笔宽 > 1 时「按下是粗圆点、一拖就变细线」。
+         */
         let c0 = last % pattern.cols;
         let r0 = Math.floor(last / pattern.cols);
         const c1 = index % pattern.cols;
@@ -3216,7 +3246,7 @@ export function usePatternCanvas(
         const sr = r0 < r1 ? 1 : -1;
         let err = dc - dr;
         for (let guard = 0; guard < 4096; guard++) {
-          paintCell(r0 * pattern.cols + c0, stroke.after);
+          stampBrush(r0 * pattern.cols + c0, stroke.after);
           if (c0 === c1 && r0 === r1) break;
           const e2 = err * 2;
           if (e2 > -dr) {
@@ -3229,10 +3259,10 @@ export function usePatternCanvas(
           }
         }
       } else {
-        paintCell(index, stroke.after);
+        stampBrush(index, stroke.after);
       }
     },
-    [editEnabled, cellAt, pattern, paintCell],
+    [editEnabled, cellAt, pattern, stampBrush],
   );
 
   const onEditPointerUp = useCallback(
