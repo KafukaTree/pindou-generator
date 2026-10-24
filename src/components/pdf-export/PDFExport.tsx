@@ -1,22 +1,39 @@
 'use client';
 
 import { useCallback, useMemo, useState, type JSX } from 'react';
-import { Download, Loader2 } from 'lucide-react';
+import { Download, FileImage, FileType2, Loader2, ShieldCheck, X } from 'lucide-react';
 import { toast } from 'sonner';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { cn } from '@/lib/utils';
 import type { PatternResult } from '@/lib/pattern/generate';
 import type { Brand } from '@/lib/color/palette';
 
 /**
- * PDF 图纸导出按钮
+ * 图纸导出按钮 + 格式选择弹窗
  * ---------------------------------------------------------------------------
- * 组件只负责把 PatternResult 序列化成 API 契约并触发下载；
- * 所有排版（分页、标尺、色号、用料清单）都在 /api/pdf 里做。
+ * 组件只负责三件事：
+ *   1. 把 PatternResult 序列化成 API 契约；
+ *   2. 让用户选格式（PDF / PNG / SVG）；
+ *   3. 触发下载、给 loading 与错误反馈。
+ *
+ * 排版全在 /api/pdf 里做。三种格式的分工：
+ *   - **PDF**：分页图纸（每页一块 + 重叠行列 + 全局标尺），适合打印照着摆豆子。
+ *   - **PNG**：单张整图，格内印色号，适合发群/存手机。栅格化到 ~3400px 长边，
+ *     单格约 30px，色号依然清楚；超出这个尺寸的图会自动退到"大色块标一次"。
+ *   - **SVG**：单张矢量图，无论放大多少倍色号都锐利，适合再编辑或印大幅面。
  *
  * 关键点：
  * - cells 是 Int16Array，必须 Array.from 转普通数组，否则 JSON.stringify 成对象。
  * - palette 里的 index 是"图案调色板下标"，cells 存的是它；上传前压缩成
  *   连续数组并重映射，避免稀疏 palette 让 API 侧的 [-1, len-1] 校验失败。
- * - 失败走 sonner toast.error，并在按钮下方保留一行可读错误文本。
+ * - 失败走 sonner toast.error，并在弹窗里保留一行可读错误文本。
  */
 
 interface PDFExportProps {
@@ -31,12 +48,29 @@ interface PDFExportProps {
   className?: string;
 }
 
+type ExportFormat = 'pdf' | 'png' | 'svg';
+
 interface SerializedPattern {
   cols: number;
   rows: number;
   cells: number[];
   palette: Array<{ hex: string; code: string; count: number; ratio: number }>;
   totalBeads: number;
+}
+
+interface FormatOption {
+  format: ExportFormat;
+  label: string;
+  extension: string;
+  icon: typeof FileType2;
+  /** 弹窗里的一句话说明 */
+  blurb: string;
+  /** 单独一行的小字，讲"什么时候该选它" */
+  hint: string;
+  /** 估算出来的输出描述（尺寸 / 页数 / 体积级别） */
+  meta: (pattern: PatternResult | null) => string;
+  /** 主推格式：描边更重，放最前面 */
+  primary?: boolean;
 }
 
 function serialize(pattern: PatternResult): SerializedPattern {
@@ -75,147 +109,300 @@ function serialize(pattern: PatternResult): SerializedPattern {
   };
 }
 
+/** 粗略估算 PDF 页数：封面 +（大图有总览）+ 图纸块 + 用料清单 + 图例 */
+function estimatePdfPages(pattern: PatternResult | null): number {
+  if (!pattern) return 0;
+  const { cols, rows } = pattern;
+  // 和 route.ts 的 planPages 同量级：约每页放 26~30 格，重叠 2
+  const perPage = 28;
+  const tilesX = Math.max(1, Math.ceil((cols - 2) / (perPage - 2)));
+  const tilesY = Math.max(1, Math.ceil((rows - 2) / (perPage - 2)));
+  const tiles = cols * rows <= 1500 ? 1 : tilesX * tilesY;
+  const bom = 1 + Math.floor(pattern.palette.length / 26);
+  return 1 + (tiles > 1 ? 1 : 0) + tiles + bom + 1;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const FORMATS: FormatOption[] = [
+  {
+    format: 'pdf',
+    label: 'PDF 图纸',
+    extension: 'pdf',
+    icon: FileType2,
+    blurb: 'A4 分页图纸，打印照着摆豆子',
+    hint: '每页一块区域，带重叠行列和全局列号 / 行号标尺',
+    primary: true,
+    meta: (pattern) => (pattern ? `约 ${estimatePdfPages(pattern)} 页 A4` : ''),
+  },
+  {
+    format: 'png',
+    label: 'PNG 图片',
+    extension: 'png',
+    icon: FileImage,
+    blurb: '整张图，格子里印着色号',
+    hint: '适合发群、存手机，或贴进自己的笔记',
+    meta: (pattern) => (pattern ? '约 3000 px 长边' : ''),
+  },
+  {
+    format: 'svg',
+    label: 'SVG 矢量',
+    extension: 'svg',
+    icon: ShieldCheck,
+    blurb: '无损矢量，放大多少倍都不糊',
+    hint: '适合印大幅面，或用设计软件继续改',
+    meta: (pattern) => (pattern ? '矢量，可任意缩放' : ''),
+  },
+];
+
 export function PDFExport({
   pattern,
   brand,
   compact = false,
   className,
 }: PDFExportProps): JSX.Element {
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [busyFormat, setBusyFormat] = useState<ExportFormat | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
+
+  const isGenerating = busyFormat !== null;
 
   /*
    * 空调色板也是不可导出的状态。
    *
-   * 空白画布刚建出来时 palette 是空的，"一张什么都没画的板子"导成 PDF
-   * 是一叠没有色号的空白格 —— 用户拿到会以为是导出失败。更实际的是
+   * 空白画布刚建出来时 palette 是空的，"一张什么都没画的板子"导出成
+   * PDF 是一叠没有色号的空白格 —— 用户拿到会以为是导出失败。更实际的是
    * API 侧 `route.ts` 明确要求 palette 非空，会直接 400，用户看到的是
    * 一个错误弹窗而不是"你还没开始画"。
    *
    * 所以这里提前禁用，并把原因写进 title，比让他点一下撞墙好。
    */
   const emptyPalette = !pattern || pattern.palette.length === 0;
-  const disabled =
-    !pattern || pattern.cols < 1 || pattern.rows < 1 || emptyPalette || isGenerating;
+  const disabled = !pattern || pattern.cols < 1 || pattern.rows < 1 || emptyPalette;
 
   const sizeLabel = useMemo(() => {
     if (!pattern) return null;
-    return `${pattern.cols} x ${pattern.rows}`;
+    return `${pattern.cols} × ${pattern.rows}`;
   }, [pattern]);
 
-  const handleExport = useCallback(async () => {
-    if (!pattern) {
-      toast.error('还没有图纸可以导出，先放一张图。');
-      return;
-    }
-
-    setIsGenerating(true);
-    setErrorText(null);
-    const startedAt = Date.now();
-
-    try {
-      const payload = serialize(pattern);
-
-      const response = await fetch('/api/pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...payload,
-          brand,
-          generatedAt: new Date().toISOString(),
-        }),
-      });
-
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `PDF 生成失败（HTTP ${response.status}）`);
+  const handleExport = useCallback(
+    async (format: ExportFormat) => {
+      if (!pattern) {
+        toast.error('还没有图纸可以导出，先放一张图。');
+        return;
       }
 
-      const blob = await response.blob();
-      if (blob.size === 0) {
-        throw new Error('PDF 返回为空，请重试。');
+      setBusyFormat(format);
+      setErrorText(null);
+      const startedAt = Date.now();
+
+      try {
+        const payload = serialize(pattern);
+
+        const response = await fetch(`/api/pdf?format=${format}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...payload,
+            brand,
+            generatedAt: new Date().toISOString(),
+          }),
+        });
+
+        if (!response.ok) {
+          const body = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(body?.error ?? `导出失败（HTTP ${response.status}）`);
+        }
+
+        const blob = await response.blob();
+        if (blob.size === 0) {
+          throw new Error('返回内容为空，请重试。');
+        }
+
+        // 文件名优先用服务端 Content-Disposition（它带中文品牌名），
+        // 拿不到就本地拼一个兜底。
+        const disposition = response.headers.get('Content-Disposition') ?? '';
+        const utf8Match = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+        const fallbackName = `perler-pattern-${brand}-${pattern.cols}x${pattern.rows}.${format}`;
+        const filename = utf8Match ? decodeURIComponent(utf8Match[1]) : fallbackName;
+
+        const url = window.URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        // 立刻 revoke 在部分浏览器会取消下载，延迟释放
+        window.setTimeout(() => window.URL.revokeObjectURL(url), 4000);
+
+        const label = FORMATS.find((entry) => entry.format === format)?.label ?? format;
+        toast.success(`${label} 已导出：${sizeLabel}，${payload.palette.length} 个色号`, {
+          description: `${formatBytes(blob.size)} · 用时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+        });
+        setOpen(false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '导出失败，请重试。';
+        setErrorText(message);
+        toast.error(message);
+      } finally {
+        setBusyFormat(null);
       }
+    },
+    [brand, pattern, sizeLabel],
+  );
 
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `perler-pattern-${brand}-${pattern.cols}x${pattern.rows}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      // 立刻 revoke 在部分浏览器会取消下载，延迟释放
-      window.setTimeout(() => window.URL.revokeObjectURL(url), 4000);
-
-      toast.success(`图纸已导出：${sizeLabel}，${payload.palette.length} 个色号`);
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : 'PDF 生成失败，请重试。';
-      setErrorText(message);
-      toast.error(message);
-    } finally {
-      const elapsed = Date.now() - startedAt;
-      if (elapsed < 250) {
-        await new Promise((resolve) => setTimeout(resolve, 250 - elapsed));
-      }
-      setIsGenerating(false);
-    }
-  }, [brand, pattern, sizeLabel]);
-
-  const title = !pattern
+  const triggerTitle = !pattern
     ? '先放一张图'
     : emptyPalette
       ? '还没上色 —— 先画几格再导出'
-      : `导出可打印 PDF（${pattern.cols} × ${pattern.rows}，${pattern.palette.length} 个色号）`;
+      : `导出图纸（${pattern.cols} × ${pattern.rows}，${pattern.palette.length} 个色号）`;
 
-  if (compact) {
-    return (
-      <button
-        type="button"
-        onClick={handleExport}
-        disabled={disabled}
-        className={className ? `px-btn px-btn-primary px-btn-sm ${className}` : 'px-btn px-btn-primary px-btn-sm'}
-        aria-busy={isGenerating}
-        aria-label={isGenerating ? '正在生成 PDF' : '导出图纸 PDF'}
-        title={title}
-      >
-        {isGenerating ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-        ) : (
-          <Download className="h-3.5 w-3.5" aria-hidden="true" />
-        )}
-        <span className="hidden sm:inline">{isGenerating ? '生成中…' : 'PDF'}</span>
-      </button>
-    );
-  }
+  const trigger = compact ? (
+    <button
+      type="button"
+      onClick={() => setOpen(true)}
+      disabled={disabled}
+      className={cn('px-btn px-btn-primary px-btn-sm', className)}
+      aria-label="导出图纸"
+      title={triggerTitle}
+    >
+      <Download className="h-3.5 w-3.5" aria-hidden="true" />
+      <span className="hidden sm:inline">导出</span>
+    </button>
+  ) : (
+    <button
+      type="button"
+      onClick={() => setOpen(true)}
+      disabled={disabled}
+      className={cn('px-btn px-btn-primary', className)}
+      title={triggerTitle}
+    >
+      <Download className="h-4 w-4" aria-hidden="true" />
+      导出图纸
+    </button>
+  );
 
   return (
-    <div className={className ? `flex flex-col gap-1.5 ${className}` : 'flex flex-col gap-1.5'}>
-      <button
-        type="button"
-        onClick={handleExport}
-        disabled={disabled}
-        className="px-btn px-btn-primary"
-        aria-busy={isGenerating}
-        title={title}
-      >
-        {isGenerating ? (
-          <>
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            正在生成…
-          </>
-        ) : (
-          <>
-            <Download className="h-4 w-4" aria-hidden="true" />
-            导出图纸 PDF
-          </>
-        )}
-      </button>
+    <Dialog open={open} onOpenChange={(next) => (isGenerating ? undefined : setOpen(next))}>
+      <DialogTrigger asChild>{trigger}</DialogTrigger>
 
-      {errorText && (
-        <p role="alert" className="text-xs text-[var(--berry)] leading-snug">
-          {errorText}
-        </p>
-      )}
-    </div>
+      <DialogContent
+        showCloseButton={false}
+        className={cn(
+          // 覆盖 shadcn 默认：方角、硬投影、纸面板底、2px 边框 —— 与历史记录弹窗一致
+          'max-h-[86vh] w-[min(520px,calc(100vw-2rem))] max-w-none gap-0 rounded-none border-2 border-[var(--line-strong)] bg-[var(--paper-raised)] p-0 shadow-[var(--shadow-px-lg)]',
+        )}
+      >
+        <DialogHeader className="space-y-0 border-b-2 border-[var(--line)] px-3.5 py-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <DialogTitle className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
+              <span className="px-section-no" aria-hidden>
+                05
+              </span>
+              导出图纸
+              {sizeLabel && (
+                <span className="text-[11.5px] font-normal tabular-nums text-[var(--ink-2)]">
+                  {sizeLabel}
+                  {pattern ? ` · ${pattern.palette.length} 色` : ''}
+                </span>
+              )}
+            </DialogTitle>
+
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              disabled={isGenerating}
+              className="px-btn px-btn-sm px-btn-ghost"
+              aria-label="关闭"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+          <DialogDescription className="text-[11.5px] leading-snug text-[var(--ink-2)]">
+            选择一种格式下载。需要打印照着摆豆子就选 PDF；只是发出去看或存手机选 PNG。
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-1.5 p-2.5">
+          {FORMATS.map((option) => {
+            const Icon = option.icon;
+            const busy = busyFormat === option.format;
+            const meta = option.meta(pattern);
+            return (
+              <button
+                key={option.format}
+                type="button"
+                onClick={() => void handleExport(option.format)}
+                disabled={isGenerating || disabled}
+                aria-busy={busy}
+                className={cn(
+                  'group flex w-full items-start gap-2.5 border-2 px-2.5 py-2 text-left transition-colors',
+                  'disabled:cursor-not-allowed disabled:opacity-55',
+                  option.primary
+                    ? 'border-[var(--line-strong)] bg-[var(--clay-soft)]/45 hover:bg-[var(--clay-soft)]'
+                    : 'border-[var(--line)] bg-[var(--paper-hi)] hover:border-[var(--line-strong)]',
+                )}
+              >
+                <span
+                  className={cn(
+                    'mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center border-2',
+                    option.primary
+                      ? 'border-[var(--clay)] bg-[var(--clay)] text-[var(--paper-hi)]'
+                      : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink-2)]',
+                  )}
+                  aria-hidden
+                >
+                  {busy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Icon className="h-3.5 w-3.5" />
+                  )}
+                </span>
+
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-baseline justify-between gap-2">
+                    <span className="text-[13px] font-semibold text-[var(--ink)]">
+                      {option.label}
+                      {option.primary && (
+                        <span className="ml-1.5 border border-[var(--clay)] px-1 py-px text-[9.5px] font-bold uppercase tracking-wide text-[var(--clay)]">
+                          推荐
+                        </span>
+                      )}
+                    </span>
+                    <span className="shrink-0 text-[10.5px] tabular-nums text-[var(--ink-3)]">
+                      {busy ? '生成中…' : meta}
+                    </span>
+                  </span>
+                  <span className="mt-0.5 block text-[12px] leading-snug text-[var(--ink)]">
+                    {option.blurb}
+                  </span>
+                  <span className="mt-0.5 block text-[11px] leading-snug text-[var(--ink-2)]">
+                    {option.hint}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+
+          {errorText && (
+            <p
+              role="alert"
+              className="mt-0.5 border-l-2 border-[var(--berry)] pl-2 text-[11.5px] leading-snug text-[var(--berry)]"
+            >
+              {errorText}
+            </p>
+          )}
+
+          <p className="mt-0.5 px-0.5 text-[10.5px] leading-snug text-[var(--ink-3)]">
+            导出的图纸不包含画布背景；空白格在图纸上是留白，不拼豆。
+          </p>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

@@ -206,7 +206,7 @@ function badRequest(error: string): NextResponse {
  */
 function sanitizeText(value: string): string {
   /*
-   * 用 code point 过滤而不是正则字符类：`\`[ -]\`` 这种写法
+   * 用 code point 过滤而不是正则字符类：`[\\x00-\\x1f]` 这种写法
    * 每次都要挂一条 `no-control-regex` 的 eslint-disable，而"控制字符"这条
    * 规则本意是防不可见字符，不是防所有转义 —— 逐字符判断更直白，也不用
    * 关规则。顺便把孤立代理项（0xD800–0xDFFF）一起清掉：它们进 PDF 的
@@ -2253,8 +2253,545 @@ function stampFooters(doc: Doc, req: CleanRequest): void {
 }
 
 // ---------------------------------------------------------------------------
+// 图像导出（SVG / PNG）
+// ---------------------------------------------------------------------------
+/*
+ * 一个图案可以导成三种文件：
+ *   - PDF   → 打印用，分块图纸（本文件上半部分那一大套排版）
+ *   - SVG   → 矢量无损，可无限放大、可拿去 AI/Figma 里改，色号一定能看清
+ *   - PNG   → 位图，发给别人 / 贴到群里最方便
+ *
+ * SVG 和 PNG 共用同一份排版：SVG 是"源"，PNG 由它栅格化（sharp）。
+ * 只维护一套绘制代码，两种格式的视觉才不会漂。
+ *
+ * 关于"位图里色号看不看得清"这件事：
+ * 位图有分辨率上限，格子小到一定程度 4 个字符的色号必然糊成灰。所以这里
+ * **先按可读性反推画布尺寸**（PNG_TARGET_EDGE / PNG_MIN_CELL），再在格子真的
+ * 放不下时降级成"大色块一个标记"，跟 PDF 的分级策略一致。SVG 不受此限
+ * （矢量缩放），但为了两种格式看起来一致，阈值放得更宽 —— 它至少能放大看。
+ */
+
+/** SVG 里统一用系统 CJK 字体栈：不内嵌字体，文件才小，且任何装了中文字体的
+ *  浏览器 / Inkscape / Illustrator 都能正常显示。色号本身是 ASCII，永远没问题。 */
+const SVG_FONT_STACK =
+  "'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC','Source Han Sans SC',sans-serif";
+
+/*
+ * 画布尺寸策略：**先定成品最长边，再反推单格**。
+ *
+ * 反过来的写法（定单格、看画布多大）会让小图案输出一张 5000px 的巨图、
+ * 大图案反而格子细到看不清。这里固定"最长边 ≈ 目标值"，多退少补由单格吸收。
+ *
+ * - SVG：~2400px。矢量文件再大也没意义（放大不糊），2000 出头够贴网页。
+ * - PNG：~3400px。这是"能看清 4 字符色号" 与 "文件别超过 3MB" 的折中；
+ *   50 格图落在单格 ~60px（字高 37px），缩略看也很清楚。
+ * - 单格下限保证小图案（10x10）不会因为反推变成 300px 的巨格；
+ *   上限保证大图案（320）不会细到一根线。
+ */
+const SVG_TARGET_EDGE = 2400;
+const SVG_MIN_CELL = 4;
+const SVG_MAX_CELL = 64;
+
+const PNG_TARGET_EDGE = 3400;
+const PNG_MIN_CELL = 12;
+const PNG_MAX_CELL = 64;
+
+/** 版面里除网格之外的固定开销（px），用于把"总尺寸上限"换算成"单格上限"。 */
+const VECTOR_PAD = 40;
+const VECTOR_RULER_LEFT = 42;
+const VECTOR_RULER_TOP = 30;
+const VECTOR_TITLE_H = 104;
+const VECTOR_GAP_BELOW_GRID = 40;
+/** 图例区高度（px）：每行 34，4 列。估算即可，只用于反推单格。 */
+function estimateLegendH(colorCount: number): number {
+  const rows = Math.max(1, Math.ceil(Math.max(1, colorCount) / 4));
+  return rows * 34 + 14;
+}
+
+/**
+ * 按"成品最长边 <= targetEdge"反推单格边长（px）。
+ * 宽度和高度各给一个上限，取小的那个，保证两个方向都不超。
+ */
+function chooseCell(
+  cols: number,
+  rows: number,
+  colorCount: number,
+  targetEdge: number,
+  minCell: number,
+  maxCell: number,
+): number {
+  const fixedW = VECTOR_PAD * 2 + VECTOR_RULER_LEFT;
+  const fixedH =
+    VECTOR_PAD * 2 +
+    VECTOR_TITLE_H +
+    VECTOR_RULER_TOP +
+    VECTOR_GAP_BELOW_GRID +
+    estimateLegendH(colorCount);
+  const byW = (targetEdge - fixedW) / cols;
+  const byH = (targetEdge - fixedH) / rows;
+  return Math.max(minCell, Math.min(maxCell, byW, byH));
+}
+
+/**
+ * 估算一段文本在无衬线字体下的宽度（单位：em）。
+ *
+ * SVG 里没有 text-measure API —— 我们是"直接拼字符串"，没法像 jsPDF 那样
+ * 调 getTextWidth 量。之前用 `字符数 * 0.58em` 一刀切，对 "A01" 还行，对
+ * "M13"/"W05" 就低估了 30%，结果 100x100 图上色号直接溢出格子、
+ * 相邻两格的字压在一起（实测 cell=29px 时 "M13" 排出来 31px 宽）。
+ *
+ * 这里按字形实际 advance 分档：
+ *   - M/W/m/w/@ 这类宽字 0.86em
+ *   - 其他大写 0.68em，数字 0.56em，小写 0.55em
+ *   - I/i/l/./,/: 这类窄字 0.30em
+ * 宁可略微高估（字略小）也不要低估 —— 溢出的代价是图纸不可读，
+ * 字小一点至少还能看清。
+ */
+function estimateTextEm(text: string): number {
+  let em = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c > 0xff) {
+      em += 1.0; // 中文/全角一律按 1em
+    } else if ('MWmw@'.includes(ch)) {
+      em += 0.86;
+    } else if ('Iijl'.includes(ch) || '.,:;!|`\'\"'.includes(ch)) {
+      em += 0.3;
+    } else if (ch >= '0' && ch <= '9') {
+      em += 0.56;
+    } else if (ch >= 'A' && ch <= 'Z') {
+      em += 0.68;
+    } else if (ch >= 'a' && ch <= 'z') {
+      em += 0.55;
+    } else {
+      em += 0.5;
+    }
+  }
+  return em;
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&apos;';
+    }
+  });
+}
+
+interface VectorSheetOptions {
+  /** 单格边长（px） */
+  cell: number;
+}
+
+/**
+ * 生成整份图案的 SVG（单张图：标题 + 标尺 + 网格 + 色号图例）。
+ * 不做分页 —— 图像就是一张图，分页交给 PDF。
+ */
+function buildVectorSheet(req: CleanRequest, options: VectorSheetOptions): string {
+  const { cols, rows, cells, palette, totalBeads } = req;
+  const cell = options.cell;
+  const usedColors = palette.filter((entry) => entry.count > 0);
+
+  const pad = 40;
+  const rulerTop = 30;
+  const rulerLeft = 42;
+  const titleH = 104;
+
+  const gridW = cols * cell;
+  const gridH = rows * cell;
+
+  const contentW = rulerLeft + gridW;
+  const width = Math.max(pad * 2 + contentW, 900);
+
+  /*
+   * 图例**随画布等比放大**。
+   *
+   * 之前图例尺寸是写死的（4 列、行高 34、字号 14/11、色块 20×20），画布却随网格
+   * 线性长大：50×50 在 cell≈30 时整图 1600px 宽，图例还是 900px 基准时代的尺寸，
+   * 在手机/聊天窗里看就是一条读不出来的小字带（用户标注原话：
+   * 「有点太小了，字和块都太小」）。
+   *
+   * 这里取画布宽度相对 900px 基准的倍数，整套图例尺寸（色块、行高、两档字号、
+   * 间距）乘同一个系数，图例与网格的视觉比例才稳定。上限 2.8：再宽就是 320 格
+   * 的超大图，图例被撑成一屏两列反而更难扫。
+   */
+  const legendScale = Math.min(2.8, Math.max(1, width / 900));
+  const legendSwatch = 20 * legendScale;
+  const legendGap = 7 * legendScale;
+  const legendCodeFont = 14 * legendScale;
+  const legendMetaFont = 11 * legendScale;
+
+  /** 估一段文字宽度：CJK 记 1em、ASCII 记 0.56em。只用来决定图例分几列。 */
+  const measureText = (text: string, size: number): number => {
+    let total = 0;
+    for (const ch of text) {
+      total += /[\u2e80-\u9fff\uff00-\uffef]/.test(ch) ? size : size * 0.56;
+    }
+    return total;
+  };
+
+  const legendTexts = usedColors.map((entry) => {
+    const buy = Math.ceil((entry.count * 1.1) / 10) * 10;
+    return {
+      code: sanitizeText(entry.code),
+      meta: `${entry.count} 颗 · 占 ${(entry.ratio * 100).toFixed(1)}% · 建议买 ${buy}`,
+    };
+  });
+
+  // 单条图例的最小宽度：色块 + 间距 + 两行文字里较长的那行 + 右侧呼吸位
+  const legendNeededW =
+    legendSwatch +
+    legendGap +
+    legendTexts.reduce(
+      (widest, item) =>
+        Math.max(
+          widest,
+          measureText(item.code, legendCodeFont),
+          measureText(item.meta, legendMetaFont),
+        ),
+      0,
+    ) +
+    16 * legendScale;
+
+  // 列数由"能放下几条"决定，上限 6；每个色号永远有自己的一格，不会挤爆
+  const legendCols = Math.max(1, Math.min(6, Math.floor(contentW / legendNeededW) || 1));
+  const legendItemH = 34 * legendScale;
+  const legendRows = Math.max(1, Math.ceil(usedColors.length / legendCols));
+  const legendH = legendRows * legendItemH;
+
+  // 网格与图例之间的留白也跟着放大，否则大图上图例会像贴着网格
+  const legendTop = pad + titleH + rulerTop + gridH + 40 * Math.min(legendScale, 2);
+  const height = legendTop + legendH + pad;
+
+  const x0 = pad + rulerLeft;
+  const y0 = pad + titleH + rulerTop;
+  const legendItemW = contentW / legendCols;
+
+  // 标尺步长：格子太小时 5 格一标会叠字，退到 10 格
+  const rulerStep = cell * 5 >= 46 ? 5 : 10;
+  const boldStep = 10;
+
+  const thin = Math.max(0.4, cell * 0.035);
+  const mid = Math.max(0.8, cell * 0.07);
+  const bold = Math.max(1.4, cell * 0.13);
+
+  const parts: string[] = [];
+  const push = (s: string) => parts.push(s);
+
+  push(`<svg xmlns="http://www.w3.org/2000/svg" width="${width.toFixed(0)}" height="${height.toFixed(0)}" viewBox="0 0 ${width.toFixed(0)} ${height.toFixed(0)}">`);
+  push(`<title>${escapeXml(`拼豆图纸 ${cols}×${rows} · ${req.brandLabel}`)}</title>`);
+  push(`<rect width="100%" height="100%" fill="#FFFDF9"/>`);
+
+  // ---- 标题区 ----
+  push(`<g font-family="${SVG_FONT_STACK}">`);
+  push(`<text x="${pad}" y="${pad + 30}" font-size="30" font-weight="700" fill="#3A2A30">拼豆图纸</text>`);
+  push(`<text x="${pad}" y="${pad + 55}" font-size="15" fill="#6B565C">网格 ${cols} × ${rows} · ${cols * rows} 格 · ${usedColors.length} 色 · ${totalBeads} 颗豆子</text>`);
+  push(`<text x="${pad}" y="${pad + 76}" font-size="15" fill="#6B565C">品牌 ${escapeXml(req.brandLabel)} · 5mm 豆，成品约 ${((cols * 5) / 10).toFixed(1)} × ${((rows * 5) / 10).toFixed(1)} cm</text>`);
+  push(`<text x="${pad}" y="${pad + 95}" font-size="12" fill="#9C868C">生成于 ${escapeXml(formatUtc(req.generatedAt))} · 标尺数字为全局行列号，每 10 格一条主线</text>`);
+  push(`</g>`);
+
+  // ---- 网格底 ----
+  push(`<rect x="${x0}" y="${y0}" width="${gridW}" height="${gridH}" fill="#FFFFFF"/>`);
+
+  // ---- 色块：横向同色 run 合并 ----
+  const runsByColor = new Map<number, string[]>();
+  for (let r = 0; r < rows; r++) {
+    const rowBase = r * cols;
+    let runStart = 0;
+    let runIdx = cells[rowBase];
+    for (let c = 1; c <= cols; c++) {
+      const nextIdx = c < cols ? cells[rowBase + c] : -2;
+      if (nextIdx !== runIdx) {
+        if (runIdx >= 0) {
+          const entry = palette[runIdx];
+          if (entry) {
+            const rect = `<rect x="${(x0 + runStart * cell).toFixed(2)}" y="${(y0 + r * cell).toFixed(2)}" width="${((c - runStart) * cell).toFixed(2)}" height="${cell.toFixed(2)}"/>`;
+            const list = runsByColor.get(runIdx);
+            if (list) list.push(rect);
+            else runsByColor.set(runIdx, [rect]);
+          }
+        }
+        runStart = c;
+        runIdx = nextIdx;
+      }
+    }
+  }
+  push(`<g shape-rendering="crispEdges">`);
+  for (const entry of palette) {
+    const list = runsByColor.get(entry.index);
+    if (!list || list.length === 0) continue;
+    push(`<g fill="${entry.hex}">${list.join('')}</g>`);
+  }
+  push(`</g>`);
+
+  // ---- 网格线：1 格细 / 5 格中 / 10 格粗 ----
+  const lineEls: string[] = [];
+  for (let c = 0; c <= cols; c++) {
+    const x = x0 + c * cell;
+    const w = c % boldStep === 0 ? bold : c % 5 === 0 ? mid : thin;
+    const color = c % boldStep === 0 ? 'rgb(58,42,48)' : c % 5 === 0 ? 'rgb(107,86,92)' : 'rgb(176,160,164)';
+    lineEls.push(
+      `<line x1="${x.toFixed(2)}" y1="${y0.toFixed(2)}" x2="${x.toFixed(2)}" y2="${(y0 + gridH).toFixed(2)}" stroke="${color}" stroke-width="${w.toFixed(2)}"/>`,
+    );
+  }
+  for (let r = 0; r <= rows; r++) {
+    const y = y0 + r * cell;
+    const w = r % boldStep === 0 ? bold : r % 5 === 0 ? mid : thin;
+    const color = r % boldStep === 0 ? 'rgb(58,42,48)' : r % 5 === 0 ? 'rgb(107,86,92)' : 'rgb(176,160,164)';
+    lineEls.push(
+      `<line x1="${x0.toFixed(2)}" y1="${y.toFixed(2)}" x2="${(x0 + gridW).toFixed(2)}" y2="${y.toFixed(2)}" stroke="${color}" stroke-width="${w.toFixed(2)}"/>`,
+    );
+  }
+  push(lineEls.join(''));
+
+  // ---- 标尺 ----
+  push(`<g font-family="${SVG_FONT_STACK}" text-anchor="middle">`);
+  for (let c = 0; c <= cols; c += rulerStep) {
+    if (c === 0) continue;
+    const x = x0 + c * cell;
+    const isMajor = c % boldStep === 0;
+    push(
+      `<text x="${x.toFixed(2)}" y="${(y0 - 9).toFixed(2)}" font-size="${Math.max(9, Math.min(cell * 0.5, 15)).toFixed(1)}" ${isMajor ? 'font-weight="700"' : ''} fill="${isMajor ? '#3A2A30' : '#6B565C'}">${c}</text>`,
+    );
+  }
+  push(`</g>`);
+  push(`<g font-family="${SVG_FONT_STACK}" text-anchor="end">`);
+  for (let r = 0; r <= rows; r += rulerStep) {
+    if (r === 0) continue;
+    const y = y0 + r * cell;
+    const isMajor = r % boldStep === 0;
+    push(
+      `<text x="${(x0 - 8).toFixed(2)}" y="${(y + Math.max(4, cell * 0.22)).toFixed(2)}" font-size="${Math.max(9, Math.min(cell * 0.5, 15)).toFixed(1)}" ${isMajor ? 'font-weight="700"' : ''} fill="${isMajor ? '#3A2A30' : '#6B565C'}">${r}</text>`,
+    );
+  }
+  push(`</g>`);
+  // 轴标记
+  push(`<g font-family="${SVG_FONT_STACK}" font-size="12" fill="#9C868C">`);
+  push(`<text x="${x0}" y="${(y0 - rulerTop + 12).toFixed(2)}">列</text>`);
+  push(`<text x="${(x0 - rulerLeft + 6).toFixed(2)}" y="${(y0 + 4).toFixed(2)}">行</text>`);
+  push(`</g>`);
+
+  /*
+   * 格内标注两种模式的分界。
+   *
+   * SVG 是矢量的：放大看永远清晰，所以"每格都标"的门槛可以比位图低得多 ——
+   * 只要 1:1 下字不算荒谬（>= 14px），铺满色号对用户更有用。位图（PNG）受
+   * 输出像素数限制，格子小到一定程度字就糊了，此时退回"大色块标一次"。
+   */
+  const perCell = cell >= 14;
+  const blockMode = !perCell && cell >= SVG_MIN_CELL;
+  if (perCell) {
+    const buckets = new Map<string, string[]>();
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const idx = cells[r * cols + c];
+        if (idx < 0) continue;
+        const entry = palette[idx];
+        if (!entry) continue;
+        /*
+         * 字号 = 让这段字**真的**塞进格子内部（留 8% 边距）。
+         *
+         * 顺序很重要：先用实际字宽算色号的可用字号；如果连 7px 都不到，
+         * 说明这个色号在这么小的格子里根本读不出来 —— 此时才降级成图例序号
+         * （序号通常只有 1~2 位，字号能大一倍多）。反过来先降级再算字号，
+         * 就会在"其实放得下"的时候也印序号。
+         */
+        const codeText = sanitizeText(entry.code);
+        const innerW = cell * 0.78;
+        const innerH = cell * 0.76;
+        const fsFor = (t: string) =>
+          Math.min(innerH, innerW / Math.max(1, estimateTextEm(t)));
+
+        let text = codeText;
+        let fs = fsFor(codeText);
+        if (fs < 7) {
+          const idxText = String(entry.index + 1);
+          const altFs = fsFor(idxText);
+          if (altFs > fs) {
+            text = idxText;
+            fs = altFs;
+          }
+        }
+        fs = Math.max(3.2, Math.min(fs, innerH));
+        const ink = readableInkFor(entry.rgb) === '#231A11' ? '#231A11' : '#FFFDF6';
+        const key = `${ink}|${fs.toFixed(1)}`;
+        const el = `<text x="${(x0 + (c + 0.5) * cell).toFixed(2)}" y="${(y0 + (r + 0.5) * cell + fs * 0.35).toFixed(2)}" font-size="${fs.toFixed(1)}">${escapeXml(text)}</text>`;
+        const list = buckets.get(key);
+        if (list) list.push(el);
+        else buckets.set(key, [el]);
+      }
+    }
+    push(`<g font-family="${SVG_FONT_STACK}" text-anchor="middle" style="pointer-events:none">`);
+    for (const [key, list] of buckets) {
+      const [ink, fs] = key.split('|');
+      push(`<g fill="${ink}" font-size="${fs}">${list.join('')}</g>`);
+    }
+    push(`</g>`);
+  } else if (blockMode) {
+    // 大色块模式：每 ~96px 见方一块，块内主导色 >=70% 才标一次
+    const blockPx = Math.max(64, Math.min(120, cell * 12));
+    const blockCells = Math.max(2, Math.round(blockPx / cell));
+    const blockFs = Math.max(9, Math.min(26, blockPx * 0.22));
+    const items: string[] = [];
+    for (let br = 0; br < rows; br += blockCells) {
+      for (let bc = 0; bc < cols; bc += blockCells) {
+        const rEnd = Math.min(rows, br + blockCells);
+        const cEnd = Math.min(cols, bc + blockCells);
+        const tally = new Map<number, number>();
+        let filled = 0;
+        for (let lr = br; lr < rEnd; lr++) {
+          for (let lc = bc; lc < cEnd; lc++) {
+            const idx = cells[lr * cols + lc];
+            if (idx < 0) continue;
+            filled++;
+            tally.set(idx, (tally.get(idx) ?? 0) + 1);
+          }
+        }
+        const area = (rEnd - br) * (cEnd - bc);
+        if (filled < area * 0.55) continue;
+        let bestIdx = -1;
+        let bestCount = 0;
+        for (const [idx, count] of tally) {
+          if (count > bestCount) {
+            bestCount = count;
+            bestIdx = idx;
+          }
+        }
+        if (bestIdx < 0 || bestCount < filled * 0.7) continue;
+        const entry = palette[bestIdx];
+        if (!entry) continue;
+        const ink = readableInkFor(entry.rgb) === '#231A11' ? '#231A11' : '#FFFDF6';
+        const cx = x0 + (bc + (cEnd - bc) / 2) * cell;
+        const cy = y0 + (br + (rEnd - br) / 2) * cell;
+        items.push(
+          `<text x="${cx.toFixed(2)}" y="${(cy + blockFs * 0.35).toFixed(2)}" font-family="${SVG_FONT_STACK}" font-size="${blockFs.toFixed(1)}" font-weight="700" text-anchor="middle" fill="${ink}">${escapeXml(sanitizeText(entry.code) || String(entry.index + 1))}</text>`,
+        );
+      }
+    }
+    push(items.join(''));
+  }
+
+  // ---- 图例 ----
+  push(`<g font-family="${SVG_FONT_STACK}">`);
+  const legendTitleFont = 16 * legendScale;
+  const legendSubFont = 12 * legendScale;
+  push(`<line x1="${pad}" y1="${(legendTop - 18 * legendScale).toFixed(2)}" x2="${(pad + contentW).toFixed(2)}" y2="${(legendTop - 18 * legendScale).toFixed(2)}" stroke="#E2D5D4" stroke-width="1"/>`);
+  push(`<text x="${pad}" y="${(legendTop - 2 * legendScale).toFixed(2)}" font-size="${legendTitleFont.toFixed(1)}" font-weight="700" fill="#3A2A30">色号图例</text>`);
+  push(`<text x="${(pad + measureText('色号图例', legendTitleFont) + 16 * legendScale).toFixed(2)}" y="${(legendTop - 2 * legendScale).toFixed(2)}" font-size="${legendSubFont.toFixed(1)}" fill="#9C868C">每格用量与建议购买量（已含 10% 余量）</text>`);
+
+  usedColors.forEach((entry, i) => {
+    const col = i % legendCols;
+    const row = Math.floor(i / legendCols);
+    const ix = pad + col * legendItemW;
+    const iy = legendTop + 14 * legendScale + row * legendItemH;
+    // 色块上沿对齐色号文字的大致中腰，视觉上和文字成一行
+    push(`<rect x="${ix.toFixed(2)}" y="${(iy - 12 * legendScale).toFixed(2)}" width="${legendSwatch.toFixed(2)}" height="${legendSwatch.toFixed(2)}" fill="${entry.hex}" stroke="#E2D5D4" stroke-width="1"/>`);
+    push(`<text x="${(ix + legendSwatch + legendGap).toFixed(2)}" y="${(iy + 1 * legendScale).toFixed(2)}" font-size="${legendCodeFont.toFixed(1)}" font-weight="700" fill="#3A2A30">${escapeXml(legendTexts[i].code)}</text>`);
+    push(`<text x="${(ix + legendSwatch + legendGap).toFixed(2)}" y="${(iy + 15 * legendScale).toFixed(2)}" font-size="${legendMetaFont.toFixed(1)}" fill="#6B565C">${escapeXml(legendTexts[i].meta)}</text>`);
+  });
+
+  if (usedColors.length === 0) {
+    push(`<text x="${pad}" y="${(legendTop + 20).toFixed(2)}" font-size="${(13 * legendScale).toFixed(1)}" fill="#9C868C">这个图案还没有上色。</text>`);
+  }
+  push(`</g>`);
+  push(`</svg>`);
+
+  return parts.join('');
+}
+
+// ---------------------------------------------------------------------------
 // 路由
 // ---------------------------------------------------------------------------
+
+type ExportFormat = 'pdf' | 'svg' | 'png';
+
+function parseFormat(value: string | null | undefined): ExportFormat | null {
+  if (!value) return 'pdf';
+  const normalized = value.toLowerCase().trim();
+  if (normalized === 'pdf' || normalized === 'svg' || normalized === 'png') return normalized;
+  return null;
+}
+
+/**
+ * 文件名要同时满足两个约束：
+ *   1. `Content-Disposition` 的值在 HTTP 里是 ByteString，每个字符必须 ≤ 0xFF，
+ *      所以中文品牌名（漫漫/盼盼/咪小窝）直接放进去会让 NextResponse 抛
+ *      "Cannot convert argument to a ByteString"，整个请求 500。
+ *   2. 用户下载下来应该看到中文名。
+ * 解法是标准的两段式：`filename=` 给老浏览器一个 ASCII 降级名，
+ * `filename*=UTF-8''…` 给现代浏览器一个 RFC 5987 编码的真名。
+ */
+function contentDisposition(stem: string, brandLabel: string, ext: string): string {
+  const asciiBrand = brandLabel.replace(/[^\x20-\x7E]/g, '').trim().toLowerCase();
+  const asciiName = `${stem}-${asciiBrand || 'pattern'}.${ext}`;
+  const utf8Name = `${stem}-${brandLabel}.${ext}`;
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(utf8Name)}`;
+}
+
+function bufferResponse(
+  buffer: Buffer,
+  contentType: string,
+  filenameHeader: string,
+): NextResponse {
+  return new NextResponse(new Uint8Array(buffer), {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Disposition': filenameHeader,
+      'Content-Length': String(buffer.byteLength),
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+/** 画出完整的分页 PDF，返回 ArrayBuffer。 */
+function renderPdf(req: CleanRequest, plan: PagePlan): ArrayBuffer {
+  const forceIndexOnly = req.cols * req.rows > MAX_CELLS_WITH_CODES;
+
+  const doc = makeDoc();
+  doc.setProperties({
+    title: sanitizeText(`拼豆图纸 ${req.cols}x${req.rows} · ${req.brandLabel}`),
+    subject: '拼豆图纸（分页图纸 / 用料清单 / 色号图例）',
+    creator: '拼豆图案生成器',
+  });
+
+  // 封面
+  drawCover(doc, req, plan);
+
+  // 整图总览：需要拆页的大图才有意义（小图一页就看全了）
+  if (plan.tiles.length > 1) {
+    doc.addPage();
+    drawPatternOverview(doc, req, plan);
+  }
+
+  // 图纸
+  const labelSpecs = buildLabelSpecs(doc, req.palette, plan.cell, forceIndexOnly);
+  plan.tiles.forEach((tile, index) => {
+    doc.addPage();
+    drawPatternTile(doc, req, plan, tile, index, labelSpecs, forceIndexOnly);
+  });
+
+  // 用料清单
+  doc.addPage();
+  drawMaterialsPages(doc, req);
+
+  // 图例
+  doc.addPage();
+  drawLegendPages(doc, req);
+
+  stampFooters(doc, req);
+
+  return doc.output('arraybuffer');
+}
 
 export async function POST(request: NextRequest) {
   let raw: IncomingBody;
@@ -2264,11 +2801,63 @@ export async function POST(request: NextRequest) {
     return badRequest('请求体不是合法 JSON');
   }
 
+  const format = parseFormat(
+    request.nextUrl.searchParams.get('format') ??
+      (typeof (raw as { format?: unknown }).format === 'string'
+        ? ((raw as { format?: unknown }).format as string)
+        : null),
+  );
+  if (!format) {
+    return badRequest('format 只支持 pdf / svg / png');
+  }
+
   const validated = validateBody(raw);
   if (validated instanceof NextResponse) return validated;
   const req = validated;
 
   try {
+    // ---- SVG / PNG：单张整图，不分页 ----
+    if (format === 'svg' || format === 'png') {
+      const isPng = format === 'png';
+      const colorCount = req.palette.filter((entry) => entry.count > 0).length;
+      const cell = chooseCell(
+        req.cols,
+        req.rows,
+        colorCount,
+        isPng ? PNG_TARGET_EDGE : SVG_TARGET_EDGE,
+        isPng ? PNG_MIN_CELL : SVG_MIN_CELL,
+        isPng ? PNG_MAX_CELL : SVG_MAX_CELL,
+      );
+      const svg = buildVectorSheet(req, { cell });
+      const stem = `perler-pattern-${req.cols}x${req.rows}`;
+
+      if (!isPng) {
+        const buffer = Buffer.from(svg, 'utf8');
+        return bufferResponse(
+          buffer,
+          'image/svg+xml; charset=utf-8',
+          contentDisposition(stem, req.brandLabel, 'svg'),
+        );
+      }
+
+      /*
+       * PNG 由 SVG 栅格化而来 —— 只维护一套排版代码，两种格式不会漂。
+       *
+       * 关键：**不要**指望 sharp 的 density 去放大。librsvg 会先按 density 把
+       * SVG 铺成一张大位图再缩放，320 格的图会走 600dpi 铺出上万像素的中间层，
+       * 4 秒起步。这里让 SVG 以 1:1（density 72）栅格化，尺寸已经由 chooseCell
+       * 定在 PNG_TARGET_EDGE 附近，多出来的一两个像素用 resize 精确收口。
+       */
+      const { default: sharp } = await import('sharp');
+      const buffer = await sharp(Buffer.from(svg, 'utf8'), { density: 72 })
+        .resize({ width: Math.round(VECTOR_PAD * 2 + VECTOR_RULER_LEFT + req.cols * cell), fit: 'inside', withoutEnlargement: true })
+        .png({ compressionLevel: 9, palette: false })
+        .toBuffer();
+
+      return bufferResponse(buffer, 'image/png', contentDisposition(stem, req.brandLabel, 'png'));
+    }
+
+    // ---- PDF ----
     let plan: PagePlan;
     try {
       plan = planPages(req.cols, req.rows);
@@ -2277,77 +2866,25 @@ export async function POST(request: NextRequest) {
       if (error instanceof PagePlanError) return badRequest(error.message);
       throw error;
     }
-    const forceIndexOnly = req.cols * req.rows > MAX_CELLS_WITH_CODES;
 
-    const doc = makeDoc();
-    doc.setProperties({
-      title: sanitizeText(`拼豆图纸 ${req.cols}x${req.rows} · ${req.brandLabel}`),
-      subject: '拼豆图纸（分页图纸 / 用料清单 / 色号图例）',
-      creator: '拼豆图案生成器',
-    });
-
-    // 封面
-    drawCover(doc, req, plan);
-
-    // 整图总览：需要拆页的大图才有意义（小图一页就看全了）
-    if (plan.tiles.length > 1) {
-      doc.addPage();
-      drawPatternOverview(doc, req, plan);
-    }
-
-    // 图纸
-    const labelSpecs = buildLabelSpecs(doc, req.palette, plan.cell, forceIndexOnly);
-    plan.tiles.forEach((tile, index) => {
-      doc.addPage();
-      drawPatternTile(doc, req, plan, tile, index, labelSpecs, forceIndexOnly);
-    });
-
-    // 用料清单
-    doc.addPage();
-    drawMaterialsPages(doc, req);
-
-    // 图例
-    doc.addPage();
-    drawLegendPages(doc, req);
-
-    stampFooters(doc, req);
-
-    const buffer = Buffer.from(doc.output('arraybuffer'));
+    const buffer = Buffer.from(renderPdf(req, plan));
     /*
-     * 文件名**必须**是纯 ASCII。
+     * stem 里**不放品牌名** —— contentDisposition() 自己会拼一次
+     * （ascii 名用小写品牌兜底、RFC 5987 的 filename* 用原文品牌）。
      *
-     * `Content-Disposition` 的 header 值在 HTTP 里是 ByteString —— 每个字符
-     * 必须 ≤ 0xFF。品牌名改成中文（漫漫/盼盼/咪小窝）之后，直接用
-     * `perler-pattern-漫漫-52x64.pdf` 会让 NextResponse 抛
-     * `Cannot convert argument to a ByteString because the character at
-     * index 37 has a value of 28459`，整个请求 500，用户什么也拿不到。
-     *
-     * 两步处理：
-     *   1. `filename=` 放一个降级成 ASCII 的版本给老浏览器（"manman"）；
-     *   2. `filename*=UTF-8''…` 放 RFC 5987 编码的真名，现代浏览器优先用
-     *      它 —— 用户下载下来看到的就是中文品牌名。
-     * 这样两头都正确，而不是像以前那样干脆把品牌印成拼音。
+     * 原来这里写的是 `perler-pattern-${brand.toLowerCase()}-${cols}x${rows}`，
+     * 于是 PDF 下载下来叫 `perler-pattern-mard-52x64-MARD.pdf`，品牌名出现
+     * 两遍；而 SVG / PNG 走的是不带品牌的 stem，文件名是干净的
+     * `perler-pattern-52x64-mard.pdf`。三种格式同一个出口，参数该一致。
      */
-    const asciiBrand = req.brandLabel
-      .replace(/[^\x20-\x7E]/g, '')
-      .trim()
-      .toLowerCase();
-    const asciiName = `perler-pattern-${asciiBrand || 'pattern'}-${req.cols}x${req.rows}.pdf`;
-    const utf8Name = `perler-pattern-${req.brandLabel}-${req.cols}x${req.rows}.pdf`;
-    const encodedName = encodeURIComponent(utf8Name);
-
-    return new NextResponse(new Uint8Array(buffer), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`,
-        'Content-Length': String(buffer.byteLength),
-        'Cache-Control': 'no-store',
-      },
-    });
+    const stem = `perler-pattern-${req.cols}x${req.rows}`;
+    return bufferResponse(buffer, 'application/pdf', contentDisposition(stem, req.brandLabel, 'pdf'));
   } catch (error) {
-    console.error('PDF generation error:', error);
-    return NextResponse.json({ error: 'PDF 生成失败' }, { status: 500 });
+    console.error('Export generation error:', error);
+    return NextResponse.json(
+      { error: `生成 ${format.toUpperCase()} 失败，请重试` },
+      { status: 500 },
+    );
   }
 }
 
