@@ -21,6 +21,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
@@ -87,6 +88,16 @@ export interface PatternCanvasProps {
    * 上报出去。只在值真正变化时触发。
    */
   onActivityChange?: (activity: CanvasActivity) => void;
+  /**
+   * 缩放控件要渲染进去的 DOM 节点（「04 图纸」标题栏右侧那个空槽）。
+   *
+   * 由父层用 ref callback 拿到真实节点后传进来，本组件用 `createPortal` 把
+   * 缩放组送进去 —— 状态留在画布内部（zoom/zoomIn/zoomOut 都活在
+   * usePatternCanvas 里），只有渲染位置搬走。
+   *
+   * 不传时缩放组退回工具条内联渲染，功能不丢（组件被别处复用时不会白屏）。
+   */
+  zoomSlot?: HTMLElement | null;
 }
 
 /**
@@ -96,6 +107,57 @@ export interface PatternCanvasProps {
  * 这个判断三种状态互斥，合并成一个值可以少两次 && 逻辑，也便于以后加档位。
  */
 export type CanvasActivity = 'idle' | 'brushing' | 'editing';
+
+/**
+ * 桌面端色板竖栏宽度（CSS px）。
+ *
+ * 200 是反算出来的，不是拍的：竖栏 200 − 左右各 2px 边框 = 196 的内容宽，
+ * 再减 px-2（左右各 8px）= 180 的净宽；7 列 × 24px + 6 个 2px 间隙 = 180，
+ * 正好吃满且不出现横向滚动条。
+ *
+ * 为什么卡在 200 而不是更宽：中栏 1244px 里，200 侧栏 + 2px 边框 + 8px
+ * 间隙之后画布仍有约 1026px，方形图能撑到 1000 以上（验收要求 >= 700）。
+ * 再宽就开始明显抢画布 —— 而这个改动的首要目的恰恰是"把面积还给画布"。
+ */
+const TRAY_RAIL_W = 200;
+/** 桌面断点，与 globals.css 里的 .wb 断点（64rem）保持一致 */
+const DESKTOP_QUERY = '(min-width: 64rem)';
+/**
+ * 竖栏里的色块边长。
+ *
+ * 24px 是"能放下 8px 色号角标"（PixelSwatch 在 >= 18px 时才画角标）与
+ * "一屏看到足够多色"的折中：24 + 2px 间隙的栅格下，291 色在 200 宽的
+ * 竖栏里是 7 列 × 42 行，约两屏看完。
+ */
+const SWATCH_DESKTOP = 24;
+/**
+ * 手机上的色块边长。
+ *
+ * 22px 是给鼠标的尺寸：手指点 22px 的方块命中率很差（拇指指腹接触面直径
+ * 约 8–10mm ≈ 30–38 CSS px），很容易点到隔壁色号。28px 是"能稳定点中"的
+ * 下限（也是验收要求的 >= 28），配合 4px 间隙形成 32px 的点击栅格。
+ */
+const SWATCH_MOBILE = 28;
+
+/**
+ * 断点判定：用 matchMedia 而不是量 host 宽度。
+ *
+ * 依据是"窗口一行还能不能并排放两栏"，那是媒体查询的事，不是画布容器的事 ——
+ * 容器宽度还受左栏折叠、专注模式影响，用它判定会让同一个窗口在不同状态下
+ * 来回换布局。断点值与 globals.css 里 `.wb` 的 64rem 对齐，两边一起变。
+ *
+ * 用 useSyncExternalStore 读，而不是 useEffect + useState：后者首帧永远渲染成
+ * "手机"，桌面用户会看到一次布局跳动；前者给出服务端快照（false）与客户端
+ * 快照两条通道，React 在 hydrate 时按真实值一次到位。
+ */
+function subscribeDesktop(onChange: () => void) {
+  const mq = window.matchMedia(DESKTOP_QUERY);
+  mq.addEventListener('change', onChange);
+  return () => mq.removeEventListener('change', onChange);
+}
+const getDesktopSnapshot = () => window.matchMedia(DESKTOP_QUERY).matches;
+/** 服务端拿不到窗口尺寸，按手机布局渲染（窄的那套是安全的默认） */
+const getDesktopServerSnapshot = () => false;
 
 export function PatternCanvas({
   pattern,
@@ -112,7 +174,19 @@ export function PatternCanvas({
   onCurrentCodeChange,
   initialTool,
   onActivityChange,
+  zoomSlot: zoomSlotProp,
 }: PatternCanvasProps) {
+  /**
+   * 「编辑」是总开关（默认关）。
+   *
+   * 为什么不默认开：画布的首要任务是"看图纸"，鼠标移过格子就弹色号才是
+   * 常态。如果一进来就是编辑态，用户想拖动画布看局部时反而会涂掉一颗豆
+   * —— 而且他自己未必立刻发现。所以必须先明确表示"我要改"。
+   *
+   * 声明在 usePatternCanvas **之前**：编辑态要改变格子的 sizing 策略
+   * （编辑时宽度优先、让画板吃满面积），所以要作为 option 传进 hook。
+   */
+  const [editActive, setEditActive] = useState(false);
   const c = usePatternCanvas(pattern, {
     brushes,
     onBrushesChange,
@@ -123,6 +197,7 @@ export function PatternCanvas({
     onEditsChange,
     onCurrentCodeChange,
     initialTool,
+    editing: editActive,
   });
   const {
     hostRef,
@@ -230,15 +305,49 @@ export function PatternCanvas({
   }, [editEnabled, currentCode, pattern, setCurrentCode]);
 
   /**
-   * 「编辑」是总开关（默认关）。
+   * 桌面端（>= 64rem）编辑布局：色板放右侧竖栏。
    *
-   * 为什么不默认开：画布的首要任务是"看图纸"，鼠标移过格子就弹色号才是
-   * 常态。如果一进来就是编辑态，用户想拖动画布看局部时反而会涂掉一颗豆
-   * —— 而且他自己未必立刻发现。所以必须先明确表示"我要改"。
+   * 用户原话：「如果是手机，面板和色板放在上面没问题，但是电脑在侧边（右边？）
+   * 会方便很多」—— 所以形态跟着断点走，不是跟着用户偏好走。
    */
-  const [editActive, setEditActive] = useState(false);
-  /** 色卡浮层默认收起：320 色铺开会把画布挤走半屏 */
+  const isDesktop = useSyncExternalStore(
+    subscribeDesktop,
+    getDesktopSnapshot,
+    getDesktopServerSnapshot,
+  );
+  /** 色板是否展开。桌面 = 右侧竖栏，手机 = 覆盖在画布上的浮层 */
   const [trayOpen, setTrayOpen] = useState(false);
+  /**
+   * 进入编辑时按断点给色板初值：桌面展开、手机收起。
+   *
+   * 桌面展开的理由：竖栏在右，不占画布高度，291 色直接摊开最省事。
+   * 手机收起的理由：横条会把画布往下推（用户原话认可"放在上面没问题"，
+   * 但高度本来就紧），所以默认收起、点「当前色」再以浮层出现。
+   *
+   * 写成"渲染期调整 state"而不是 useEffect：effect 里同步 setState 会触发
+   * 一轮级联渲染（eslint 的 react-hooks/set-state-in-effect 会直接报错），
+   * 而这里要的恰恰是"在渲染同一帧里就按新状态算好"，正是 React 文档里
+   * adjusting state when props change 那个模式。跨断点拖窗口也走这条路：
+   * 切到手机 → 收起；切回桌面 → 展开。
+   */
+  const [layoutSeed, setLayoutSeed] = useState({ editing: editActive, desktop: isDesktop });
+  if (layoutSeed.editing !== editActive || layoutSeed.desktop !== isDesktop) {
+    setLayoutSeed({ editing: editActive, desktop: isDesktop });
+    if (editActive) setTrayOpen(isDesktop);
+  }
+  const trayRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 当前色块。
+   *
+   * 291 个色号，用户记不住位置 —— 选完一个色，高亮块很可能就滚出视野了，
+   * 那时"我现在拿的是什么色"立刻断掉。每次当前色变化把它滚回可见区。
+   * block:'nearest' 而不是 'center'：后者会让色板每点一下就整块跳一下。
+   */
+  const activeSwatchRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!trayOpen) return;
+    activeSwatchRef.current?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+  }, [currentCode, trayOpen]);
 
   /*
    * 把"画布现在被占着"这件事上报给父组件。
@@ -266,6 +375,26 @@ export function PatternCanvas({
     () => brandColors.find((c) => c.code === currentCode) ?? null,
     [brandColors, currentCode],
   );
+
+  /**
+   * 291 色按色号首字母分组（A/B/C/…/ZG，共 15 组）。
+   *
+   * 分组不是为了好看，是为了**可定位**：291 个方块平铺成一片时，用户只能
+   * 靠肉眼从左上角扫到右下角找 A26；有了首字母小标题和分组之间的留白，
+   * 视线能直接跳到"我要 A 开头"那一段。标题 sticky 在容器顶部，滚到哪
+   * 都知道自己在哪一组。
+   */
+  const colorGroups = useMemo(() => {
+    const groups: { prefix: string; colors: typeof brandColors }[] = [];
+    for (const bead of brandColors) {
+      const match = /^[A-Z]+/.exec(bead.code);
+      const prefix = match ? match[0] : '#';
+      const last = groups[groups.length - 1];
+      if (last && last.prefix === prefix) last.colors.push(bead);
+      else groups.push({ prefix, colors: [bead] });
+    }
+    return groups;
+  }, [brandColors]);
 
   const EDIT_TOOLS: { tool: EditTool; label: string; title: string }[] = [
     { tool: 'pencil', label: '手绘', title: '逐格涂色（可拖动连涂）' },
@@ -313,6 +442,79 @@ export function PatternCanvas({
   }, [pattern, brushRadius, regionFeather]);
 
   const zoomPct = Math.round(zoom * 100);
+
+
+  /** 缩放控件本体。渲染位置由 portal 决定，状态仍归本组件。 */
+  const zoomGroup = (
+    <div className="flex items-center gap-1.5">
+      {/*
+        「Zoom」这个词在 xl 以下藏起来。
+
+        标题栏是 flex-wrap 的，1240px（1600 视口）一行放得下；但 1024–1279
+        时标题栏只有 664–920px，塞标题组 + 缩放组 + 六个按钮会超出 9–90px，
+        折成两行 —— 那就等于没省下空间，还不如原来固定的两行整齐。
+        「− 100% +」本身已经无歧义，这个词是纯装饰，让位于空间。
+      */}
+      <span className="px-label mr-1 hidden xl:inline" style={{ color: 'var(--ink-3)' }}>
+        Zoom
+      </span>
+      <button
+        type="button"
+        className="px-btn px-btn-sm"
+        onClick={zoomOut}
+        disabled={zoom <= ZOOM_MIN + 1e-6}
+        title="缩小 (−)"
+        aria-label="缩小"
+        style={{ minWidth: 32, paddingInline: 0 }}
+      >
+        −
+      </button>
+      <button
+        type="button"
+        className="px-btn px-btn-sm"
+        onClick={resetZoom}
+        title="重置为 100% (0)"
+        style={{ minWidth: 54, fontVariantNumeric: 'tabular-nums' }}
+      >
+        {zoomPct}%
+      </button>
+      <button
+        type="button"
+        className="px-btn px-btn-sm"
+        onClick={zoomIn}
+        disabled={zoom >= ZOOM_MAX - 1e-6}
+        title="放大 (+)"
+        aria-label="放大"
+        style={{ minWidth: 32, paddingInline: 0 }}
+      >
+        +
+      </button>
+    </div>
+  );
+
+  /*
+   * 整条工具条（缩放组 + 功能开关）要渲染到「04 图纸」标题栏右侧的空槽里，
+   * 而不是自己占一行。
+   *
+   * 用户两次标注：先是「这个东西位置不好，占了一行，下面就会少一行空间给
+   * 面板」，把 Zoom 组指到标题栏右侧；Zoom 搬走后又圈出剩下那排
+   * 「刷区域/编辑/色号/网格/标尺」说「这个也移植到上面那一行吧，不然看起来
+   * 很难受，能省空间就省」。所以整条一起上去，画布上方那 31px + 8px gap
+   * 全部还给画布。
+   *
+   * 容量核算（1600px 视口实测）：标题栏 1240px 宽。左侧标题组 224 +
+   * 缩放组 237 + 按钮组 294 + gap 28 = 783，右侧那句说明已按用户要求删掉
+   * （「这个删了，不用提示的」），余量 457px。窄屏放不下，所以槽位本身带
+   * `hidden lg:flex`，窄屏退回画布上方内联渲染。
+   *
+   * 为什么用 portal 而不是把 zoom 状态提到 page.tsx：zoom/zoomIn/zoomOut/
+   * resetZoom 全在 usePatternCanvas 里，提到父层要新增 5 个 prop 并搬走
+   * hook 状态，而"控件画在哪"和"状态归谁"本来就不必绑定。portal 让状态
+   * 一动不动，父层只提供一个空节点。
+   *
+   * 槽找不到时（比如别人复用本组件但没给槽）退回内联渲染，功能不丢。
+   */
+  const zoomSlot = zoomSlotProp ?? null;
   const cellCss = metrics?.cellCss ?? 12;
   /*
    * 颗数读**叠加编辑后**的数字：手绘加一颗豆，颗数就该 +1；
@@ -630,6 +832,52 @@ export function PatternCanvas({
     </button>
   );
 
+  /** 功能开关组。和 zoomGroup 一起被 portal 到标题栏，或窄屏时留在画布上方。 */
+  const toolbarButtons = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {brushEnabled &&
+        toggleBtn(
+          brushMode,
+          brushMode ? '退出刷子' : '刷区域',
+          // 退出时若有未提交的草稿，自动应用（见 hook 里 exitBrushMode 的注释）
+          () => (brushMode ? exitBrushMode() : setBrushMode(true)),
+          '在图上刷一块区域，用不同的精细度算法重算（其余部分不变）',
+        )}
+      {editEnabled &&
+        toggleBtn(
+          editActive,
+          editActive ? '退出编辑' : '编辑',
+          () => {
+            setEditActive((v) => {
+              if (v) onEditPointerLeave(); // 关掉时清掉落点方框
+              return !v;
+            });
+            // 编辑与刷区域互斥：两套拖动语义打架
+            if (brushMode) setBrushMode(false);
+          },
+          '手工改格子：手绘 / 橡皮 / 取色 / 油漆桶（可 Ctrl+Z 撤销）',
+        )}
+      {toggleBtn(showCodes, '色号', () => setShowCodes((v) => !v), '显示/隐藏每颗豆子的色号')}
+      {toggleBtn(showGrid, '网格', () => setShowGrid((v) => !v), '显示/隐藏网格线')}
+      {toggleBtn(showRulers, '标尺', () => setShowRulers((v) => !v), '显示/隐藏行列标尺')}
+      {/*
+        「区域标记」必须常驻这一排。
+        早先它挂在刷子工具条里，退出刷子模式后按钮消失，而遮罩还在图上
+        —— 用户再也关不掉那块覆盖层（实测：退出后 mask 仍有 56,689 像素
+        在显示，但按钮已经不存在了）。现在和色号/网格/标尺同排，任何时候
+        都能关。pending/live 不受它影响，见 drawRegionMask 的注释。
+      */}
+      {appliedCount > 0 &&
+        toggleBtn(
+          showRegionOverlay,
+          '区域标记',
+          () => setShowRegionOverlay((v) => !v),
+          '显示/隐藏已应用区域的标记（陶土色底纹+虚线轮廓）。待应用草稿与拖动预览不受此开关影响',
+        )}
+    </div>
+  );
+
+
   return (
     <div
       ref={hostRef}
@@ -654,250 +902,177 @@ export function PatternCanvas({
           : undefined
       }
     >
-      {/* ---------------- 工具条 ---------------- */}
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
-        <div className="flex items-center gap-1.5">
-          <span className="px-label mr-1" style={{ color: 'var(--ink-3)' }}>
-            Zoom
-          </span>
-          <button
-            type="button"
-            className="px-btn px-btn-sm"
-            onClick={zoomOut}
-            disabled={zoom <= ZOOM_MIN + 1e-6}
-            title="缩小 (−)"
-            aria-label="缩小"
-            style={{ minWidth: 32, paddingInline: 0 }}
-          >
-            −
-          </button>
-          <button
-            type="button"
-            className="px-btn px-btn-sm"
-            onClick={resetZoom}
-            title="重置为 100% (0)"
-            style={{ minWidth: 54, fontVariantNumeric: 'tabular-nums' }}
-          >
-            {zoomPct}%
-          </button>
-          <button
-            type="button"
-            className="px-btn px-btn-sm"
-            onClick={zoomIn}
-            disabled={zoom >= ZOOM_MAX - 1e-6}
-            title="放大 (+)"
-            aria-label="放大"
-            style={{ minWidth: 32, paddingInline: 0 }}
-          >
-            +
-          </button>
-          <span
-            className="ml-1 hidden text-[11px] sm:inline"
-            style={{ color: 'var(--ink-3)' }}
-            title="滚轮可在画布上缩放"
-          >
-            滚轮缩放
-          </span>
-        </div>
+      {/* ---------------- 工具条 ----------------
+          桌面端整条搬到「04 图纸」标题栏右侧（见下方 toolbar 的注释）。
+          这里只在窄屏 / 没有槽位时兜底渲染 —— 那些情况下标题栏放不下
+          六个按钮，留在画布上方独占一行才是可用的。
 
-        <div className="flex flex-wrap items-center gap-1.5">
-          {brushEnabled &&
-            toggleBtn(
-              brushMode,
-              brushMode ? '退出刷子' : '刷区域',
-              // 退出时若有未提交的草稿，自动应用（见 hook 里 exitBrushMode 的注释）
-              () => (brushMode ? exitBrushMode() : setBrushMode(true)),
-              '在图上刷一块区域，用不同的精细度算法重算（其余部分不变）',
-            )}
-          {editEnabled &&
-            toggleBtn(
-              editActive,
-              editActive ? '退出编辑' : '编辑',
-              () => {
-                setEditActive((v) => {
-                  if (v) onEditPointerLeave(); // 关掉时清掉落点方框
-                  return !v;
-                });
-                // 编辑与刷区域互斥：两套拖动语义打架
-                if (brushMode) setBrushMode(false);
-              },
-              '手工改格子：手绘 / 橡皮 / 取色 / 油漆桶（可 Ctrl+Z 撤销）',
-            )}
-          {toggleBtn(showCodes, '色号', () => setShowCodes((v) => !v), '显示/隐藏每颗豆子的色号')}
-          {toggleBtn(showGrid, '网格', () => setShowGrid((v) => !v), '显示/隐藏网格线')}
-          {toggleBtn(showRulers, '标尺', () => setShowRulers((v) => !v), '显示/隐藏行列标尺')}
-          {/*
-            「区域标记」必须常驻这一排。
-            早先它挂在刷子工具条里，退出刷子模式后按钮消失，而遮罩还在图上
-            —— 用户再也关不掉那块覆盖层（实测：退出后 mask 仍有 56,689 像素
-            在显示，但按钮已经不存在了）。现在和色号/网格/标尺同排，任何时候
-            都能关。pending/live 不受它影响，见 drawRegionMask 的注释。
-          */}
-          {appliedCount > 0 &&
-            toggleBtn(
-              showRegionOverlay,
-              '区域标记',
-              () => setShowRegionOverlay((v) => !v),
-              '显示/隐藏已应用区域的标记（陶土色底纹+虚线轮廓）。待应用草稿与拖动预览不受此开关影响',
-            )}
-        </div>
-      </div>
-
-      {/* ---------------- 编辑工具条（父组件接管 edits 时出现） ---------------- */}
-      {editEnabled && editActive && (
-        <div
-          className="px-panel-flat flex flex-col gap-2 px-2.5 py-2"
-          role="region"
-          aria-label="编辑工具条"
-        >
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            {/* 四个工具 */}
-            <div className="flex items-center gap-1" role="group" aria-label="编辑工具">
-              {EDIT_TOOLS.map(({ tool, label, title }) => {
-                const active = editTool === tool;
-                return (
-                  <button
-                    key={tool}
-                    type="button"
-                    className="px-btn px-btn-sm inline-flex items-center gap-1.5"
-                    aria-pressed={active}
-                    title={title}
-                    onClick={() => setEditTool(tool)}
-                    data-testid={`tool-${tool}`}
-                    style={
-                      active
-                        ? {
-                            background: 'var(--clay)',
-                            borderColor: 'var(--clay-deep)',
-                            color: 'var(--on-clay)',
-                          }
-                        : { padding: '4px 7px' }
-                    }
-                  >
-                    <PixelCursor
-                      kind={
-                        tool === 'pencil'
-                          ? 'pencil'
-                          : tool === 'eraser'
-                            ? 'eraser'
-                            : tool === 'picker'
-                              ? 'picker'
-                              : 'fill'
-                      }
-                      size={14}
-                    />
-                    <span className="text-[11px]">{label}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* 当前色 + 展开色卡 */}
-            <button
-              type="button"
-              className="px-btn px-btn-sm inline-flex items-center gap-1.5"
-              onClick={() => setTrayOpen((v) => !v)}
-              aria-expanded={trayOpen}
-              title="展开/收起品牌色卡（改了色的格子右上角会有金色三角）"
-              data-testid="toggle-tray"
-            >
-              {currentBead ? (
-                <PixelSwatch hex={currentBead.hex} size={16} />
-              ) : (
-                <span
-                  style={{
-                    width: 16,
-                    height: 16,
-                    background: 'var(--paper-sunken)',
-                    border: '1px solid var(--line-strong)',
-                    display: 'inline-block',
-                  }}
-                />
-              )}
-              <span className="font-px text-[11px] font-bold" style={{ color: 'var(--ink)' }}>
-                {currentCode || '—'}
-              </span>
-              <span style={{ color: 'var(--ink-3)' }}>{trayOpen ? '▲' : '▼'}</span>
-            </button>
-
-            {/* 撤销 / 重做 / 清除手改 */}
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                className="px-btn px-btn-sm"
-                onClick={undoEdit}
-                disabled={!canUndoEdit}
-                title="撤销上一步（Ctrl+Z）"
-                data-testid="undo-edit"
-              >
-                撤销
-              </button>
-              <button
-                type="button"
-                className="px-btn px-btn-sm"
-                onClick={redoEdit}
-                disabled={!canRedoEdit}
-                title="重做（Ctrl+Shift+Z / Ctrl+Y）"
-                data-testid="redo-edit"
-              >
-                重做
-              </button>
-              <button
-                type="button"
-                className="px-btn px-btn-sm"
-                onClick={clearEdits}
-                disabled={editedCount === 0}
-                title="把所有手改格子恢复成引擎生成的样子（可撤销）"
-                data-testid="clear-edits"
-              >
-                还原
-              </button>
-            </div>
-
-            {editedCount > 0 && (
-              <span
-                className="px-tag px-tag-gold"
-                style={{ fontSize: 10 }}
-                data-testid="tag-edited"
-              >
-                手改 {editedCount} 格
-              </span>
-            )}
-          </div>
-
-          {/* 色卡浮层：品牌全部色号，按色号排序，塞进一个可滚动的条带里 */}
-          {trayOpen && (
-            <div
-              className="px-inset flex max-h-[92px] flex-wrap content-start gap-1 overflow-y-auto p-1.5"
-              data-testid="color-tray"
-              aria-label="品牌色卡"
-            >
-              {brandColors.map((bead) => {
-                const active = bead.code === currentCode;
-                return (
-                  <PixelSwatch
-                    key={bead.code}
-                    hex={bead.hex}
-                    code={bead.code}
-                    size={22}
-                    selected={active}
-                    title={`${bead.code} · ${bead.hex.toUpperCase()}（${bead.rgb.r},${bead.rgb.g},${bead.rgb.b}）`}
-                    onClick={() => setCurrentCode(bead.code)}
-                  />
-                );
-              })}
-              {brandColors.length === 0 && (
-                <span className="text-[11px]" style={{ color: 'var(--ink-3)' }}>
-                  这个品牌没有色卡数据
-                </span>
-              )}
-            </div>
-          )}
+          剩下的功能开关单独一行时不能用 justify-between（会把它顶到右端），
+          用 justify-end 保持和标题栏动作按钮一条竖线。 */}
+      {!(zoomSlot && isDesktop) && (
+        <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
+          {zoomGroup}
+          {toolbarButtons}
         </div>
       )}
 
-      {/* ---------------- 刷区域工具条（只在父组件接管 brushes 时出现） ---------------- */}
-      {brushEnabled && brushMode && (
+      {/*
+        编辑区外壳：桌面 = 左画布 + 右色板竖栏；手机 = 单列（色板以浮层出现）。
+
+        结构上的重点在**外层这一个 flex 行**：桌面两栏时画布列 flex-1、色板列
+        flex-none，于是"色板占多少宽"与"画布占多少高"完全解耦 —— 色板再高也
+        不会把画布顶下去（这正是原来横条版的问题：色卡一展开 92px，画布矮了
+        92px）。手机上这个行仍是 column，色板改绝对定位浮在画布上，同样不推挤
+        画布高度。
+      */}
+      <div
+        className="flex min-h-0 min-w-0 gap-2"
+        style={{
+          flex: useFill ? '1 1 auto' : undefined,
+          flexDirection: isDesktop && editActive ? 'row' : 'column',
+          // 非 fill（老行为）时不让这一层撑高，交给里面原来的限高逻辑
+          minHeight: 0,
+        }}
+      >
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
+          {/* ---------------- 编辑工具条（父组件接管 edits 时出现） ---------------- */}
+          {editEnabled && editActive && (
+            <div
+              className="px-panel-flat flex flex-col gap-2 px-2.5 py-2"
+              role="region"
+              aria-label="编辑工具条"
+            >
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                {/* 四个工具 */}
+                <div className="flex items-center gap-1" role="group" aria-label="编辑工具">
+                  {EDIT_TOOLS.map(({ tool, label, title }) => {
+                    const active = editTool === tool;
+                    return (
+                      <button
+                        key={tool}
+                        type="button"
+                        className="px-btn px-btn-sm inline-flex items-center gap-1.5"
+                        aria-pressed={active}
+                        title={title}
+                        onClick={() => setEditTool(tool)}
+                        data-testid={`tool-${tool}`}
+                        style={
+                          active
+                            ? {
+                                background: 'var(--clay)',
+                                borderColor: 'var(--clay-deep)',
+                                color: 'var(--on-clay)',
+                              }
+                            : { padding: '4px 7px' }
+                        }
+                      >
+                        <PixelCursor
+                          kind={
+                            tool === 'pencil'
+                              ? 'pencil'
+                              : tool === 'eraser'
+                                ? 'eraser'
+                                : tool === 'picker'
+                                  ? 'picker'
+                                  : 'fill'
+                          }
+                          size={14}
+                        />
+                        <span className="text-[11px]">{label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/*
+                  当前色 + 展开色卡。
+                  桌面端它仍然是色板竖栏的开关（此时色号的大预览在右侧栏顶）；
+                  手机端它是唯一入口 —— 点击才浮出色板，不常驻。
+                */}
+                <button
+                  type="button"
+                  className="px-btn px-btn-sm inline-flex items-center gap-1.5"
+                  onClick={() => setTrayOpen((v) => !v)}
+                  aria-expanded={trayOpen}
+                  title={
+                    trayOpen
+                      ? isDesktop
+                        ? '收起右侧色板，让画布变宽'
+                        : '收起色板'
+                      : isDesktop
+                        ? '展开右侧色板'
+                        : '展开色板选色'
+                  }
+                  data-testid="toggle-tray"
+                >
+                  {currentBead ? (
+                    <PixelSwatch hex={currentBead.hex} size={16} />
+                  ) : (
+                    <span
+                      style={{
+                        width: 16,
+                        height: 16,
+                        background: 'var(--paper-sunken)',
+                        border: '1px solid var(--line-strong)',
+                        display: 'inline-block',
+                      }}
+                    />
+                  )}
+                  <span className="font-px text-[11px] font-bold" style={{ color: 'var(--ink)' }}>
+                    {currentCode || '—'}
+                  </span>
+                  <span style={{ color: 'var(--ink-3)' }}>{trayOpen ? '▲' : '▼'}</span>
+                </button>
+
+                {/* 撤销 / 重做 / 清除手改 */}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    className="px-btn px-btn-sm"
+                    onClick={undoEdit}
+                    disabled={!canUndoEdit}
+                    title="撤销上一步（Ctrl+Z）"
+                    data-testid="undo-edit"
+                  >
+                    撤销
+                  </button>
+                  <button
+                    type="button"
+                    className="px-btn px-btn-sm"
+                    onClick={redoEdit}
+                    disabled={!canRedoEdit}
+                    title="重做（Ctrl+Shift+Z / Ctrl+Y）"
+                    data-testid="redo-edit"
+                  >
+                    重做
+                  </button>
+                  <button
+                    type="button"
+                    className="px-btn px-btn-sm"
+                    onClick={clearEdits}
+                    disabled={editedCount === 0}
+                    title="把所有手改格子恢复成引擎生成的样子（可撤销）"
+                    data-testid="clear-edits"
+                  >
+                    还原
+                  </button>
+                </div>
+
+                {editedCount > 0 && (
+                  <span
+                    className="px-tag px-tag-gold"
+                    style={{ fontSize: 10 }}
+                    data-testid="tag-edited"
+                  >
+                    手改 {editedCount} 格
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ---------------- 刷区域工具条（只在父组件接管 brushes 时出现） ---------------- */}
+          {brushEnabled && brushMode && (
         <div
           className="px-panel-flat flex flex-wrap items-center gap-x-3 gap-y-2 px-2.5 py-2"
           role="region"
@@ -1144,8 +1319,17 @@ export function PatternCanvas({
         </p>
       )}
 
-      {/* ---------------- 画布区 ---------------- */}
-      <div
+          {/*
+            画布外框：单独包一层，只为了给手机色板一个**不参与排版**的定位父级。
+
+            手机色板用 absolute 浮在画布上（见下面 trayOpen 的浮层），如果直接
+            挂在画布滚动容器里，absolute 会跟着画布内容一起滚走；挂在编辑工具条
+            那层又会把工具条盖住。所以这里多一层 relative 的壳，浮层贴在画布
+            上沿，画布高度完全不被它推挤。
+          */}
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            {/* ---------------- 画布区 ---------------- */}
+            <div
         ref={scrollRef}
         tabIndex={0}
         onKeyDown={onKeyDown}
@@ -1432,6 +1616,246 @@ export function PatternCanvas({
 
           </div>
         </div>
+            </div>
+
+            {/*
+              手机色板：**覆盖**在画布上的浮层，不推挤画布高度。
+
+              为什么不选"展开时压缩画布"：压缩那条路已经在原来横条版里试过了
+              —— 92px 的横条把 390×844 的画布挤到只剩 216px 高，正好落进
+              "看不清也点不准"的区间。浮层方案下画布高度完全不变，色板占的
+              是用户"正在选色、暂时不画"的那几秒，选完收起即可。
+
+              定位在这一层（画布外壳）而不是画布滚动容器里：后者会跟着画布
+              内容一起滚走；也不在工具条那层，否则会盖住工具条。
+
+              **铺满画布区**（inset-0）而不是只占顶上一条：手机画布区本身只有
+              约 207px 高，浮层若只取 46% 就只剩 95px —— 28px 的色块只放得下
+              两行，291 色要翻二十屏。铺满之后色块区有 150px 以上，一屏能看
+              6 行，翻五屏左右看完。代价是选色时看不见画布，但这本来就是
+              "先选色、再回去画"的两段式操作，收起即恢复。
+            */}
+            {!isDesktop && editEnabled && editActive && trayOpen && (
+              <div
+                className="px-panel absolute inset-0 z-30 flex flex-col"
+                style={{
+                  background: 'var(--paper-raised)',
+                  boxShadow: 'var(--shadow-px)',
+                }}
+              >
+                <div className="flex items-center gap-2 px-2 py-1.5">
+                  {/*
+                    当前色大样也在手机上出现，但只在这个浮层里 —— 平时常驻
+                    会白占 40px 高度，而那正是手机上最缺的东西。选色时用户
+                    的目光本来就在这块面板上，把色号/hex/RGB 放这里正好。
+                  */}
+                  {currentBead ? (
+                    <PixelSwatch hex={currentBead.hex} size={SWATCH_MOBILE} />
+                  ) : (
+                    <span
+                      style={{
+                        width: 28,
+                        height: 28,
+                        flex: 'none',
+                        background: 'var(--paper-sunken)',
+                        border: '2px solid var(--line-strong)',
+                        display: 'inline-block',
+                      }}
+                    />
+                  )}
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <span
+                      className="font-px text-[12px] leading-none font-bold"
+                      style={{ color: 'var(--ink)' }}
+                    >
+                      {currentBead?.code ?? '—'}
+                      <span
+                        className="ml-1.5 text-[9px] font-normal tabular-nums"
+                        style={{ color: 'var(--ink-3)' }}
+                      >
+                        {currentBead ? currentBead.hex.toUpperCase() : ''}
+                      </span>
+                    </span>
+                    <span
+                      className="font-px text-[9px] leading-none tabular-nums"
+                      style={{ color: 'var(--ink-3)' }}
+                    >
+                      {currentBead
+                        ? `RGB ${currentBead.rgb.r},${currentBead.rgb.g},${currentBead.rgb.b} · 共 ${brandColors.length} 色`
+                        : `共 ${brandColors.length} 色`}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="px-btn px-btn-sm"
+                    onClick={() => setTrayOpen(false)}
+                    title="收起色板"
+                  >
+                    收起
+                  </button>
+                </div>
+                <div
+                  ref={trayRef}
+                  className="px-inset min-h-0 flex-1 overflow-y-auto p-1.5"
+                  data-testid="color-tray"
+                  aria-label="品牌色卡"
+                  style={{ display: 'flex', flexWrap: 'wrap', alignContent: 'flex-start', gap: 4 }}
+                >
+                  {brandColors.map((bead) => {
+                    const active = bead.code === currentCode;
+                    return (
+                      <PixelSwatch
+                        key={bead.code}
+                        hex={bead.hex}
+                        code={bead.code}
+                        /*
+                          手机上 22px 是"看"的尺寸，不是"点"的尺寸：手指落点
+                          有 8–10px 抖动，22px 的方块点准一格很费劲。28px 是
+                          能稳定点中的下限，再大就一屏放不下几个色了。
+                        */
+                        size={SWATCH_MOBILE}
+                        selected={active}
+                        title={`${bead.code} · ${bead.hex.toUpperCase()}（${bead.rgb.r},${bead.rgb.g},${bead.rgb.b}）`}
+                        onClick={() => setCurrentCode(bead.code)}
+                      />
+                    );
+                  })}
+                  {brandColors.length === 0 && (
+                    <span className="text-[11px]" style={{ color: 'var(--ink-3)' }}>
+                      这个品牌没有色卡数据
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/*
+            手机端不额外加「当前色」横条。
+            390×844 上编辑态的画布只剩 200 出头，下方再挂一行 40px 就把它
+            压到 160 —— 那正是这次要修的问题。当前色的信息放进色板浮层的
+            头部（见上面的浮层），不常驻、不占高度；平时 tool 按钮上的
+            16px 小色块 + 色号已经够提示"我现在拿的是什么"。
+          */}
+        </div>
+
+        {/*
+          桌面端色板竖栏。
+
+          宽度 200px 是量出来的：291 色要在大约两屏内看完，同时不能把画布压窄
+          —— 1244px 的中栏里，198px 侧栏 + 2px 边框 + 8px 间隙之后，画布仍有
+          约 1030px，方形图能撑到 1000 以上。再宽就明显开始抢画布了。
+
+          它是 flex-none：画布列 flex-1 吃掉其余宽度，所以"侧栏多宽"与"画布多高"
+          完全无关 —— 这正是原来横条版做不到的。
+        */}
+        {isDesktop && editEnabled && editActive && trayOpen && (
+          <aside
+            className="px-panel flex flex-none flex-col"
+            aria-label="品牌色板"
+            style={{ width: TRAY_RAIL_W }}
+          >
+            {/* 当前色大样：32×32 色块 + 色号 + hex + RGB */}
+            <div
+              className="flex items-center gap-2 border-b-2 px-2 py-2"
+              style={{ borderColor: 'var(--line-strong)' }}
+            >
+              {currentBead ? (
+                <PixelSwatch hex={currentBead.hex} size={32} />
+              ) : (
+                <span
+                  style={{
+                    width: 32,
+                    height: 32,
+                    background: 'var(--paper-sunken)',
+                    border: '2px solid var(--line-strong)',
+                    display: 'inline-block',
+                    flex: 'none',
+                  }}
+                />
+              )}
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <span
+                  className="font-px text-[14px] leading-none font-bold"
+                  style={{ color: 'var(--ink)' }}
+                >
+                  {currentBead?.code ?? '—'}
+                </span>
+                {currentBead && (
+                  <>
+                    <span
+                      className="font-px text-[10px] leading-none tabular-nums"
+                      style={{ color: 'var(--ink-2)' }}
+                    >
+                      {currentBead.hex.toUpperCase()}
+                    </span>
+                    <span
+                      className="font-px text-[10px] leading-none tabular-nums"
+                      style={{ color: 'var(--ink-3)' }}
+                    >
+                      RGB {currentBead.rgb.r},{currentBead.rgb.g},{currentBead.rgb.b}
+                    </span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* 色号网格：7 列 × 24px + 2px 间隙 = 侧栏内宽正好吃满 */}
+            <div
+              ref={trayRef}
+              className="min-h-0 flex-1 overflow-y-auto px-2 py-2"
+              data-testid="color-tray"
+              aria-label="品牌色卡"
+            >
+              {colorGroups.map((group) => (
+                <div key={group.prefix} className="mb-1.5">
+                  <div
+                    className="font-px sticky top-0 z-10 mb-1 text-[9px] uppercase tracking-[0.12em]"
+                    style={{
+                      color: 'var(--ink-3)',
+                      background: 'var(--paper-raised)',
+                      paddingBlock: 1,
+                    }}
+                  >
+                    {group.prefix}
+                  </div>
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: `repeat(7, ${SWATCH_DESKTOP}px)`,
+                      gap: 2,
+                    }}
+                  >
+                    {group.colors.map((bead) => {
+                      const active = bead.code === currentCode;
+                      return (
+                        <span
+                          key={bead.code}
+                          ref={active ? activeSwatchRef : undefined}
+                          style={{ display: 'inline-flex' }}
+                        >
+                          <PixelSwatch
+                            hex={bead.hex}
+                            code={bead.code}
+                            size={SWATCH_DESKTOP}
+                            selected={active}
+                            title={`${bead.code} · ${bead.hex.toUpperCase()}（${bead.rgb.r},${bead.rgb.g},${bead.rgb.b}）`}
+                            onClick={() => setCurrentCode(bead.code)}
+                          />
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              {brandColors.length === 0 && (
+                <span className="text-[11px]" style={{ color: 'var(--ink-3)' }}>
+                  这个品牌没有色卡数据
+                </span>
+              )}
+            </div>
+          </aside>
+        )}
       </div>
 
       {/*
@@ -1446,6 +1870,25 @@ export function PatternCanvas({
         只保留 DPR 那一项的信息量没有替代品，但它是给开发核对渲染质量的，
         不是用户要看的东西 —— 真要查，devtools 里量一下更准。
       */}
+
+      {/*
+        缩放控件搬到 04「图纸」标题栏右侧的空槽里。
+        见上方 zoomGroup 的注释：状态留在本组件，只有渲染位置搬走。
+
+        只在桌面端搬：那块槽位在 lg 以下被 `hidden` 掉（手机上标题栏连
+        「拖动画布可平移…」那句都放不下，塞六个缩放按钮会把标题挤成一团），
+        此时上面的 `!(zoomSlot && isDesktop)` 条件会把它退回工具条内联渲染。
+        portal 这边必须用同一个条件，否则窄屏会渲染两遍。
+      */}
+      {zoomSlot &&
+        isDesktop &&
+        createPortal(
+          <div className="flex items-center gap-2.5">
+            {zoomGroup}
+            {toolbarButtons}
+          </div>,
+          zoomSlot,
+        )}
 
       {/* 刷子模式的反向命中提示：告诉用户"这一笔会把这处变成什么" */}
       {brushMode &&

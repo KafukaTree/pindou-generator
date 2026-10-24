@@ -226,6 +226,16 @@ export default function Home() {
    * onActivityChange 上报。
    */
   const [canvasActivity, setCanvasActivity] = useState<CanvasActivity>('idle');
+  /*
+   * 「04 图纸」标题栏右侧的缩放槽位节点。
+   *
+   * 用回调 ref 直接持有 DOM 节点、再作为 prop 交给 PatternCanvas，而不是让它
+   * 自己 `document.getElementById(...)` 去查：查 DOM 得放在挂载后的 effect 里，
+   * 那会多一次同步渲染（eslint 的 react-hooks/set-state-in-effect），而且父层
+   * 重排标题栏后节点可能被换掉、画布手里就成了悬空引用。回调 ref 由 React
+   * 在节点挂载/卸载时各调一次，天然同步。
+   */
+  const [zoomSlot, setZoomSlot] = useState<HTMLDivElement | null>(null);
   const hasCanvasImage = sourceDataUrl !== null || blankCanvas !== null;
 
   /*
@@ -936,16 +946,27 @@ export default function Home() {
                */
               action={
                 hasImage ? (
+                  /*
+                   * 折叠按钮的尺寸。
+                   *
+                   * 原来是 `!px-1 !py-0.5` + 14px 图标 ≈ 22×22，用户反馈
+                   * 「这个折叠按钮也可以大一点」—— 22px 是个"能点中但试探
+                   * 一次"的尺寸，而它是个高频开关（收左栏看大图时每次都要按）。
+                   * 现在撑到 28×28（图标 16px + 6px 内边距），既是 WCAG 2.5.8
+                   * 的 24px 下限之上，又能和右侧的 hint 文字在视觉重量上对齐 ——
+                   * 一个纯图标按钮摆在标题栏最右端，太小会像块污渍。
+                   */
                   <button
                     type="button"
                     onClick={toggleFocus}
-                    className="px-btn px-btn-ghost !px-1 !py-0.5"
+                    className="px-btn px-btn-ghost"
+                    style={{ width: 32, height: 32, padding: 0, flex: 'none' }}
                     aria-pressed={leftCollapsed}
                     title="收起左侧面板，让图纸占满整行"
                     aria-label="收起左侧的图片与参数面板"
                     data-testid="collapse-left"
                   >
-                    <PanelLeftClose className="h-3.5 w-3.5" aria-hidden />
+                    <PanelLeftClose className="h-[18px] w-[18px]" aria-hidden />
                   </button>
                 ) : undefined
               }
@@ -1077,36 +1098,57 @@ export default function Home() {
                   <h2 className="font-display text-[15px] font-bold tracking-tight">
                     图纸
                   </h2>
+                  {/*
+                    尺寸在 xl 以下只留格数、不留厘米数：标题栏要塞下整条
+                    画布工具条，1024–1279 那段宽度差最后这几十像素就会
+                    折行，而折行等于把省下来的那一行又还回去了。
+                    格数是拼豆规格的硬信息（决定板子张数），厘米是估算，
+                    缩到 xl 以上再显示。
+                  */}
                   {displayPattern && (
                     <span className="font-px text-[10px] tracking-wide text-[var(--ink-3)]">
                       {displayPattern.cols} × {displayPattern.rows}
-                      {sizeCm ? ` · 约 ${sizeCm.w} × ${sizeCm.h} cm` : ''}
+                      {sizeCm ? (
+                        <span className="hidden xl:inline">
+                          {` · 约 ${sizeCm.w} × ${sizeCm.h} cm`}
+                        </span>
+                      ) : null}
                     </span>
                   )}
                 </div>
+
                 {/*
-                 * 折叠开关已经挪到左栏自己的标题栏里（见 Section 01 的
-                 * action）。这里只在**已收起**时留一个展开入口 —— 收起后
-                 * 左栏整体不存在，它的标题栏也没了，必须有个地方能把人
-                 * 请回去。收起态的展开路径有两条：这条按钮 + 屏幕最左侧
-                 * 那条 24px 竖边条（见下）。
+                 * 画布工具条的槽位 —— 整条工具条（缩放组 + 刷区域/编辑/色号/
+                 * 网格/标尺）由 PatternCanvas 通过 portal 送进来。
+                 *
+                 * 用户分两次标的：先把 Zoom 组指到这块空白（「这个东西位置
+                 * 不好，占了一行，下面就会少一行空间给面板」），Zoom 搬走后又
+                 * 圈出剩下那排按钮说「这个也移植到上面那一行吧，不然看起来
+                 * 很难受，能省空间就省」。合起来就是整条工具条上移，画布上方
+                 * 那 31px + 8px gap 全部还给画布。
+                 *
+                 * 容量核算（1600px 视口实测）：标题栏 1240px 宽，左侧标题组
+                 * 224 + 缩放组 237 + 按钮组 294 + gap 28 = 783，余量 457px。
+                 * 那句「拖动画布可平移…」的说明按用户要求删掉了
+                 * （「这个删了，不用提示的」），正好腾出位置。
+                 *
+                 * 窄屏放不下，所以槽位带 `hidden lg:flex`；PatternCanvas 用同一个
+                 * `isDesktop` 判断，窄屏与无槽位时退回画布上方内联渲染。
                  */}
-                {hasImage && leftCollapsed && (
-                  <button
-                    type="button"
-                    onClick={toggleFocus}
-                    className="px-btn px-btn-ghost px-btn-sm ml-auto hidden shrink-0 lg:inline-flex"
-                    aria-pressed={leftCollapsed}
-                    title="展开左侧的图片与参数面板"
-                    data-testid="expand-left"
-                  >
-                    <PanelLeftOpen className="h-3.5 w-3.5" aria-hidden />
-                    展开左栏
-                  </button>
-                )}
-                <p className="hidden text-[11px] text-[var(--ink-3)] md:block">
-                  拖动画布可平移，滚轮缩放，悬停看色号
-                </p>
+                <div
+                  ref={setZoomSlot}
+                  className="ml-auto hidden shrink-0 items-center gap-1.5 lg:flex"
+                />
+                {/*
+                 * 这里原本还有一个「展开左栏」按钮（收起态才出现）。
+                 *
+                 * 用户反馈：「当折叠之后，右侧也有一个折叠回去的按钮，其实不需要，
+                 * 折叠展开的按钮在最左边有了，右侧的可以删去」—— 折起来之后，
+                 * 展开入口只需**一个**：屏幕最左侧那条 24px 竖边条（见上），它
+                 * 就长在左栏原来占位的地方，视线往左一看就在，符合"就地操作"。
+                 * 再在画布标题栏右侧放第二个，反而让人两个都不确定该点哪个，
+                 * 而且它还跟缩放控件、右侧说明抢那一行。
+                 */}
               </div>
 
               <div className="relative flex min-h-0 flex-1 flex-col px-3 pt-3 pb-3">
@@ -1144,6 +1186,7 @@ export default function Home() {
                     onEditsChange={setEdits}
                     isWorking={isWorking}
                     onActivityChange={setCanvasActivity}
+                    zoomSlot={zoomSlot}
                   />
                 )}
 
@@ -1282,16 +1325,31 @@ function Section({
   return (
     <section className={cn('px-panel', className)}>
       <div className="flex items-center justify-between gap-2 border-b-2 border-[var(--line)] px-4 py-2.5">
-        <div className="flex items-baseline gap-2.5">
-          <span className="px-section-no">{index}</span>
-          <h2 className="px-section-title">{title}</h2>
+        <div className="flex min-w-0 items-baseline gap-2.5">
+          <span className="px-section-no shrink-0">{index}</span>
+          {/*
+            标题不许折行。
+            动作按钮放大到 32px 后，左栏 320px 宽时标题栏的可用宽度被压掉
+            10px，「放一张图」就会被拆成「放一张 / 图」两行 —— 标题栏高度也
+            跟着跳。宁可让右侧的 hint 先截断（它本来就是次要说明），也要保证
+            标题始终是一行：它是这一块唯一的识别标志。
+          */}
+          <h2 className="px-section-title whitespace-nowrap">{title}</h2>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
-          {action}
+        {/*
+          * hint 在前、action 在后。
+          *
+          * 反过来的话折叠按钮会挤在「JPG / PNG / WEBP / GIF」这类说明文字的
+          * 左边，落在标题栏中间偏右的位置 —— 用户截图标注指的就是这个：折叠
+          * 按钮应该贴在**标题栏最右端**（"应该放在这里吧，会好看一点"）。
+          * 动作按钮固定在右边缘，说明文字往左让位，右边缘也就成了一条整齐的
+          * 竖线，各 section 的按钮位置对得上。
+          */}
+        <div className="flex min-w-0 shrink items-center gap-1.5">
           {hint && (
             <span
               className={cn(
-                'font-px text-[9.5px] tracking-wide',
+                'font-px truncate text-[9.5px] tracking-wide',
                 busy ? 'text-[var(--clay)]' : 'text-[var(--ink-3)]',
               )}
             >
@@ -1301,6 +1359,7 @@ function Section({
               {hint}
             </span>
           )}
+          <span className="shrink-0">{action}</span>
         </div>
       </div>
       <div className="px-4 py-4">{children}</div>

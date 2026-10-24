@@ -105,6 +105,23 @@ const MIN_READABLE_CELL = 6;
  */
 const NARROW_VIEWPORT = 640;
 
+/**
+ * 编辑态的"别高到离谱"上限，按可见高度的倍数表示。
+ *
+ * 宽度优先会把"很宽很扁"的图算出离谱的高度（300×40 的横幅在 1000px 宽里
+ * 是 30px/格 → 1200px 高），所以要有一条防线。但这条线必须**松**：
+ *
+ *  - 窄窗口（<64rem）里 `.wb-mid` 是 54dvh 的定高盒子，编辑工具条再吃掉
+ *    52px，滚动视口往往只剩 220–310px。按 1.5 倍算只有 330–465px，64×54
+ *    的图会被压回 6–8px/格、画布 384 宽，而容器有 642 宽 —— 横向空掉
+ *    260px，格子还点不准。用户截图抱怨的"面板太小不好操作"就是这个。
+ *  - 3 倍能让格子回到 9–15px、画布宽度基本吃满容器，代价是纵向要滚一屏
+ *    多。对"下笔涂格子"这个动作来说，格子大远比"不用滚"重要。
+ *
+ * 只有真正极端的长条（300×40 这种）才会被这条线收住，那时按高度缩是对的。
+ */
+const EDIT_TALL_FACTOR = 3;
+
 /** 色号字号上限（CSS px）。放大到 4× 时字也该跟着长，但不必无限长 */
 const MAX_CODE_FONT = 30;
 
@@ -1268,6 +1285,14 @@ export interface UsePatternCanvasOptions {
   onCurrentCodeChange?: (code: string) => void;
   /** 初始工具（不传默认 pencil） */
   initialTool?: EditTool;
+  /**
+   * 编辑模式是否激活（画布进入"手绘/橡皮/取色/油漆桶"状态）。
+   *
+   * 只影响**格子尺寸的计算策略**：编辑时按宽度优先，让画板占主要面积；
+   * 非编辑时仍是"宽高取小值、一打开看全整图"。两者是不同的使用场景，
+   * 不能共用一套 fit。
+   */
+  editing?: boolean;
 }
 
 export function usePatternCanvas(
@@ -1284,6 +1309,7 @@ export function usePatternCanvas(
     onEditsChange,
     onCurrentCodeChange,
     initialTool,
+    editing = false,
   } = options;
 
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1786,6 +1812,20 @@ export function usePatternCanvas(
    * 高度约束只在 useFill 成立、且 hostHeight 是有效值时启用：非 fill 模式
    * 高度本来就由内容决定，拿它算会形成反馈环。
    */
+  /*
+   * 编辑态：宽度优先，让画板吃满可用面积。
+   *
+   * 和上面的默认策略是**两种用途**，所以分开算：
+   *  - 非编辑（看图纸）：宽高取小值，一打开就能看全整张图；
+   *  - 编辑（下笔）：格子要够大好点，画板要占主要面积。竖长的图按高度
+   *    算会把格子压到 10px 而横向空掉一半，用户原话就是冲着这个来的
+   *    （"应该是画板占主要的面板"）。
+   *
+   * 编辑态仍然不是无脑按宽度：给一个"别高到离谱"的松上限（
+   * EDIT_TALL_FACTOR × 可视高度）。超过就按高度收 —— 否则 300×60 的
+   * 横幅图会算出 3000px 高的画布，用户得滚一整屏才看得到底边。
+   * 方形图上这个上限永远不会生效，格子直接按宽度铺满，画布自然 1:1。
+   */
   const cellPx = useMemo(() => {
     if (!pattern) return 16;
     const rulerX = showRulers ? RULER_LEFT : 0;
@@ -1795,6 +1835,41 @@ export function usePatternCanvas(
     const fitW = Math.floor(availW / Math.max(1, pattern.cols));
 
     let fit = fitW;
+    if (editing) {
+      /*
+       * 编辑态：**宽度优先**，画板吃满可用宽度。
+       *
+       * 默认策略（下面那段）是"宽高取小值、整图可见"，那对看图是对的，对
+       * 下笔是错的：64×54 的图在 1000px 宽的中栏里按高度只能给 12px/格、
+       * 画布 768 宽 —— 横向空掉 240px，格子还小。用户原话就是冲这个来的
+       * （"应该是画板占主要的面板"）。
+       *
+       * 唯一的守门是"别把画布拉到一屏半以上"：很竖的图（比如 20×200）按
+       * 宽度算出 48px/格就是 9600px 高，那不叫占主要面积，叫没法用。
+       * 所以 fit 与 fitH × EDIT_TALL_FACTOR 取小 —— 方形图和常见的
+       * 4:3、3:4 作品都碰不到这条线，只有极端长条才会被高度收回来。
+       *
+       * 窄屏（< NARROW_VIEWPORT，如 390 宽手机）不需要特别处理：那里
+       * 宽度本身就是最紧的约束，fitW 算出来就是"整图铺满宽度"，与默认
+       * 策略同解，所以不加分支也不会把移动端改坏。
+       */
+      if (useFill && viewportH > 0) {
+        const rulerY = showRulers ? RULER_TOP : 0;
+        const availH = Math.max(80, viewportH - FRAME_BORDER - rulerY);
+        const fitH = Math.floor(availH / Math.max(1, pattern.rows));
+        const tallCap = Math.floor(fitH * EDIT_TALL_FACTOR);
+        if (fit > tallCap) fit = tallCap;
+      }
+      /*
+       * 下限仍是 MIN_FIT_CELL，**不是** MIN_EDIT_CELL：地板值一抬就会超过
+       * 宽度容纳的上限（实测 1280 宽 + 色板竖栏时 64 列只算得出 10px/格，
+       * 抬到 12 就变成 768px 画布、横向溢出容器）。格子的"好不好点"由
+       * 缩放解决，不由地板值解决。
+       */
+      const baseEdit = Math.max(MIN_FIT_CELL, Math.min(MAX_FIT_CELL, fit));
+      return Math.max(2, Math.round(baseEdit * zoom));
+    }
+
     if (useFill && viewportH > 0) {
       const rulerY = showRulers ? RULER_TOP : 0;
       // 横向滚动条只有在真的溢出时才占位，先按不出现算，留 1 格余量即可
@@ -1817,7 +1892,7 @@ export function usePatternCanvas(
 
     const base = Math.max(MIN_FIT_CELL, Math.min(MAX_FIT_CELL, fit));
     return Math.max(2, Math.round(base * zoom));
-  }, [pattern, hostWidth, viewportW, viewportH, showRulers, zoom, useFill]);
+  }, [pattern, hostWidth, viewportW, viewportH, showRulers, zoom, useFill, editing]);
 
   const metrics = useMemo<CanvasMetrics | null>(() => {
     if (!hasPattern || !pattern) return null;
@@ -3094,6 +3169,16 @@ export function usePatternCanvas(
     canvasRef,
     overlayRef,
     maskRef,
+    /**
+     * host 的实测尺寸。
+     *
+     * 加进返回值是为了让调用方能在**不看滚动容器**的前提下判断"这块地方够
+     * 不够宽放一条侧栏"。不能用滚动容器的宽度判：侧栏一出现滚动容器就变窄，
+     * 判据跟着翻转，布局会自己抖起来。host 包着侧栏，宽度与侧栏在不在无关，
+     * 是稳定的判据。
+     */
+    hostWidth,
+    hostHeight,
     metrics,
     zoom,
     setZoom,
