@@ -1270,7 +1270,14 @@ export default function Home() {
       </main>
 
       {/* ============================ 状态条 ============================ */}
-      <footer className="relative z-10 shrink-0 border-t-2 border-[var(--line)] bg-[var(--paper-raised)]/80">
+      {/*
+        页脚与页头用同一个处理：`/92 + backdrop-blur`。
+        原来这里是 `/80` 且没有模糊，而背景布景（PixelGarden）是 full-bleed
+        的 —— 底部的草丛和花朵正好压在页脚这条 32px 的带子上，11px 的
+        `--ink-3` 灰字直接骑在粉色花瓣上，截图里几乎读不出来。
+        不改成完全不透明是因为留一点布景透出来更好看，92% + 模糊就够了。
+      */}
+      <footer className="relative z-10 shrink-0 border-t-2 border-[var(--line)] bg-[var(--paper-raised)]/92 backdrop-blur-[2px]">
         <div className="flex items-center justify-between gap-x-4 px-4 py-1.5">
           {/* 手机上底栏折成两行会吃掉可视高度（还挤掉图纸），所以只留最短的一句，
               完整说明放到 sm 以上 */}
