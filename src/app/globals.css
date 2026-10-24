@@ -333,6 +333,71 @@
     box-shadow: inset 2px 2px 0 0 rgba(0, 0, 0, 0.35);
   }
 
+  /*
+   * 常驻滚动条：给画布区用。
+   *
+   * 用户原话：「这个框的那个滚动条我觉得可以常驻显示，要不然开画笔的时候，
+   * 和滚轮放大还是上下移动有点分不清，有那个滚动条常驻就可以直接操作滚动条」。
+   *
+   * 默认的滚动条是**覆盖式**的（overlay scrollbar）：不滚动时完全隐形，
+   * 鼠标移开就淡出。画布区偏偏是最需要它常驻的地方 —— 那里滚轮既要缩放手
+   * 又要滚动内容（wheel 在 surface 上是缩放、在留白上是滚动），没有一条可见
+   * 的"这里可以滚"的指示，用户根本分不清当前滚动位置和可用范围，也没法用
+   * 鼠标直接拖。
+   *
+   * **关键的一条：`scrollbar-color: auto` 不能省。**
+   *
+   * 全局 `html { scrollbar-color: var(--line) transparent }` 是**继承属性**，
+   * 会落到页面上每一个滚动容器上。Chromium 的规则是：只要元素上能算出
+   * 非 auto 的 scrollbar-color，就整体切到「覆盖式」滚动条，`::-webkit-scrollbar`
+   * 那套自定义样式**全部失效**、并且**不预留布局空间**（实测 offsetWidth -
+   * clientWidth 恒为 4＝只剩 2px×2 边框，滚动条本身一个像素都不占）。
+   *
+   * 所以这里必须把继承来的颜色显式打回 auto：一旦回 auto，Chromium 恢复
+   * 经典滚动条 —— 占 12px 布局空间、常驻可见 —— 而 `::-webkit-scrollbar`
+   * 样式也重新生效，于是颜色、像素硬边都还是我们的。实测同一元素：
+   *   scrollbar-color: <继承值>  → reserve 0px、覆盖式、看不见
+   *   scrollbar-color: auto      → reserve 12px、经典常驻、可拖
+   *
+   * 之所以写成独立类而不是改全局 `::-webkit-scrollbar`：全局那条是像素块
+   * 风格（10px、硬边），色板、左栏都在用，把它们一起改成 12px 原生条会
+   * 让整页的像素风崩掉。只有画布区需要"能看见、能拖"这件事。
+   */
+  .px-scroll-always {
+    overflow-y: scroll;
+    scrollbar-width: auto;
+    /* 打掉从 html 继承来的覆盖式设置，恢复经典滚动条（占位 + 常驻） */
+    scrollbar-color: auto;
+  }
+  .px-scroll-always::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  .px-scroll-always::-webkit-scrollbar-track {
+    background: var(--paper-sunken);
+    border-left: 2px solid var(--line);
+  }
+  .px-scroll-always::-webkit-scrollbar-thumb {
+    background: var(--line-strong);
+    border: 2px solid var(--paper-sunken);
+    /* 拖起来要有点反馈：默认的 thumb 是灰的，按住时跟 track 分不开 */
+    min-height: 28px;
+  }
+  /*
+   * hover / active 用强调色而不是 var(--ink-3)：ink-3 在浅色主题下
+     比 line-strong 还浅（对纸面只有 2.86:1），悬停反而更难看见。
+     clay 在两个主题下分别是 4.60:1 / 8.28:1，berry 是 6.23:1 / 7.62:1，
+     都过 WCAG 非文本 3:1 线，且"越按越深"的方向和直觉一致。 */
+  .px-scroll-always::-webkit-scrollbar-thumb:hover {
+    background: var(--clay);
+  }
+  .px-scroll-always::-webkit-scrollbar-thumb:active {
+    background: var(--berry);
+  }
+  .px-scroll-always::-webkit-scrollbar-corner {
+    background: var(--paper-sunken);
+  }
+
   /* 透明格子底（棋盘） */
   .px-checker {
     background-image:
