@@ -944,6 +944,18 @@ export function PatternCanvas({
       if (e.key === 'z' || e.key === 'Z') {
         e.preventDefault();
         if (e.shiftKey) redoEdit();
+        /*
+         * 草稿优先 —— 与刷区域工具条上那颗「撤销」按钮**必须是同一套语义**。
+         *
+         * 原来这里无条件调 undoEdit()，绕开了 undoBrush() 的草稿优先逻辑，
+         * 于是同一个动作在按钮上和键盘上后果不同：草稿非空时按 Ctrl+Z 毫无
+         * 反应（文档历史里没东西可退），而如果此时已经落地过别的改动，它
+         * 会退掉**那条已经生效的**改动 —— 用户以为在撤草稿，实际撤的是
+         * 别的东西，且草稿还原封不动待在画布上。
+         *
+         * 只有草稿为空时才轮到文档历史（undoBrush 内部就是这么分的）。
+         */
+        else if (brushMode && pendingCount > 0) undoBrush();
         else undoEdit();
       } else if (e.key === 'y' || e.key === 'Y') {
         e.preventDefault();
@@ -952,7 +964,7 @@ export function PatternCanvas({
     };
     window.addEventListener('keydown', onWindowKey);
     return () => window.removeEventListener('keydown', onWindowKey);
-  }, [undoEdit, redoEdit]);
+  }, [undoEdit, redoEdit, brushMode, pendingCount, undoBrush]);
 
   /*
    * 色板浮层打开时的 Esc。
@@ -1460,8 +1472,8 @@ export function PatternCanvas({
                     className="px-btn px-btn-sm inline-flex items-center justify-center"
                     style={{ width: 28, height: 26, padding: 0 }}
                     onClick={clearEdits}
-                    disabled={editedCount === 0}
-                    title="把所有手改格子恢复成引擎生成的样子（可撤销）"
+                    disabled={editedCount === 0 && appliedCount === 0}
+                    title="把手绘格子和区域算法一起恢复成引擎生成的样子（可撤销）"
                     aria-label="还原"
                     data-testid="clear-edits"
                   >

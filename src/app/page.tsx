@@ -1330,9 +1330,25 @@ export default function Home() {
   });
 
   /** 「还原」= 把全部手改格子擦掉。走 jumpTo，所以撤销得回来 */
+  /*
+   * 「还原」= 回到引擎生成的原始结果，手绘和区域算法**一起**清掉。
+   *
+   * 只清手绘是错的：用户眼里"我改过这张图"包含两种操作 —— 一格一格涂，
+   * 和刷一块区域让算法重算。手绘 + 区域混合时若只清手绘，就再也没有任何
+   * 一个按钮能一次回到原始结果（区域的「清空」只在刷区域态可见，而且它
+   * 也只清区域）。用户点「还原」要的就是"回到没动过的样子"。
+   *
+   * 走的还是 jumpTo，所以整批可撤销 —— 手滑点了还原能退回来。
+   */
   const handleResetEdits = useCallback(() => {
-    if (editCount(docSnapshot.edits) === 0) return;
-    docHistory.jumpTo({ ...docSnapshot, edits: EMPTY_EDITS });
+    const hasEdits = editCount(docSnapshot.edits) > 0;
+    const hasBrushes = (docSnapshot.brushes ?? []).length > 0;
+    if (!hasEdits && !hasBrushes) return;
+    docHistory.jumpTo({
+      ...docSnapshot,
+      edits: EMPTY_EDITS,
+      brushes: [],
+    });
   }, [docHistory, docSnapshot]);
 
   /*
