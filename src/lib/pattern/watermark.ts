@@ -79,6 +79,26 @@ const BAND_SHARE_HIGH = 0.85;
 const MIN_DEV_FRAC = 0.05;
 const MIN_BAND_RUN = 8;
 
+/*
+ * 门禁：偏离占比的**上限**。
+ *
+ * 这条是补测出来的，原版只有下限，结果像素画全线误报。实测：
+ *
+ *   真水印（4 张 AI 直出图）  devFrac 8.4% / 8.5% / 10.6% / 12.1%
+ *   无水印像素画（12 张）     devFrac 38.6% ~ 82.6%  → 全部被误判为有水印
+ *
+ * 误报的 12 张里有 8 张是自建的"右下角故意塞满色块"的硬负例，信度
+ * 打出 1.0（满分），比真水印的 0.63–0.77 还高 —— 说明"更大的偏离面积"
+ * 在原判据里是**加分项**，方向正好反了。
+ *
+ * 为什么会反：水印是一层薄字**压在同一片底色上**，偏离像素只能是少数；
+ * 而右下角颜色杂乱说明那里是画面内容本身，不是压上去的一层字。所以
+ * 偏离占比超过 25% 时，"底色"这个参照系根本没成立，整段统计无效。
+ *
+ * 25% 的位置：真水印最高 12.1%、误报最低 38.6%，取中间偏上留足余量。
+ */
+const MAX_DEV_FRAC = 0.25;
+
 /**
  * 检测右下角水印。
  *
@@ -191,7 +211,7 @@ export function detectWatermark(img: ImageData): WatermarkResult {
   }
 
   const devFrac = picked / (cw * ch);
-  if (devFrac < MIN_DEV_FRAC || bandRun < MIN_BAND_RUN) {
+  if (devFrac < MIN_DEV_FRAC || devFrac > MAX_DEV_FRAC || bandRun < MIN_BAND_RUN) {
     return {
       detected: false,
       region: null,
@@ -200,7 +220,9 @@ export function detectWatermark(img: ImageData): WatermarkResult {
       reason:
         devFrac < MIN_DEV_FRAC
           ? `quiet(${(devFrac * 100).toFixed(1)}%)`
-          : `no-band(run ${bandRun})`,
+          : devFrac > MAX_DEV_FRAC
+            ? `busy(${(devFrac * 100).toFixed(1)}%)`
+            : `no-band(run ${bandRun})`,
     };
   }
 

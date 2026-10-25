@@ -38,6 +38,14 @@ export interface FileUploadProps {
   className?: string;
   /** 已选图片的原始尺寸/文件名（父组件传回，用于展示"尺寸"那行） */
   imageInfo?: { width: number; height: number; name: string } | null;
+  /**
+   * 引擎对这张图的识别结论。两者都可能为 null / undefined：
+   * 老会话恢复、空白画布、或还没跑完生成。
+   */
+  detection?: {
+    nativePixel?: { cols: number; rows: number; confidence: number } | null;
+    watermark?: { areaFrac: number } | null;
+  } | null;
 }
 
 /** 12MB —— 再大的手机直出照片先让用户裁一下，比在浏览器里解 60MP 强 */
@@ -90,6 +98,7 @@ export function FileUpload({
   disabled = false,
   className,
   imageInfo = null,
+  detection = null,
 }: FileUploadProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -303,27 +312,68 @@ export function FileUpload({
                       已就绪
                     </span>
                   ) : null}
+                  {/*
+                   * 算法识别结论。
+                   *
+                   * 这两条不是装饰 —— 它们解释"为什么这张图出来的图纸和别
+                   * 的图不一样"：
+                   *   - 认成原生像素画时，管线不走量化，而是直接按原图的
+                   *     格子采样，所以边缘是硬的、颜色数是原图自带的；
+                   *   - 认出水印时，那一片格子会被原样留下来（不清除），
+                   *     用户得知道该用橡皮擦哪。
+                   * 不显示的话，用户只会觉得"这张图好像没处理干净"。
+                   *
+                   * 只在**真的检测到**时才出现。照片走普通管线、什么标记
+                   * 都没有，卡片保持干净 —— 常驻一条"未识别"只会变成噪音。
+                   */}
+                  {detection?.nativePixel ? (
+                    <span
+                      className="px-tag px-tag-clay"
+                      title={`这张原图本身就是 ${detection.nativePixel.cols}×${detection.nativePixel.rows} 格的像素画：按原格子直接采样，不走重采样量化，所以边缘更硬、色数更贴近原图。最终图纸格数仍按你的设定缩放。`}
+                    >
+                      <span aria-hidden className="inline-block h-1.5 w-1.5 bg-[var(--clay)]" />
+                      原生像素画
+                    </span>
+                  ) : null}
+                  {detection?.watermark ? (
+                    <span
+                      className="px-tag px-tag-bloom"
+                      title="右下角检测到 AI 生成水印。图案里对应位置会保留原样，用橡皮擦掉那几格即可（不会自动清除，以免改坏旁边的像素）"
+                    >
+                      <span aria-hidden className="inline-block h-1.5 w-1.5 bg-[var(--bloom)]" />
+                      右下角有水印
+                    </span>
+                  ) : null}
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-1.5">
+              {/*
+               * 两个按钮等宽平分这一行。
+               *
+               * 原来用 flex-wrap + 自适应宽度，左栏 282px 时按钮区只剩
+               * 154px，两个按钮合计 162px 放不下，于是竖着堆成两行 ——
+               * 也不是错，但把一块本来够高的卡片又撑高了 40px。等宽两列
+               * 让它们永远并排，窄到实在放不下时（<150px 按钮区）再靠
+               * min-w-0 + truncate 兜底。
+               */}
+              <div className="flex gap-1.5">
                 <button
                   type="button"
                   onClick={handlePickAnother}
                   disabled={disabled || isReading}
-                  className="px-btn px-btn-sm px-btn-ghost"
+                  className="px-btn px-btn-sm min-w-0 flex-1 justify-center !gap-1 !px-1.5"
                 >
-                  <RefreshCw className="h-3.5 w-3.5" aria-hidden />
-                  换一张
+                  <RefreshCw className="h-3 w-3 shrink-0" aria-hidden />
+                  <span className="whitespace-nowrap">换一张</span>
                 </button>
                 <button
                   type="button"
                   onClick={handleClear}
                   disabled={disabled}
-                  className="px-btn px-btn-sm px-btn-danger"
+                  className="px-btn px-btn-sm px-btn-danger min-w-0 flex-1 justify-center !gap-1 !px-1.5"
                 >
-                  <X className="h-3.5 w-3.5" aria-hidden />
-                  移除
+                  <X className="h-3 w-3 shrink-0" aria-hidden />
+                  <span className="whitespace-nowrap">移除</span>
                 </button>
               </div>
             </div>

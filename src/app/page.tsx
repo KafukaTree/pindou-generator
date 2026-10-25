@@ -1470,6 +1470,31 @@ export default function Home() {
    * 没手改过的图纸重来不心疼；画了格的才需要提醒，并且给出具体数量。
    */
   /*
+   * 把引擎的识别结论整理成 FileUpload 要显示的两种标记。
+   *
+   * 用 `pattern` 而不是 `displayPattern`：描边/手改不会改变"这张图被认成
+   * 什么"，那是生成阶段的一次性结论。用 displayPattern 的话，用户每刷一
+   * 笔都会重算一次 memo（applyEdits 是全量重建），纯属浪费。
+   *
+   * 读的是 meta 而不是重新跑检测 —— 检测已经在 generatePattern 里做过
+   * 一次了，这里只是把结果搬到界面上。
+   */
+  const imageDetection = useMemo(() => {
+    const meta = pattern?.meta;
+    const np = meta?.nativePixel;
+    if (!np) return null;
+    return {
+      nativePixel: np.detected
+        ? { cols: np.cols, rows: np.rows, confidence: np.confidence }
+        : null,
+      watermark:
+        np.watermarkDetected && np.watermarkAreaFrac > 0
+          ? { areaFrac: np.watermarkAreaFrac }
+          : null,
+    };
+  }, [pattern]);
+
+  /*
    * 换尺寸不再是"替换" —— 图案会按比例搬到新画板上，所以警告改成了
    * "搬运说明书"。原来那句「会被替换掉」在保留内容之后就是错的，会让
    * 用户以为画的东西要没了，从而不敢按。
@@ -1817,6 +1842,7 @@ export default function Home() {
                   onClear={handleClear}
                   previewUrl={sourceDataUrl}
                   imageInfo={imageInfo}
+                  detection={imageDetection}
                   disabled={isWorking && !pattern}
                 />
               )}
