@@ -151,7 +151,26 @@ export function MascotBubble({ enabled = true, className }: MascotBubbleProps) {
          * lg 以上居中），放气泡会盖住「拼豆图纸工坊」。这是锦上添花的
          * 细节，不值得为它挤掉站名。
          */
-        'pointer-events-none absolute left-full top-1/2 z-30 ml-2 hidden -translate-y-1/2 lg:block',
+        /*
+         * 挂载点随断点换方向。
+         *
+         * 原来只有 `left-full ... hidden lg:block` —— 也就是说**窗口窄于
+         * 1024px 时气泡整个不渲染**。用户截图（约 970px 的单栏布局）里
+         * 「小宠物不说话了」，不是随机间隔没轮到，是它从来没被显示过。
+         *
+         * 为什么一开始要藏：lg 以下标题就在鸭子右边，气泡从鸭子右侧弹出
+         * 会直接盖住「拼豆图纸工坊」。但"藏起来"把一个功能变成了零 ——
+         * 正确做法是换个方向挂。
+         *
+         *   lg 及以上：标题居中到顶栏正中，鸭子右边空着 → 气泡挂右侧
+         *   lg 以下  ：鸭子下面挂，朝下弹出，箭头指向上方
+         *
+         * 宽度仍用 `w-max` + max-w 兜住；`sm:block` 是因为 390px 手机上
+         * 气泡会盖住站名，那种尺寸下这段装饰不值得挤掉标题。
+         */
+        'pointer-events-none absolute z-30 hidden sm:block',
+        'left-0 top-full mt-2',
+        'lg:left-full lg:top-1/2 lg:ml-2 lg:mt-0 lg:-translate-y-1/2',
         /*
          * 必须给 `w-max`。
          *
@@ -182,12 +201,28 @@ export function MascotBubble({ enabled = true, className }: MascotBubbleProps) {
           外层 6×6 旋转 45° 画边框，内层 4×4 盖住朝向气泡的那半条边 ——
           纯 CSS 三角（border 技巧）在这里不行，它画不出 2px 的硬边。
         */}
+        {/*
+          小尖角要跟着挂载方向换：挂右侧时朝左指（指向鸭子），挂在鸭子
+          下面时朝上指。两个都渲染，用断点各自显隐 —— 比用 JS 读断点省
+          一次 reflow，也不会在 SSR 首帧闪一下错方向的角。
+        */}
+        {/* 朝左：lg 以上（气泡在鸭子右侧） */}
         <span
           aria-hidden
-          className="absolute top-1/2 -left-[6px] block size-[6px] -translate-y-1/2 rotate-45"
+          className="absolute top-1/2 -left-[6px] hidden size-[6px] -translate-y-1/2 rotate-45 lg:block"
           style={{
             background: 'var(--paper-hi)',
             borderBottom: '2px solid var(--line-strong)',
+            borderLeft: '2px solid var(--line-strong)',
+          }}
+        />
+        {/* 朝上：lg 以下（气泡在鸭子下面） */}
+        <span
+          aria-hidden
+          className="absolute -top-[6px] left-3 block size-[6px] rotate-45 lg:hidden"
+          style={{
+            background: 'var(--paper-hi)',
+            borderTop: '2px solid var(--line-strong)',
             borderLeft: '2px solid var(--line-strong)',
           }}
         />

@@ -64,8 +64,10 @@ import {
   centerPattern,
   detectNativePixelGrid,
   downsampleNative,
+  findNativeSubjectBounds,
   sampleNativeCells,
   scalePattern,
+  type NativeCell,
   type NativeGrid,
 } from './pixel-native';
 import { detectWatermark, type WatermarkResult } from './watermark';
@@ -746,6 +748,7 @@ export function generatePattern(
       watermark: detectWatermark(imageData),
       canvasCenter: canvasCenterOn,
       canvasScale: canvasScaleMode,
+      gridSize: options.gridSize,
     });
   }
 
@@ -1386,6 +1389,8 @@ function generateFromNativeGrid(
     watermark: WatermarkResult;
     canvasCenter: boolean;
     canvasScale: 'off' | 'integer' | 'nearest';
+    /** 用户设定的长边格数；裁切后要按新长宽比重算目标行列 */
+    gridSize: number;
   },
 ): PatternResult {
   const { brand, colorLimit, smoothing, dither, detail, profile } = cfg;
@@ -1393,8 +1398,150 @@ function generateFromNativeGrid(
   // 1) 按原生网格逐格取中位色（中位数抗 JPEG 振铃，均值会被拉偏）
   const nativeCells = sampleNativeCells(src, native, mask, 0.18);
 
+  /*
+   * 1.5) 主体裁切 —— **只在原生格边界上裁**
+   *
+   * 原生路径原本完全不裁（外层 `autoCrop && !nativeProbe?.detected`），
+   * 因为 detectSubjectBounds 的框不对齐块边界、先裁再探会毁掉相位。
+   * 但"不裁"让主体只占画板的 38%–69%，用户给的 64 格预算里 30–60 格
+   * 在画背景 —— 五官当然糊。这里改成：**先按原相位取好所有原生格，
+   * 再在"格数组"层面裁**。裁的是下标不是像素，被丢掉的只有整块，
+   * 保留下来的每一格仍是原来那一块，相位天然不变。
+   *
+   * 裁完长宽比变了，目标行列要跟着重算，否则画面会被拉扁。
+   */
+  let workGrid = native;
+  let workCells = nativeCells;
+  let outCols = cols;
+  let outRows = rows;
+  if (cfg.autoCrop) {
+    /*
+     * 水印框换到原生格坐标后传给裁切，否则右下角那撮水印会把包围盒
+     * 一路拽到图角，裁完等于没裁。
+     */
+    const wmRegion = cfg.watermark?.detected ? cfg.watermark.region : null;
+    const exclude = wmRegion
+      ? {
+          c0: Math.max(0, Math.floor(wmRegion.x0 / native.blockX)),
+          r0: Math.max(0, Math.floor(wmRegion.y0 / native.blockY)),
+          c1: Math.min(native.cols - 1, Math.ceil(wmRegion.x1 / native.blockX)),
+          r1: Math.min(native.rows - 1, Math.ceil(wmRegion.y1 / native.blockY)),
+        }
+      : null;
+    const bounds = findNativeSubjectBounds(nativeCells, native, { exclude });
+    if (bounds) {
+      const bw = bounds.c1 - bounds.c0 + 1;
+      const bh = bounds.r1 - bounds.r0 + 1;
+      const full = native.cols * native.rows;
+      /*
+       * 裁掉的比例太小就不折腾：改动长宽比会重算目标行列、引入取整误差，
+       * 为几格不值得。0.92 实测能保住 r2/r7 这类本来就铺满的图不动。
+       */
+      if ((bw * bh) / full < 0.92) {
+        const cropped = new Array<NativeCell>(bw * bh);
+        for (let r = 0; r < bh; r++) {
+          for (let c = 0; c < bw; c++) {
+            const si = (bounds.r0 + r) * native.cols + (bounds.c0 + c);
+            const cell = nativeCells[si];
+            /*
+             * 顺带把背景判定结果写回 cover：泛洪算出的背景格覆盖率清零，
+             * 下游的 `cover < profile.cellMin` 就会直接把它们判成空。
+             *
+             * 这一步是必要的：裁切后主体紧贴画布边缘，下游的
+             * `removeBorderBackground` 会从边缘向内泛洪，很可能把贴着
+             * 边的主体描边当成"背景"再啃掉一圈（实测底部整行被吃空）。
+             * 这里既已拿到更准的判定（在原生格粒度、且考虑了内部镂空），
+             * 就把这份信息交给下游，不再让它自己从裁剪后的边缘瞎猜。
+             */
+            cropped[r * bw + c] = bounds.bg[si] ? { ...cell, cover: 0 } : cell;
+          }
+        }
+        workCells = cropped;
+        workGrid = { ...native, cols: bw, rows: bh };
+        // 用像素长宽比重算目标行列（块宽可能非整数，用块数×块宽更准）
+        const aspect = (bw * native.blockX) / (bh * native.blockY);
+        const sized = computeGridSize(aspect, cfg.gridSize);
+        outCols = sized.cols;
+        outRows = sized.rows;
+        /*
+         * 吸附到整数倍比例 —— 原生路径最要命的质量损失在这里。
+         *
+         * `downsampleNative` 是**面积加权多数表决**：比例是整数时，每个
+         * 目标格恰好覆盖 k×k 个原生块，投票是干净的；比例非整数时（如
+         * 96 原生 → 64 目标，1.5 倍），一部分目标格覆盖 1 块、另一部分
+         * 覆盖 2 块，同一片纯色区域会因为"这块占 60% / 那块占 40%"而在
+         * 两色之间反复横跳，成品出现 1 格宽的横向噪条。
+         *
+         * 实测 r1（原生 68×91，裁后 40×73）：请求 64 格得到 35×64，
+         * 两个方向都是 1.14 倍，画出来的橘猫条纹变成一片粉红糊斑，
+         * 比裁切前还差。而 1:1 取 40×73 时边缘全硬、条纹清楚。
+         *
+         * 策略：在"整数倍"候选里挑长边最接近用户请求的那个，但只接受
+         * 落在请求值 0.8–1.25 倍窗口内的候选 —— 超出去宁可按原请求做
+         * 面积表决（有噪条，但至少颗数符合预期）。
+         */
+        const natLong = Math.max(bw, bh);
+        const wantLong = Math.max(outCols, outRows);
+        const step = Math.max(1, Math.round(natLong / wantLong));
+        const snapLong = Math.max(
+          Math.round(bw / step),
+          Math.round(bh / step),
+        );
+        const ratio = snapLong / wantLong;
+        if (step > 1 && ratio >= 0.8 && ratio <= 1.25) {
+          /*
+           * 必须让裁切框本身是 step 的整数倍，否则 `bw / step` 带小数
+           * （实测 r2：原生 102、step=2、裁后 77 宽 → 77/2 = 38.5 →
+           * round 成 39，比例回到 1.97 而非 2.00，投票又变成非整数）。
+           *
+           * 扩张而不是收缩：往外多带 1 列背景远比切掉主体一角安全，
+           * 而且这些格子本来就属于背景，投票会把它们投成背景色。
+           * 扩张到图边还不够时再往里收。
+           */
+          const fitExtent = (lo: number, hi: number, limit: number): [number, number] => {
+            let a = lo;
+            let b = hi;
+            let need = (b - a + 1) % step;
+            if (!need) return [a, b];
+            // 优先各扩 1 格；贴边了就往另一侧扩；两侧都贴边再往内收
+            while (need) {
+              if (b + 1 <= limit) {
+                b += 1;
+              } else if (a - 1 >= 0) {
+                a -= 1;
+              } else {
+                b -= 1;
+              }
+              need = (b - a + 1) % step;
+            }
+            return [a, b];
+          };
+          const [ec0, ec1] = fitExtent(bounds.c0, bounds.c1, native.cols - 1);
+          const [er0, er1] = fitExtent(bounds.r0, bounds.r1, native.rows - 1);
+          const ebw = ec1 - ec0 + 1;
+          const ebh = er1 - er0 + 1;
+          if (ebw % step === 0 && ebh % step === 0) {
+            // 重做裁切（原来那一份是按旧框算的，这里覆盖掉）
+            const recount = new Array<NativeCell>(ebw * ebh);
+            for (let r = 0; r < ebh; r++) {
+              for (let c = 0; c < ebw; c++) {
+                const si = (er0 + r) * native.cols + (ec0 + c);
+                const cell = nativeCells[si];
+                recount[r * ebw + c] = bounds.bg[si] ? { ...cell, cover: 0 } : cell;
+              }
+            }
+            workCells = recount;
+            workGrid = { ...native, cols: ebw, rows: ebh };
+            outCols = ebw / step;
+            outRows = ebh / step;
+          }
+        }
+      }
+    }
+  }
+
   // 2) 原生格 → 目标网格：面积加权多数表决（不是混色）
-  const down = downsampleNative(nativeCells, native, cols, rows);
+  const down = downsampleNative(workCells, workGrid, outCols, outRows);
 
   // 3) 调色板：把目标网格的投票结果当加权点集，复用同一套选色逻辑
   const candidates = getBrandPalette(brand);
@@ -1443,9 +1590,11 @@ function generateFromNativeGrid(
   );
 
   // 4) 逐目标格最近邻赋色 + 构造 pooled（供 finalize 算 meanDeltaE）
-  const cells = new Int16Array(cols * rows).fill(-1);
-  const pooled = new Float32Array(cols * rows * 3);
-  for (let i = 0; i < cols * rows; i++) {
+  const cols2 = outCols;
+  const rows2 = outRows;
+  const cells = new Int16Array(cols2 * rows2).fill(-1);
+  const pooled = new Float32Array(cols2 * rows2 * 3);
+  for (let i = 0; i < cols2 * rows2; i++) {
     const cover = down.cover[i];
     // 覆盖率门槛和照片路径的 CELL_MIN 对齐：半格以上才算一颗豆
     if (cover < profile.cellMin) continue;
@@ -1467,34 +1616,34 @@ function generateFromNativeGrid(
 
   // 5) 下游清理：只保留与分辨率无关的步骤
   const noProtect = undefined;
-  const regionField = emptyRegionField(cols, rows);
-  coalescePalette(cells, palette, cols, rows);
+  const regionField = emptyRegionField(cols2, rows2);
+  coalescePalette(cells, palette, cols2, rows2);
 
-  mergeSmallRegions(cells, palette, cols, rows, smoothing, noProtect, profile, regionField);
+  mergeSmallRegions(cells, palette, cols2, rows2, smoothing, noProtect, profile, regionField);
 
   if (cfg.background === 'ignore') {
-    removeBorderBackground(cells, palette, cols, rows, 0.09);
+    removeBorderBackground(cells, palette, cols2, rows2, 0.09);
   }
-  mergeSmallRegions(cells, palette, cols, rows, smoothing * 0.6, noProtect, profile, regionField);
+  mergeSmallRegions(cells, palette, cols2, rows2, smoothing * 0.6, noProtect, profile, regionField);
 
   if (dither) {
-    applyDither(cells, pooled, palette, cols, rows);
+    applyDither(cells, pooled, palette, cols2, rows2);
   }
   const pruned = pruneWeakColors(
     cells, palette, 0.006 * profile.pruneRatioScale, noProtect,
-    profile.pruneAbsolute, regionField, cols, rows, new Set<string>(),
+    profile.pruneAbsolute, regionField, cols2, rows2, new Set<string>(),
   );
-  const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, noProtect);
+  const defragged = defragmentColors(pruned.cells, pruned.palette, cols2, rows2, noProtect);
   const deblended = eliminateBlends(
-    defragged.cells, defragged.palette, pooled, cols, rows, noProtect,
+    defragged.cells, defragged.palette, pooled, cols2, rows2, noProtect,
   );
   const clipped = enforceColorLimit(
-    deblended.cells, deblended.palette, cols, rows, colorLimit,
-    new Uint8Array(cols * rows),
+    deblended.cells, deblended.palette, cols2, rows2, colorLimit,
+    new Uint8Array(cols2 * rows2),
   );
 
   const wm = cfg.watermark;
-  return applyCanvasFit(finalize(clipped.cells, clipped.palette, pooled, cols, rows, {
+  return applyCanvasFit(finalize(clipped.cells, clipped.palette, pooled, cols2, rows2, {
     brand,
     colorLimit,
     fit: cfg.fit,
@@ -2847,7 +2996,9 @@ function removeBorderBackground(
 
   // 用边缘格子的颜色众数作为背景色
   const border = new Map<number, number>();
+  let perimeter = 0;
   const pushBorder = (i: number) => {
+    perimeter++;
     const c = cells[i];
     if (c >= 0) border.set(c, (border.get(c) ?? 0) + 1);
   };
@@ -2869,8 +3020,25 @@ function removeBorderBackground(
       bgColor = c;
     }
   }
-  // 只有边缘明显被同一色占据时才认为是背景
-  if (bgVotes < (cols + rows) * 2 * 0.55) return;
+  /*
+   * 只有边缘明显被同一色占据时才认为是背景。
+   *
+   * 分母必须是**周边取样位总数** `perimeter`，不是 `(cols + rows) * 2`。
+   * 后者把四个角数了两遍，本身就不等于真实周长，而且更严重的问题是：
+   * 走到这里时，前面的 `mergeSmallRegions` 已经把大片背景清成 `-1` 了，
+   * 于是 `border` 里只剩**没被清掉的那一圈残留**（实测 r3：周边 256 位
+   * 只剩 130 个非空，全是右侧/底部的 1px 蓝色残边）。拿 130 去比
+   * `(64+64)*2*0.55 = 140.8` 差 10 票没过门槛，函数直接 return ——
+   * 于是那圈确实该删的残边一颗都没删掉，画面右侧和底部留下一整条蓝边。
+   *
+   * 用 perimeter 当分母才在问正确的问题："周边有多少比例是同一种颜色"。
+   * 实测 r3 是 130/256 = 50.8%，接近但未过半；这里有第二个坑：残留本身
+   * 就是背景色，所以正确行为是**继续判**而不是放弃。因此门禁改为
+   * "在**还活着的**周边格里，最高票占比过半"，即 bgVotes/votes >= 0.55，
+   * 同时要求绝对票数不少于周长的 15%，避免只剩一两个格子时误判。
+   */
+  const alive = [...border.values()].reduce((a, b) => a + b, 0);
+  if (bgVotes < alive * 0.55 || bgVotes < perimeter * 0.15) return;
 
   const bgLab = palette[bgColor].lab;
   const tol2 = tolerance * tolerance;

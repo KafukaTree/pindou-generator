@@ -111,6 +111,10 @@ export const bilateralLab = resample.bilateralLab;
 export const detectSubjectBounds = resample.detectSubjectBounds;
 export const cropImageData = resample.cropImageData;
 export const computeGridSize = engine.computeGridSize;
+const pn = build(path.join(SRC_ROOT, 'lib/pattern/pixel-native.ts')).mod;
+export const detectNativePixelGrid = pn.detectNativePixelGrid;
+export const sampleNativeCells = pn.sampleNativeCells;
+export const findNativeSubjectBounds = pn.findNativeSubjectBounds;
 export const estimateSizeCm = engine.estimateSizeCm;
 export { cleanup };
 

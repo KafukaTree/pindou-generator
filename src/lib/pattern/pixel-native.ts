@@ -1087,3 +1087,234 @@ export function meanDeltaEForCells(
   }
   return n ? sum / n : 0;
 }
+
+/* ------------------------------------------------------------------ *
+ * 原生网格 → 主体边界（用于裁掉大片背景）
+ * ------------------------------------------------------------------ */
+
+/** 主体裁切的块范围（原生格坐标，含端点） */
+export interface NativeSubjectBounds {
+  c0: number;
+  r0: number;
+  c1: number;
+  r1: number;
+  /** 主体占原生格总数的比例 0–1 */
+  fill: number;
+  /** 哪些原生格是背景（1 = 背景）。长度 cols*rows，供调用方直接把 cover 清零 */
+  bg: Uint8Array;
+}
+
+/**
+ * 在**原生格**层面找主体的包围盒，并标出背景格。
+ *
+ * ## 为什么需要这一步
+ *
+ * 原生路径原本**不裁切**（`generate.ts` 里 `autoCrop && !nativeProbe?.detected`
+ * 刻意跳过），理由是"裁切会破坏网格相位"。那个理由本身是对的 ——
+ * `detectSubjectBounds` 的边界是"第一列非背景像素"，跟原生块边界毫无
+ * 对齐关系，先裁再探会得到一张边缘半块的图，相位错了整圈块都变混色。
+ *
+ * 但**不裁**的代价实测非常大：AI 直出图习惯把主体画在中间、四周留大片
+ * 纯色底，实测 7 张参考图（默认 64 格）主体只占画板 38%–69% 宽：
+ *
+ *   r3  主体 24×37 / 板 64×64 → 占宽 38%
+ *   r4  主体 33×48 / 板 64×64 → 占宽 52%
+ *   r1  主体 27×50 / 板 48×64 → 占宽 56%
+ *   r6  主体 44×56 / 板 64×64 → 占宽 69%
+ *
+ * 也就是说 64 格里有 30–60 格在画背景，用户的"64 格预算"实际只用了
+ * 24–44 格画主体 —— 眼睛、腮红这些 1 格的东西当然没了。
+ *
+ * ## 为什么"裁在原生格边界上"就不破坏相位
+ *
+ * 相位是"格边界相对图像左上角的偏移"。裁切只丢整块、不移动任何保留的
+ * 块，所以保留下来的每一格与原来那一块一一对应，采样窗口落在块内部的
+ * 同一相对位置 —— 相位天然不变。这里返回**块**坐标，调用方在下标层面
+ * 裁剪 `NativeCell[]`，连亚像素都不用碰。
+ *
+ * ## 为什么按"所有非背景"取框、但要排除水印
+ *
+ * 一开始用"最大连通块"，实测会把散在主体周围的高光星星（r4 的 ∬ 装饰）
+ * 丢掉 —— 它们跟主体不连通，于是被当成独立小块排除。改成"所有非背景格
+ * 的外接框"就都保住了。但 AI 直出图右下角常带一小块平台水印（实测面积
+ * 0.4%–3.6%），它会把框一路拽到右下角，裁完等于没裁（实测 r4 的水印在
+ * 第 93 块，而主体右边缘只到第 72 块）。所以水印框由调用方传进来排除。
+ */
+export function findNativeSubjectBounds(
+  cells: NativeCell[],
+  grid: NativeGrid,
+  opts: {
+    tolerance?: number;
+    margin?: number;
+    /** 要排除的矩形（原生格坐标，含端点），通常给水印框 */
+    exclude?: { c0: number; r0: number; c1: number; r1: number } | null;
+  } = {},
+): NativeSubjectBounds | null {
+  const { cols, rows } = grid;
+  const n = cols * rows;
+  if (!n) return null;
+  const tol = opts.tolerance ?? 0.075;
+  const margin = opts.margin ?? 1;
+  const ex = opts.exclude;
+
+  // 1) 背景色 = 四条边上覆盖率最高的那格颜色（量化分桶投票，抗单点噪点）
+  const votes = new Map<number, { r: number; g: number; b: number; w: number }>();
+  const addVote = (idx: number) => {
+    const c = cells[idx];
+    if (!c || c.cover <= 0.5) return;
+    const key =
+      ((Math.round(c.r / 16) << 8) |
+        (Math.round(c.g / 16) << 4) |
+        Math.round(c.b / 16)) >>> 0;
+    const v = votes.get(key);
+    if (v) {
+      v.r += c.r;
+      v.g += c.g;
+      v.b += c.b;
+      v.w += 1;
+    } else {
+      votes.set(key, { r: c.r, g: c.g, b: c.b, w: 1 });
+    }
+  };
+  for (let x = 0; x < cols; x++) {
+    addVote(x);
+    addVote((rows - 1) * cols + x);
+  }
+  for (let y = 0; y < rows; y++) {
+    addVote(y * cols);
+    addVote(y * cols + cols - 1);
+  }
+  if (!votes.size) return null;
+  let bestVote: { r: number; g: number; b: number; w: number } | null = null;
+  for (const v of votes.values()) {
+    if (!bestVote || v.w > bestVote.w) bestVote = v;
+  }
+  if (!bestVote) return null;
+  const bgR = bestVote.r / bestVote.w;
+  const bgG = bestVote.g / bestVote.w;
+  const bgB = bestVote.b / bestVote.w;
+  const bgLab = rgbToOklab(bgR, bgG, bgB);
+  const tol2 = tol * tol;
+
+  // 2) 从四边泛洪：只把"与边界连通"的底色判为背景
+  //    主体内部的浅色（白脸、白衣、高光）被前景包住，不会被挖洞。
+  const bgLike = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const c = cells[i];
+    if (!c) continue;
+    const lab = rgbToOklab(c.r, c.g, c.b);
+    const dL = lab.L - bgLab.L;
+    const da = lab.a - bgLab.a;
+    const db = lab.b - bgLab.b;
+    if (dL * dL + da * da + db * db <= tol2) bgLike[i] = 1;
+  }
+  const bg = new Uint8Array(n);
+  const queue: number[] = [];
+  const seed = (i: number) => {
+    if (bgLike[i] && !bg[i]) {
+      bg[i] = 1;
+      queue.push(i);
+    }
+  };
+  for (let x = 0; x < cols; x++) {
+    seed(x);
+    seed((rows - 1) * cols + x);
+  }
+  for (let y = 0; y < rows; y++) {
+    seed(y * cols);
+    seed(y * cols + cols - 1);
+  }
+  while (queue.length) {
+    const i = queue.pop()!;
+    const r = (i / cols) | 0;
+    const c = i % cols;
+    if (c > 0) seed(i - 1);
+    if (c + 1 < cols) seed(i + 1);
+    if (r > 0) seed(i - cols);
+    if (r + 1 < rows) seed(i + cols);
+  }
+
+  /*
+   * 3) 非背景格按连通块分组，只保留"够大"的块
+   *
+   * 一开始直接拿所有非背景格的外接框，实测 r4 会被 AI 随手撒的装饰
+   * 高光星星（∬ 之类，每颗 8–10 格）一路撑到接近整图 —— 主体反而只
+   * 值 52×74，裁完等于没裁。但也不能只留最大连通块：主体上真正脱离
+   * 的部分（飘起的帽子、旁边的道具）会被丢掉。
+   *
+   * 折中：保留所有面积 ≥ 最大块 3% 的块。实测 7 张参考图里主体
+   * 500–1800 格、星星 6–16 格（占比 < 1.5%）、真正要留的次要部件
+   * 都在 5% 以上，3% 这条线两边都留足余量。
+   */
+  const comp = new Int32Array(n).fill(-1);
+  const sizes: number[] = [];
+  let label = 0;
+  const okCell = (i: number) => {
+    if (bg[i] || comp[i] >= 0) return false;
+    const cell = cells[i];
+    if (!cell || cell.cover <= 0.15) return false;
+    if (ex) {
+      const c = i % cols;
+      const r = (i / cols) | 0;
+      if (c >= ex.c0 && c <= ex.c1 && r >= ex.r0 && r <= ex.r1) return false;
+    }
+    return true;
+  };
+  for (let i = 0; i < n; i++) {
+    if (!okCell(i)) continue;
+    const id = label++;
+    let size = 0;
+    const stack = [i];
+    comp[i] = id;
+    while (stack.length) {
+      const k = stack.pop()!;
+      size++;
+      const r = (k / cols) | 0;
+      const c = k % cols;
+      const go = (j: number) => {
+        if (!okCell(j)) return;
+        comp[j] = id;
+        stack.push(j);
+      };
+      if (c > 0) go(k - 1);
+      if (c + 1 < cols) go(k + 1);
+      if (r > 0) go(k - cols);
+      if (r + 1 < rows) go(k + cols);
+    }
+    sizes.push(size);
+  }
+  if (!sizes.length) return null;
+  const maxSize = Math.max(...sizes);
+  const MIN_COMP_FRAC = 0.03;
+  const keep = sizes.map((v) => v >= maxSize * MIN_COMP_FRAC);
+
+  // 4) 保留下来的块的外接框
+  let c0 = cols;
+  let r0 = rows;
+  let c1 = -1;
+  let r1 = -1;
+  let content = 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const i = r * cols + c;
+      const id = comp[i];
+      if (id < 0 || !keep[id]) continue;
+      content++;
+      if (c < c0) c0 = c;
+      if (c > c1) c1 = c;
+      if (r < r0) r0 = r;
+      if (r > r1) r1 = r;
+    }
+  }
+  if (c1 < 0) return null;
+
+  // 4) 留 1 格余量：主体最外圈常有 1 格宽的描边/高光，紧贴裁会切掉半格
+  return {
+    c0: Math.max(0, c0 - margin),
+    r0: Math.max(0, r0 - margin),
+    c1: Math.min(cols - 1, c1 + margin),
+    r1: Math.min(rows - 1, r1 + margin),
+    fill: content / n,
+    bg,
+  };
+}
