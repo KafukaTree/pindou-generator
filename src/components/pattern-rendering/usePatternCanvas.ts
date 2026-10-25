@@ -124,6 +124,10 @@ export const CANVAS_GUTTER_NARROW = 8;
  * 桌面格高在 11–17px 之间，3 格 = 33–51px，所以 64px 是实际生效的那条。
  * 桌面为什么给到 96：编辑态画布高度常见 700–1100px，底部要留到能看见
  * 「画布到此为止」而不是「再滚还有」，96px 大约是一屏高度的 1/8。
+ *
+ * 这块空白还必须**能抓手拖动**（见 PatternCanvas 里那段 padPointer）——
+ * 只加留白、不接事件的话它是一块"看得见抓不住"的纸，用户仍然得先滚回画布
+ * 上再拖动。
  */
 export const CANVAS_GUTTER_BOTTOM = 96;
 /**
@@ -181,6 +185,26 @@ const MIN_READABLE_CELL = 6;
  * 所以这条规则只对窄屏生效：手机上滚动是常态，可读性才是矛盾的主要方面。
  */
 const NARROW_VIEWPORT = 640;
+
+/**
+ * 底部留白用哪一档的分界高度（CSS px，滚动容器的可视高度）。
+ *
+ * 低于这个值用 72（CANVAS_GUTTER_BOTTOM_NARROW），否则用 96。
+ * 600 的依据（各档实测的滚动容器可视高）：
+ *   390×844 手机 567  → 72
+ *   673×889 窄窗 590  → 72
+ *   1024×768     508  → 72（中栏窄，但 72 已满足「≥64 且 ≥3 格」，且省下 24px）
+ *   1440×900     640  → 96
+ *   1600×1000    740  → 96
+ *   1920×1080    820  → 96
+ * 取 600 而不是 560：390 手机是 567，卡在 560 上面就会拿到接近一屏 1/6 的
+ * 空白，而它本来就已经把画布居中、下方余量 159px —— 再多没有收益。
+ *
+ * 这条线分的是「屏幕矮」而不是「容器窄」：底部留白吃的是垂直空间，只有
+ * 垂直方向真的紧张时才该退让。按宽度分档会把 673/1024 这种窄中栏误判成
+ * 手机（它们的可视高其实有 508–590）。
+ */
+const EDIT_GUTTER_FULL_HEIGHT = 600;
 
 /**
  * 编辑态的"别高到离谱"上限，按可见高度的倍数表示。
@@ -2062,10 +2086,15 @@ export function usePatternCanvas(
    *
    * 只有底部变大、左右和上方仍用 canvasGutter，所以这块空白不会挤掉一列，
    * 横向不会有溢出。
+   *
+   * 分档看的是**可视高度**，不是宽度：这里要回答的问题是「这一屏装不装得下
+   * 一大块底部留白」，与容器多宽无关。按宽度分档会把 673×889 这种窄中栏窗口
+   * 误判成手机 —— 它的滚动容器只有 645 宽（clientWidth 637 > NARROW_VIEWPORT
+   * 勉强逃过），但可视高有 594，与手机（567）完全是两种处境。
    */
   const canvasGutterBottom =
     editing || brushMode
-      ? viewportW > 0 && viewportW < NARROW_VIEWPORT
+      ? viewportH > 0 && viewportH < EDIT_GUTTER_FULL_HEIGHT
         ? CANVAS_GUTTER_BOTTOM_NARROW
         : CANVAS_GUTTER_BOTTOM
       : canvasGutter;

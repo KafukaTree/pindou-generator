@@ -1761,11 +1761,46 @@ export function PatternCanvas({
         }}
       >
         <div
+          /*
+           * 留白区也要能拖动画板（抓手）。
+           *
+           * 用户原话：「现在的状态是下面的不用容易看到并【拖动编辑】，我猜测
+           * 可能要把画板的周围的拖动底部空间预留的大一点」。把底部留白加大
+           * 只是让它**看得见** —— 这块 padding 区原本连一个事件处理都没挂，
+           * 指针落上去是死区：画布的 pointerdown/move 只挂在 surface 上，
+           * 空白属于这个 grid 块的 padding，事件到不了任何处理函数。实测在
+           * 加留白之后、接事件之前，在底部空白里用抓手拖动 scrollTop 纹丝不动。
+           *
+           * 所以复用编辑态的同一套指针处理，用 `padPointer` 做守门：只有事件
+           * **直接落在 padding 上**（target 就是这块本身）才处理，从 surface
+           * 冒泡上来的一律不进 —— 否则同一次拖动会被处理两遍。
+           *
+           * 为什么只判 target 不判 buttons：`setPointerCapture` 之后浏览器会把
+           * 后续事件的 target 固定成捕获元素，所以由这块发起的拖动后续 move
+           * 的 target 一直是这块，判等即可；而由 surface 发起的拖动 target
+           * 一直是 surface，判不等，天然不会重复。
+           */
+          {...(editActive && editTool === 'pan'
+            ? (() => {
+                const padPointer = (fn: typeof onEditPointerMove) => (e: React.PointerEvent<HTMLDivElement>) => {
+                  if (e.target === e.currentTarget) fn(e);
+                };
+                return {
+                  onPointerDown: padPointer(onEditPointerDown),
+                  onPointerMove: padPointer(onEditPointerMove),
+                  onPointerUp: padPointer(onEditPointerUp),
+                  onPointerCancel: padPointer(onEditPointerUp),
+                };
+              })()
+            : {})}
           style={{
             display: 'grid',
             gridTemplateColumns: showRulers ? `${RULER_LEFT}px ${cssW}px` : `${cssW}px`,
             gridTemplateRows: showRulers ? `${RULER_TOP}px ${cssH}px` : `${cssH}px`,
             flex: 'none',
+            // 留白区能抓手拖动时，光标也要跟着变成 grab（否则看不出这块能按）
+            cursor: editActive && editTool === 'pan' ? 'grab' : undefined,
+            touchAction: editActive && editTool === 'pan' ? 'none' : undefined,
             /*
              * 画布四周的留白做在**滚动内容**上，不做在滚动容器上。
              *
