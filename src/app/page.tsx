@@ -11,6 +11,8 @@ import {
   Grid2x2,
   RefreshCw,
   SlidersHorizontal,
+  AlignCenter,
+  Maximize2,
   X,
 } from 'lucide-react';
 
@@ -65,6 +67,11 @@ import {
   parseBlankSourceKey,
 } from '@/lib/pattern/blank';
 import { BRANDS, BRAND_META, type Brand } from '@/lib/color/palette';
+import {
+  centerPatternToCanvas,
+  scalePatternToCanvas,
+  resizePatternToCanvas,
+} from '@/lib/pattern/canvas-resize';
 import { readStorage, writeStorage } from '@/hooks/useLocalStorage';
 import {
   clearWorkspaceSession,
@@ -254,6 +261,14 @@ export default function Home() {
     id: string;
   } | null>(null);
   const [newCanvasOpen, setNewCanvasOpen] = useState(false);
+  /*
+   * 换尺寸时已经搬好内容的图纸。
+   *
+   * 那个「空白画布 → makeBlankPattern」的 effect 只依赖 blankCanvas，它分不
+   * 清"新建一块空的"和"换尺寸但保留内容"。这个 ref 就是那一次的信使：带
+   * 值进去就用它，用完立刻清空。
+   */
+  const carriedRef = useRef<PatternResult | null>(null);
 
   // ---- 输出 --------------------------------------------------------------
   const [pattern, setPattern] = useState<PatternResult | null>(null);
@@ -780,7 +795,9 @@ export default function Home() {
    */
   useEffect(() => {
     if (!blankCanvas) return;
-    setPattern(makeBlankPattern(blankCanvas.cols, blankCanvas.rows, options));
+    const carried = carriedRef.current;
+    carriedRef.current = null;
+    setPattern(carried ?? makeBlankPattern(blankCanvas.cols, blankCanvas.rows, options));
     setIsWorking(false);
     setError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1109,6 +1126,45 @@ export default function Home() {
    * 空白画布走 BlankSettings：它不走引擎，网格/色数/精细度/成片度/彩度
    * 全都不生效，给一堆假滑杆比不给更糟。
    */
+  /*
+   * 画板校准：居中 / 放大约到边。
+   *
+   * 两件事必须分开给，不能合成一个"自动摆正"：
+   *   - 居中只平移，图案大小不变 —— 用户说"它贴在左上角"时要的是这个；
+   *   - 放大是重采样，每颗豆变成 k×k 块 —— 用户说"板子这么大图太小"时
+   *     要的是这个。
+   * 合成一个的话，想居中的用户会突然发现图案变成 2 倍大。
+   */
+  const handleCenter = useCallback(() => {
+    if (!displayPattern) return;
+    const r = centerPatternToCanvas(displayPattern, edits);
+    if (!r.moved) {
+      toast.info('图案已经在正中央了');
+      return;
+    }
+    setPattern(r.pattern);
+    setEdits(r.edits);
+    toast.success(
+      `已居中：四边余量从 ${r.marginBefore} 格调到 ${r.marginAfter} 格`,
+    );
+  }, [displayPattern, edits]);
+
+  const handleScaleToFit = useCallback(() => {
+    if (!displayPattern) return;
+    const r = scalePatternToCanvas(displayPattern, edits);
+    if (!r.moved) {
+      toast.info('已经铺满画板，或放大倍数不到 2 倍（拼豆只做整数倍放大）');
+      return;
+    }
+    setPattern(r.pattern);
+    setEdits(r.edits);
+    toast.success(
+      r.raggedCells > 0
+        ? `已放大 ${r.amount} 倍，有 ${r.raggedCells} 格宽度不齐`
+        : `已放大 ${r.amount} 倍，无空洞无锯齿`,
+    );
+  }, [displayPattern, edits]);
+
   const sizeCm = pattern?.meta.sizeCm ?? null;
   const paramsNode = pattern || blankCanvas ? (
     blankCanvas ? (
@@ -1118,6 +1174,9 @@ export default function Home() {
         cols={blankCanvas.cols}
         rows={blankCanvas.rows}
         onResize={() => setNewCanvasOpen(true)}
+        onCenter={handleCenter}
+        onScaleToFit={handleScaleToFit}
+        canCalibrate={!!displayPattern && displayPattern.totalBeads > 0}
       />
     ) : (
       <PatternSettings
@@ -1132,6 +1191,8 @@ export default function Home() {
         outlineNote={outlineNote}
         margin={margin}
         onMarginChange={setMargin}
+        onCenter={handleCenter}
+        onScaleToFit={handleScaleToFit}
       />
     )
   ) : null;
@@ -1336,6 +1397,22 @@ export default function Home() {
    */
   const handleCreateBlank = useCallback(
     (cols: number, rows: number, brand: Brand) => {
+      /*
+       * 换尺寸 = 把已有图案按比例搬过去，而不是抹掉重来。
+       *
+       * 用户的原话是「换尺寸的应该是按比例缩放的」：这块板子从 48×48 改成
+       * 64×64，他想要的是同一张图装进更大的板，不是重画一遍。只有真的没
+       * 东西可搬（没有图纸 / 全空）时才退化成纯替换。
+       */
+      /*
+       * 源必须用 displayPattern 而不是 pattern：空白画布的手绘格子全在
+       * `edits` 覆盖层里，`pattern.cells` 是一整片 -1。拿 pattern 去搬会
+       * 搬过去一张空板子 —— 实测「画了 3 格 → 换尺寸 → 图没了」。
+       */
+      const carried = displayPattern
+        ? resizePatternToCanvas(displayPattern, cols, rows, brand, edits)
+        : null;
+
       setSourceDataUrl(null);
       setImageInfo(null);
       sourceRef.current = null;
@@ -1343,14 +1420,30 @@ export default function Home() {
       sourceEdgeRef.current = 0;
       setError(null);
       setBrushes([]);
-      setEdits(EMPTY_EDITS);
+      setEdits(carried ? carried.edits : EMPTY_EDITS);
       setOptions((prev) => ({ ...prev, brand }));
       setBlankCanvas({ cols, rows, id: makeBlankId() });
       // 记一笔历史时不要让"签名相同"挡住
       lastRecordedRef.current = '';
-      toast.success(`已新建 ${cols} × ${rows} 的空白画布，点「编辑」开始画`);
+      if (carried && carried.pattern.totalBeads > 0) {
+        /*
+         * 搬过来的图案直接 set 进 pattern 会让下面那条"空白画布 effect"再
+         * 造一张全空的把它盖掉 —— 那条 effect 只认 blankCanvas 变化。所以
+         * 用 carriedRef 让 effect 知道这一次已经有内容了。
+         */
+        carriedRef.current = carried.pattern;
+        const bits = [`已换成 ${cols} × ${rows}，图案按比例搬过来了`];
+        if (carried.clippedCells > 0) bits.push(`裁掉 ${carried.clippedCells} 颗`);
+        if (Math.abs(carried.aspectDistort - 1) > 0.02) {
+          bits.push(`长宽比变了 ${carried.aspectDistort.toFixed(2)} 倍，图案有拉伸`);
+        }
+        toast.success(bits.join('，'));
+      } else {
+        carriedRef.current = null;
+        toast.success(`已新建 ${cols} × ${rows} 的空白画布，点「编辑」开始画`);
+      }
     },
-    [],
+    [displayPattern, edits],
   );
 
   const handleClear = useCallback(() => {
@@ -1376,16 +1469,28 @@ export default function Home() {
    * 才发现刚画的东西没了。只在"真的会丢东西"时才提示：一张刚生成的、
    * 没手改过的图纸重来不心疼；画了格的才需要提醒，并且给出具体数量。
    */
+  /*
+   * 换尺寸不再是"替换" —— 图案会按比例搬到新画板上，所以警告改成了
+   * "搬运说明书"。原来那句「会被替换掉」在保留内容之后就是错的，会让
+   * 用户以为画的东西要没了，从而不敢按。
+   *
+   * 只在真有内容可搬时才说"搬过去"；空板子照旧说"会换成新尺寸"。
+   */
   const replaceWarning = useMemo<string | null>(() => {
     if (!hasImage) return null;
-    if (blankCanvas && editedCount > 0) {
-      return `当前这张 ${blankCanvas.cols} × ${blankCanvas.rows} 的空白画布上已经画了 ${editedCount} 格，新建会把它替换掉。`;
+    const hasContent = (displayPattern?.totalBeads ?? 0) > 0;
+    const from = blankCanvas
+      ? `${blankCanvas.cols} × ${blankCanvas.rows} 的空白画布`
+      : '当前图纸';
+    if (!hasContent) {
+      return blankCanvas
+        ? `当前这块 ${from}还是空的，换尺寸只会改变画板大小。`
+        : null;
     }
-    if (blankCanvas) {
-      return `当前这块 ${blankCanvas.cols} × ${blankCanvas.rows} 的空白画布会被替换掉。`;
-    }
-    return '新建画布会替换掉当前这张从图片生成的图纸（原图仍留在历史记录里，可以随时恢复）。';
-  }, [hasImage, blankCanvas, editedCount]);
+    const bits = [`会按比例搬到新画板上，不用重画`];
+    if (editedCount > 0) bits.push(`你手改的 ${editedCount} 格也跟着搬`);
+    return `${from}上的图案${bits.join('，')}。缩小太多会裁掉边上的豆。`;
+  }, [hasImage, blankCanvas, editedCount, displayPattern]);
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
@@ -2174,18 +2279,77 @@ function Section({
  * 与其猜（按比例缩放？保留左上？），不如让他重新建一张 —— 这是明确、
  * 可预期、不会悄悄吃掉工作的行为。
  */
+/**
+ * 画板校准：居中 / 放大。
+ *
+ * 两个按钮必须并排且各自说清楚"会不会改变图案大小" —— 这是它们唯一的
+ * 区别，也是用户唯一会搞混的地方。所以 hint 直接写进按钮下方，而不是
+ * 藏在 tooltip 里（手机上根本没有 hover）。
+ */
+function CanvasCalibrateRow({
+  onCenter,
+  onScaleToFit,
+  disabled,
+}: {
+  onCenter: () => void;
+  onScaleToFit: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <span className="text-[12px] font-semibold text-[var(--ink)]">画板校准</span>
+        <span className="font-px text-[9px] tracking-[0.14em] text-[var(--ink-3)]">
+          不改颜色
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5">
+        <button
+          type="button"
+          onClick={onCenter}
+          disabled={disabled}
+          title="只是平移，图案大小不变"
+          className="px-btn px-btn-sm disabled:opacity-40"
+        >
+          <AlignCenter className="h-3 w-3" aria-hidden />
+          居中
+        </button>
+        <button
+          type="button"
+          onClick={onScaleToFit}
+          disabled={disabled}
+          title="整数倍放大到铺满画板，图案会变大"
+          className="px-btn px-btn-sm disabled:opacity-40"
+        >
+          <Maximize2 className="h-3 w-3" aria-hidden />
+          放大约到边
+        </button>
+      </div>
+      <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+        居中只挪位置；放大把每颗豆变成 2×2、3×3 块（只做整数倍，不会出现一半宽一半窄的列）。
+      </p>
+    </div>
+  );
+}
+
 function BlankSettings({
   brand,
   onBrandChange,
   cols,
   rows,
   onResize,
+  onCenter,
+  onScaleToFit,
+  canCalibrate,
 }: {
   brand: Brand;
   onBrandChange: (b: Brand) => void;
   cols: number;
   rows: number;
   onResize: () => void;
+  onCenter: () => void;
+  onScaleToFit: () => void;
+  canCalibrate: boolean;
 }) {
   const cm = estimateSizeCm(cols, rows);
   return (
@@ -2221,6 +2385,12 @@ function BlankSettings({
           </span>
         </div>
       </div>
+
+      <CanvasCalibrateRow
+        onCenter={onCenter}
+        onScaleToFit={onScaleToFit}
+        disabled={!canCalibrate}
+      />
 
       <div className="px-rule" />
 

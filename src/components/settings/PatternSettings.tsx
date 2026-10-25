@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useMemo, type ReactNode } from 'react';
-import { SlidersHorizontal } from 'lucide-react';
+import { AlignCenter, Maximize2, SlidersHorizontal } from 'lucide-react';
 import { Slider } from '@/components/ui/slider';
 import { getBrandPalette, BRANDS, BRAND_META, type Brand } from '@/lib/color/palette';
 import type { GenerateOptions } from '@/lib/pattern/generate';
@@ -72,6 +72,12 @@ export interface PatternSettingsProps {
    */
   margin?: MarginMode;
   onMarginChange?: (next: MarginMode) => void;
+  /**
+   * 画板校准两个动作：居中（纯平移）与放大约到边（整数倍重采样）。
+   * 不传时不渲染这一块 —— 组件在图片还没生成好时不该出现空按钮。
+   */
+  onCenter?: () => void;
+  onScaleToFit?: () => void;
   className?: string;
 }
 
@@ -170,6 +176,8 @@ export function PatternSettings({
   outlineNote = null,
   margin = DEFAULT_MARGIN,
   onMarginChange,
+  onCenter,
+  onScaleToFit,
   className,
 }: PatternSettingsProps) {
   const patch = useCallback(
@@ -289,6 +297,10 @@ export function PatternSettings({
           </p>
         )}
       </Field>
+
+      {onCenter && onScaleToFit ? (
+        <CanvasCalibrateRow onCenter={onCenter} onScaleToFit={onScaleToFit} disabled={disabled} />
+      ) : null}
 
       <div className="px-rule" />
 
@@ -846,3 +858,59 @@ function SwitchRow({
 }
 
 export default PatternSettings;
+
+/**
+ * 画板校准：居中 / 放大。
+ *
+ * 为什么两个按钮要并排且各带一句说明：它们唯一的区别是"图案大小变不变"，
+ * 而这恰恰是用户唯一会搞混的地方。说明直接写进按钮下方而不是 tooltip ——
+ * 手机上根本没有 hover。
+ *
+ * 只做整数倍放大是硬约束：拼豆是手摆的，1.4 倍会让一半源列映射到 1 列、
+ * 一半映射到 2 列，实物上一眼就是坏的。宁可留白。
+ */
+function CanvasCalibrateRow({
+  onCenter,
+  onScaleToFit,
+  disabled,
+}: {
+  onCenter: () => void;
+  onScaleToFit: () => void;
+  disabled: boolean;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-2">
+        <span className="text-[12px] font-semibold text-[var(--ink)]">画板校准</span>
+        <span className="font-px text-[9px] tracking-[0.14em] text-[var(--ink-3)]">
+          不改颜色
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5">
+        <button
+          type="button"
+          onClick={onCenter}
+          disabled={disabled}
+          title="只是平移，图案大小不变"
+          className="px-btn px-btn-sm disabled:opacity-40"
+        >
+          <AlignCenter className="h-3 w-3" aria-hidden />
+          居中
+        </button>
+        <button
+          type="button"
+          onClick={onScaleToFit}
+          disabled={disabled}
+          title="整数倍放大到铺满画板，图案会变大"
+          className="px-btn px-btn-sm disabled:opacity-40"
+        >
+          <Maximize2 className="h-3 w-3" aria-hidden />
+          放大约到边
+        </button>
+      </div>
+      <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+        居中只挪位置；放大把每颗豆变成 2×2、3×3 块，零空洞零锯齿。
+      </p>
+    </div>
+  );
+}
