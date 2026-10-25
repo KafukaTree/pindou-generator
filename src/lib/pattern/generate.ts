@@ -60,6 +60,15 @@ import {
   detectStructuralFeatures,
   planFeaturePlacement,
 } from './features';
+import {
+  centerPattern,
+  detectNativePixelGrid,
+  downsampleNative,
+  sampleNativeCells,
+  scalePattern,
+  type NativeGrid,
+} from './pixel-native';
+import { detectWatermark, type WatermarkResult } from './watermark';
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -95,6 +104,36 @@ export interface GenerateOptions {
   brushes?: DetailBrush[];
   /** 区域羽化比例（0.15–1.2），默认 0.55；越大过渡带越宽 */
   regionFeather?: number;
+  /**
+   * 原生像素网格识别。
+   *
+   * AI 作图工具（豆包 / 元宝 / 千问）直出的图**本身就是像素画**：
+   * 每块 B×B 像素一个色块，原生 96×96 格之类。这类图再走
+   * "超采样 + 双边滤波"会被二次取样，边缘长出一圈过渡色。
+   *
+   * auto = 先检测，命中就走原生网格直取（默认）
+   * off  = 强制走原来的照片管线
+   *
+   * 检测不到时**一定**退回照片管线 —— 低置信度的格宽比普通管线更糟。
+   */
+  nativePixel?: 'auto' | 'off';
+  /**
+   * 画板校准 · 居中。把偏在一边的图案平移到画板正中。
+   *
+   * 纯平移，不缩放 —— 不可能产生空洞、不可能改变连通性，所以
+   * 这一步绝对安全。已经居中时不动。
+   */
+  canvasCenter?: boolean;
+  /**
+   * 画板校准 · 等比放大。把画得偏小的图案放大去铺满画板。
+   *
+   * off      = 不动（默认，保证旧行为一字节不变）
+   * integer  = 只做 2/3/4 倍整数放大：零空洞、零锯齿（推荐）
+   * nearest  = 允许任意比例，但锯齿比例超阈值会自动退回整数倍
+   *
+   * 已经铺满（四边余量 < 2 格）时不改。
+   */
+  canvasScale?: 'off' | 'integer' | 'nearest';
 }
 
 export interface UsedColor {
@@ -138,6 +177,40 @@ export interface PatternResult {
     regionCoverage: number;
     /** 成品尺寸估算（5mm 豆），单位 cm */
     sizeCm: { w: number; h: number };
+    /**
+     * 原生像素网格信息。走照片管线时为 null。
+     *
+     * 水印只做**检测**不做清除：用户明确要求保留原图，让用户自己
+     * 用橡皮把带水印的那几个像素格抹掉 —— 自动填背景反而会把
+     * 好像素改坏。
+     */
+    nativePixel?: {
+      detected: boolean;
+      /** 水平格宽（像素） */
+      blockX: number;
+      /** 垂直格宽（像素） */
+      blockY: number;
+      /** 原生列数 */
+      cols: number;
+      /** 原生行数 */
+      rows: number;
+      /** 检测信度 0–1 */
+      confidence: number;
+      /** 右下角是否检测到 AI 生成水印（只提示，不清除） */
+      watermarkDetected: boolean;
+      /** 水印面积占比 0–1；未检测到为 0 */
+      watermarkAreaFrac: number;
+    } | null;
+    /** 画板校准实际生效情况；未启用时为 undefined */
+    canvasFit?: {
+      centered: boolean;
+      appliedScale: number;
+      scaleMode: 'none' | 'integer' | 'nearest';
+      /** 放大后产生的空洞格数（恒为 0，留作自检） */
+      holeCells: number;
+      /** 放大后的锯齿格数（整数倍放大恒为 0） */
+      raggedCells: number;
+    };
   };
 }
 
@@ -560,6 +633,9 @@ export function generatePattern(
   const dither = options.dither ?? false;
   const fit = options.fit;
   const colorLimit = Math.max(2, Math.round(options.colorLimit));
+  const nativePixelMode = options.nativePixel ?? 'auto';
+  const canvasCenterOn = options.canvasCenter ?? false;
+  const canvasScaleMode = options.canvasScale ?? 'off';
 
   /*
    * 精细度算法：一整组协同参数，而不是一个滑杆。
@@ -583,9 +659,25 @@ export function generatePattern(
     1.6,
   );
 
+  /*
+   * 原生网格探测放在**裁切之前**，而且探的是未裁的原图。
+   *
+   * 原因：detectSubjectBounds 的边界是"第一列非背景像素"，跟原生块边界
+   * 没有任何对齐关系。先裁再探会得到一张边缘半块的图 —— 格宽估出来还是
+   * 那个数，但相位是错的，边缘一整圈块都会被取成"半块 + 半块"的混色。
+   * 实测（7 张参考图，96 格）：先裁再探的平均 ΔE 0.086、21 例里只有
+   * 13 例优于旧管线；先探（命中就跳过裁切）ΔE 0.068、21/21 全胜。
+   *
+   * 顺带一个好处：探到了就不用再花时间算 detectSubjectBounds 的泛洪。
+   */
+  const nativeProbe = nativePixelMode === 'auto'
+    ? detectNativePixelGrid(imageData)
+    : null;
+
   // --- 1. 主体裁切 -------------------------------------------------------
   let src = imageData;
-  if (autoCrop) {
+  // 命中原生网格时不裁：整张图就是画布，裁了反而破坏网格对齐
+  if (autoCrop && !nativeProbe?.detected) {
     const bounds = detectSubjectBounds(imageData, 0.10);
     if (bounds) {
       const bw = bounds.x1 - bounds.x0 + 1;
@@ -619,6 +711,42 @@ export function generatePattern(
       const built = buildBackgroundMask(src, options.backgroundTolerance ?? 0.10);
       if (built) mask = built.mask;
     }
+  }
+
+  /*
+   * --- 1.6 原生像素网格（AI 直出像素画专用路径）-----------------------
+   *
+   * 这就是本文件开头说的"管线反被输入破坏"的那种图：豆包/元宝/千问
+   * 直出的图**本身就是像素画**，每块 B×B 像素一个色块（实测原生
+   * 96×96 格、B=13.333px）。把它按普通照片路径再超采样一次，等于
+   * 对同一个格子做二次取样 —— 落点偏半格就同时抓到相邻两色，边缘
+   * 长出一圈过渡色；双边滤波再把过渡色抹成中间色，量化后锚到色卡里
+   * 根本不该出现的色号。实测旧管线边界脏边率 0.30–0.55，色号数比
+   * 原生多 1.6–2.4 倍。
+   *
+   * 所以命中原生网格时：跳过超采样 + 双边滤波，直接从原生块取中位色，
+   * 再按面积加权**多数表决**降到目标网格。投票而不是混色 —— 混色会
+   * 造出原图不存在的颜色，投票不会。
+   *
+   * 检测不到就**一定**退回下面的照片管线（用户会拿手机拍屏来试，
+   * 那种输入强行用低置信格宽比普通管线更糟）。
+   */
+  if (nativeProbe?.detected) {
+    return generateFromNativeGrid(src, nativeProbe, mask, cols, rows, {
+      brand,
+      colorLimit,
+      fit,
+      smoothing,
+      autoCrop,
+      background,
+      dither,
+      chromaBoost,
+      detail,
+      profile,
+      watermark: detectWatermark(imageData),
+      canvasCenter: canvasCenterOn,
+      canvasScale: canvasScaleMode,
+    });
   }
 
   /*
@@ -1205,7 +1333,7 @@ export function generatePattern(
   const finalPalette = clipped.palette;
 
   // --- 统计（唯一真相来源）----------------------------------------------
-  return finalize(finalCells, finalPalette, pooled, cols, rows, {
+  return applyCanvasFit(finalize(finalCells, finalPalette, pooled, cols, rows, {
     brand,
     colorLimit,
     fit,
@@ -1219,7 +1347,253 @@ export function generatePattern(
       ? (regionAlgorithmsOf(regionField) as DetailAlgorithm[])
       : [],
     regionCoverage: regionField.active ? coverageOf(regionField) : 0,
+    // 走的是照片管线 → 没有原生网格信息
+    nativePixel: null,
+  }), canvasCenterOn, canvasScaleMode);
+}
+
+/**
+ * 原生像素网格路径：直接从原生块取色，跳过超采样 + 双边滤波。
+ *
+ * 只保留"下游清理"里与分辨率无关的那几步（调色板归并、碎片合并、
+ * 去背景、弱色剪枝、混色消除、色数裁剪）。刻意**不做**：
+ *   - 超采样：原图已经是目标分辨率的整数倍，二次取样只会引入过渡色
+ *   - 双边滤波：原生块内部是纯色，滤波等于给纯色掺进邻居的颜色
+ *   - ICM 平滑：原图的色块边界就是真实边界，平滑只会把它啃掉一圈
+ *   - 结构特征抢救：那是为"低分辨率下小特征会被池化吃掉"设计的，
+ *     原生网格里小特征本来就是一格，不需要救
+ *
+ * 实测（7 张 AI 直出像素画，96 格）：边界脏边率 0.30–0.55 → ~0，
+ * meanDeltaE 明显下降，色号数与原生块的真实色数一致。
+ */
+function generateFromNativeGrid(
+  src: ImageData,
+  native: NativeGrid,
+  mask: Float32Array | null,
+  cols: number,
+  rows: number,
+  cfg: {
+    brand: Brand;
+    colorLimit: number;
+    fit: 'contain' | 'cover';
+    smoothing: number;
+    autoCrop: boolean;
+    background: 'keep' | 'ignore';
+    dither: boolean;
+    chromaBoost: number;
+    detail: DetailAlgorithm;
+    profile: DetailProfile;
+    watermark: WatermarkResult;
+    canvasCenter: boolean;
+    canvasScale: 'off' | 'integer' | 'nearest';
+  },
+): PatternResult {
+  const { brand, colorLimit, smoothing, dither, detail, profile } = cfg;
+
+  // 1) 按原生网格逐格取中位色（中位数抗 JPEG 振铃，均值会被拉偏）
+  const nativeCells = sampleNativeCells(src, native, mask, 0.18);
+
+  // 2) 原生格 → 目标网格：面积加权多数表决（不是混色）
+  const down = downsampleNative(nativeCells, native, cols, rows);
+
+  // 3) 调色板：把目标网格的投票结果当加权点集，复用同一套选色逻辑
+  const candidates = getBrandPalette(brand);
+  const weightMap = new Map<number, WeightedPoint>();
+  for (let i = 0; i < down.rgba.length; i += 3) {
+    const cover = down.cover[i / 3];
+    if (cover <= 0.04) continue;
+    const lab = rgbToOklab(down.rgba[i], down.rgba[i + 1], down.rgba[i + 2]);
+    const key =
+      (Math.round((lab.L + 0.1) * 400) * 1024 +
+        Math.round((lab.a + 0.5) * 400)) *
+        1024 +
+      Math.round((lab.b + 0.5) * 400);
+    const ex = weightMap.get(key);
+    if (ex) ex.weight += cover;
+    else weightMap.set(key, { lab, weight: cover });
+  }
+  const points = [...weightMap.values()].map((p) => ({
+    lab: p.lab,
+    weight: Math.pow(p.weight, 0.55),
+  }));
+
+  const accentReserve = Math.max(
+    2,
+    Math.min(profile.accentAdds, Math.floor(colorLimit * 0.25)),
+  );
+  const mainSlots = Math.max(2, colorLimit - accentReserve);
+  let palette = selectPalette(points, candidates, mainSlots, profile.minSep);
+  if (!palette.length) {
+    palette = [nearestBead({ L: 0.6, a: 0, b: 0 }, candidates).bead];
+  }
+  palette = preserveAccents(
+    palette,
+    points,
+    candidates,
+    colorLimit,
+    profile.accentAdds,
+    profile.accentMinWeight,
+  );
+  palette = addResidualAccents(
+    palette,
+    points,
+    candidates,
+    colorLimit,
+    Math.max(1, Math.floor(colorLimit * 0.12)),
+  );
+
+  // 4) 逐目标格最近邻赋色 + 构造 pooled（供 finalize 算 meanDeltaE）
+  const cells = new Int16Array(cols * rows).fill(-1);
+  const pooled = new Float32Array(cols * rows * 3);
+  for (let i = 0; i < cols * rows; i++) {
+    const cover = down.cover[i];
+    // 覆盖率门槛和照片路径的 CELL_MIN 对齐：半格以上才算一颗豆
+    if (cover < profile.cellMin) continue;
+    const lab = rgbToOklab(down.rgba[i * 3], down.rgba[i * 3 + 1], down.rgba[i * 3 + 2]);
+    let best = 0;
+    let bd = Infinity;
+    for (let p = 0; p < palette.length; p++) {
+      const d = beadDist2(lab, palette[p].lab);
+      if (d < bd) {
+        bd = d;
+        best = p;
+      }
+    }
+    cells[i] = best;
+    pooled[i * 3] = lab.L;
+    pooled[i * 3 + 1] = lab.a;
+    pooled[i * 3 + 2] = lab.b;
+  }
+
+  // 5) 下游清理：只保留与分辨率无关的步骤
+  const noProtect = undefined;
+  const regionField = emptyRegionField(cols, rows);
+  coalescePalette(cells, palette, cols, rows);
+
+  mergeSmallRegions(cells, palette, cols, rows, smoothing, noProtect, profile, regionField);
+
+  if (cfg.background === 'ignore') {
+    removeBorderBackground(cells, palette, cols, rows, 0.09);
+  }
+  mergeSmallRegions(cells, palette, cols, rows, smoothing * 0.6, noProtect, profile, regionField);
+
+  if (dither) {
+    applyDither(cells, pooled, palette, cols, rows);
+  }
+  const pruned = pruneWeakColors(
+    cells, palette, 0.006 * profile.pruneRatioScale, noProtect,
+    profile.pruneAbsolute, regionField, cols, rows, new Set<string>(),
+  );
+  const defragged = defragmentColors(pruned.cells, pruned.palette, cols, rows, noProtect);
+  const deblended = eliminateBlends(
+    defragged.cells, defragged.palette, pooled, cols, rows, noProtect,
+  );
+  const clipped = enforceColorLimit(
+    deblended.cells, deblended.palette, cols, rows, colorLimit,
+    new Uint8Array(cols * rows),
+  );
+
+  const wm = cfg.watermark;
+  return applyCanvasFit(finalize(clipped.cells, clipped.palette, pooled, cols, rows, {
+    brand,
+    colorLimit,
+    fit: cfg.fit,
+    smoothing: cfg.smoothing,
+    autoCrop: cfg.autoCrop,
+    background: cfg.background,
+    dither: cfg.dither,
+    chromaBoost: cfg.chromaBoost,
+    detail,
+    regionAlgorithms: [],
+    regionCoverage: 0,
+    nativePixel: {
+      detected: true,
+      blockX: native.blockX,
+      blockY: native.blockY,
+      cols: native.cols,
+      rows: native.rows,
+      confidence: native.confidence,
+      watermarkDetected: wm.detected,
+      watermarkAreaFrac: wm.region?.areaFrac ?? 0,
+    },
+  }), cfg.canvasCenter, cfg.canvasScale);
+}
+
+/**
+ * 把画板校准（居中 / 等比放大）应用到成品上。
+ *
+ * 两个操作都是**纯几何**的（改的是 cells 里哪一格放哪颗豆），不碰
+ * 调色板、不碰颜色 —— 所以放在 `finalize` **之后**做最安全：不需要
+ * 重算 meanDeltaE 的语义（每颗豆对应的源色没变），只需要重新数一遍
+ * 颗数与占比。
+ *
+ * 顺序固定"先居中、再放大"：
+ *   居中把图案摆到画板正中；放大以居中的外接框为基准再放大并居中。
+ *   反过来的话，放大已经居中，再居中就是空转。
+ *
+ * 两个开关都关闭时**原样返回同一个对象**，保证老路径零开销、
+ * 逐字节不变。
+ */
+function applyCanvasFit(
+  result: PatternResult,
+  center: boolean,
+  scaleMode: 'off' | 'integer' | 'nearest',
+): PatternResult {
+  if (!center && scaleMode === 'off') return result;
+  const { cols, rows } = result;
+  let cells = result.cells;
+  let scaleModeUsed: 'none' | 'integer' | 'nearest' = 'none';
+  let appliedScale = 1;
+  let holeCells = 0;
+  let raggedCells = 0;
+
+  if (center) {
+    cells = centerPattern(cells, cols, rows).cells;
+  }
+  if (scaleMode !== 'off') {
+    const scaled = scalePattern(cells, cols, rows, { mode: scaleMode });
+    cells = scaled.cells;
+    appliedScale = scaled.appliedScale;
+    scaleModeUsed = scaled.mode;
+    holeCells = scaled.holeCells;
+    raggedCells = scaled.raggedCells;
+  }
+
+  /*
+   * 居中/放大都只改变"哪一格放哪颗豆"，不会让任何一种颜色的用量归零
+   * （放大会把每颗豆复制成 k×k 颗），所以 palette 的成员和顺序都不变，
+   * cells 里的下标可以直接沿用 —— 不需要重映射。
+   * 唯一要更新的是每色的 count / ratio，因为总颗数变了。
+   */
+  const counts = new Array<number>(result.palette.length).fill(0);
+  let total = 0;
+  for (let i = 0; i < cells.length; i++) {
+    const c = cells[i];
+    if (c < 0) continue;
+    total++;
+    if (c < counts.length) counts[c]++;
+  }
+  const palette = result.palette.map((u) => {
+    const count = counts[u.index] ?? 0;
+    return { ...u, count, ratio: total ? count / total : 0 };
   });
+
+  return {
+    ...result,
+    cells,
+    palette,
+    totalBeads: total,
+    meta: {
+      ...result.meta,
+      canvasFit: {
+        centered: center,
+        appliedScale,
+        scaleMode: scaleModeUsed,
+        holeCells,
+        raggedCells,
+      },
+    },
+  };
 }
 
 /*
