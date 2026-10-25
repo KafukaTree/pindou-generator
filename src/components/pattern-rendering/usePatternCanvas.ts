@@ -47,7 +47,6 @@ import {
   applyEdits,
   editCount,
   floodFill,
-  invertDelta,
   makeDelta,
   pickCodeAt,
   type EditDelta,
@@ -1442,9 +1441,6 @@ export const clampBrushWidth = (w: number): number =>
   Math.min(MAX_BRUSH_WIDTH, Math.max(MIN_BRUSH_WIDTH, Math.round(w)));
 
 
-/** 编辑历史上限：每笔一格一条 delta，太大反而找不到想撤的那一步 */
-const MAX_EDIT_HISTORY = 200;
-
 export interface UsePatternCanvasOptions {
   /** 受控的区域笔刷 */
   brushes?: DetailBrush[];
@@ -1472,6 +1468,23 @@ export interface UsePatternCanvasOptions {
    * 不能共用一套 fit。
    */
   editing?: boolean;
+  /*
+   * ---- 撤销 / 重做 / 还原：交给父级的**文档级历史栈**执行 ----
+   *
+   * 画布自己不再记账。原因见下面那段大注释：一份图纸的"文档"包含图源、
+   * 画板尺寸、参数、手改格、区域笔刷，画布只看得见其中两样 —— 它记的账
+   * 天然管不住换图 / 换尺寸 / 居中 / 放大这四条路径。那四条改完文档后，
+   * 画布栈里还留着按旧网格算出来的绝对下标，撤销一去就写到别的格子上。
+   */
+  /** 撤销一步 */
+  onUndo?: () => void;
+  /** 重做一步 */
+  onRedo?: () => void;
+  /** 把所有手改格子恢复成引擎生成的样子（进历史栈，可撤销） */
+  onResetEdits?: () => void;
+  /** 父级历史栈现在能不能撤销 / 重做（决定按钮 disabled） */
+  canUndoDoc?: boolean;
+  canRedoDoc?: boolean;
 }
 
 export function usePatternCanvas(
@@ -1489,6 +1502,11 @@ export function usePatternCanvas(
     onCurrentCodeChange,
     initialTool,
     editing = false,
+    onUndo,
+    onRedo,
+    onResetEdits,
+    canUndoDoc,
+    canRedoDoc,
   } = options;
 
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1772,44 +1790,44 @@ export function usePatternCanvas(
   currentCodeRef.current = currentCode;
 
   /*
-   * 撤销/重做栈存的是 **delta**（改了哪些格、改之前是什么、改之后是什么），
-   * 不是整份 EditMap 快照 —— 一张 320 格图纸改 500 格时，快照会占几十 MB。
-   */
-  /*
-   * 刷区域的"隐式应用"也要能撤销（lead 明确要求）。
+   * ---- 撤销栈已经上移到页面级（`src/hooks/useDocHistory.ts`）----
    *
-   * 但刷子和编辑是两个不同的数据层：刷子改的是 `brushes`（引擎重算的输入），
-   * 编辑改的是 `edits`（格子覆盖层）。撤销栈如果只认 delta，就撤不掉
-   * brushes 的变化。所以这里额外记一份"刷子快照"，让 Ctrl+Z 在两类操作
-   * 之间按时间顺序回退 —— 用户不关心底层是哪个层，他只知道"刚才那一下"。
+   * 这里原来有一套自己的 `undoLogRef` / `redoLogRef`，只认「手工编辑」和
+   * 「区域笔刷」两种条目。它有三个走不通的地方：
+   *
+   *   1. **没有清空入口**。栈的生命周期 = 组件挂载期，而一张图纸的"文档
+   *      身份"在这期间至少换过七次（换图、换尺寸、恢复历史、居中、放大、
+   *      改边距、改网格）。每换一次，栈里那些按旧网格算出来的**绝对下标**
+   *      就全部失效 —— 换张图后按 Ctrl+Z，旧图的下标被当成新图的格子写进
+   *      去，画布上冒出几颗从没画过的豆子。
+   *   2. **看不见文档的其余部分**。换尺寸/居中/放大直接把 cells 换掉，
+   *      画布栈里对应的条目还指向老坐标系；这类动作本身完全不进栈。
+   *   3. **刷子工具条的撤销/清空改了文档却不记账**，还顺手不清重做栈 ——
+   *      于是「点撤销删掉区域 → Ctrl+Z 空转一次 → Ctrl+Shift+Z 让区域
+   *      凭空复活」，而复活出来的那一次修改从来没有被真正执行过。
+   *
+   * 所以现在画布只做一件事：把用户动作翻译成 props 变化（`onBrushesChange`
+   * / `onEditsChange`），撤销的记账与执行全部交给父级那份把整份文档当对象
+   * 的栈。画布这里只剩三个薄委托。
    */
-  type BrushUndoEntry = { kind: 'brushes'; before: DetailBrush[]; after: DetailBrush[] };
-  type EditUndoEntry = { kind: 'edits'; delta: EditDelta };
-  const undoLogRef = useRef<(BrushUndoEntry | EditUndoEntry)[]>([]);
-  const redoLogRef = useRef<(BrushUndoEntry | EditUndoEntry)[]>([]);
-  /** 栈状态用计数器推进渲染（栈本身在 ref 里，避免每次 push 都整棵重渲染） */
-  const [historyTick, setHistoryTick] = useState(0);
-  const bumpHistory = useCallback(() => setHistoryTick((t) => t + 1), []);
+  const undoEdit = useCallback(() => {
+    onUndo?.();
+  }, [onUndo]);
 
-  /** 把一笔记入撤销栈（同时清空重做栈：新的分支开始了） */
-  const pushUndo = useCallback(
-    (entry: BrushUndoEntry | EditUndoEntry) => {
-      const log = undoLogRef.current;
-      log.push(entry);
-      if (log.length > MAX_EDIT_HISTORY) log.shift();
-      redoLogRef.current = [];
-      bumpHistory();
-    },
-    [bumpHistory],
-  );
+  const redoEdit = useCallback(() => {
+    onRedo?.();
+  }, [onRedo]);
 
-  /** 提交一批编辑 delta（一次油漆桶 / 一笔涂色 = 一条或多条 delta，原子撤销） */
+  const canUndoEdit = canUndoDoc ?? false;
+  const canRedoEdit = canRedoDoc ?? false;
+
+  /** 提交一批编辑 delta（一次油漆桶 / 一笔涂色 = 一条或多条 delta） */
   const commitDeltas = useCallback(
     (deltas: EditDelta[]) => {
       if (!onEditsChange || deltas.length === 0) return;
       let next = editsRef.current;
       for (const d of deltas) next = applyDelta(next, d);
-      // 多条 delta 合成一条历史项，撤销时一起退掉
+      // 多条 delta 合成一条：这一笔真正写了哪些色号要用它（见下）
       const merged: EditDelta =
         deltas.length === 1
           ? deltas[0]
@@ -1819,7 +1837,6 @@ export function usePatternCanvas(
               after: deltas.flatMap((d) => d.after),
             };
       editsRef.current = next;
-      pushUndo({ kind: 'edits', delta: merged });
       onEditsChange(next, deltas);
       /*
        * 记「常用」：这一笔真正写了哪些色号。
@@ -1845,7 +1862,7 @@ export function usePatternCanvas(
         });
       }
     },
-    [onEditsChange, pushUndo],
+    [onEditsChange],
   );
 
   const setCurrentCode = useCallback(
@@ -2678,18 +2695,17 @@ export function usePatternCanvas(
     const groups = pendingRef.current;
     if (groups.length === 0) return;
     const flat = groups.flat();
-    const before = brushesRef.current ?? [];
-    const next = [...before, ...flat];
+    const next = [...(brushesRef.current ?? []), ...flat];
     const clipped = next.length > MAX_BRUSHES ? next.slice(next.length - MAX_BRUSHES) : next;
     brushesRef.current = clipped;
-    /*
-     * 记一笔历史。退出刷区域时草稿是**隐式应用**的（不弹确认），如果这次
-     * 应用撤不掉，用户会觉得"我只是切了个开关，选区就没了"。
-     */
-    pushUndo({ kind: 'brushes', before, after: clipped });
     setPendingStrokes([]);
+    /*
+     * 只调 onBrushesChange，不自己记账 —— 父级的历史栈看到 brushes 变了
+     * 就会记一笔。退出刷区域时草稿是**隐式应用**的（不弹确认），所以这笔
+     * 必须在栈里：否则用户会觉得"我只是切了个开关，选区就没了"。
+     */
     onBrushesChange?.(clipped);
-  }, [onBrushesChange, setPendingStrokes, pushUndo]);
+  }, [onBrushesChange, setPendingStrokes]);
 
   /** 取消选区：只丢草稿，已应用的一根汗毛都不动 */
   const cancelPending = useCallback(() => {
@@ -3674,81 +3690,24 @@ export function usePatternCanvas(
     if (!panRef.current) setEditCursor(null);
   }, [stopEdgeScroll]);
 
-  // ---- 撤销 / 重做（统一历史） ----
-  /*
-   * 撤销栈里混着两类操作：编辑 delta 和刷子快照。它们分属不同的数据层，
-   * 但用户在界面上只看到"我刚做的那一下"，所以按时间顺序统一回退。
-   *
-   * 刷子那条尤其重要：退出刷区域时草稿会被**隐式应用**（不弹确认），
-   * 如果那次应用撤不掉，用户会觉得"我只是切了个开关，选区就没了"。
-   */
-  const undoEdit = useCallback(() => {
-    const log = undoLogRef.current;
-    const entry = log.pop();
-    if (!entry) return;
-    redoLogRef.current.push(entry);
-    if (entry.kind === 'brushes') {
-      brushesRef.current = entry.before;
-      onBrushesChange?.(entry.before);
-    } else if (onEditsChange) {
-      const next = applyDelta(editsRef.current, invertDelta(editsRef.current, entry.delta));
-      editsRef.current = next;
-      onEditsChange(next, []);
-    }
-    bumpHistory();
-  }, [onBrushesChange, onEditsChange, bumpHistory]);
-
-  const redoEdit = useCallback(() => {
-    const entry = redoLogRef.current.pop();
-    if (!entry) return;
-    undoLogRef.current.push(entry);
-    if (entry.kind === 'brushes') {
-      brushesRef.current = entry.after;
-      onBrushesChange?.(entry.after);
-    } else if (onEditsChange) {
-      const next = applyDelta(editsRef.current, entry.delta);
-      editsRef.current = next;
-      onEditsChange(next, []);
-    }
-    bumpHistory();
-  }, [onBrushesChange, onEditsChange, bumpHistory]);
-
-  const canUndoEdit = undoLogRef.current.length > 0;
-  const canRedoEdit = redoLogRef.current.length > 0;
-  /*
-   * historyTick 只用来"推一下"渲染：撤销栈在 ref 里，push 不会触发重渲染，
-   * 按钮的 disabled 状态就会滞后一帧。这个 void 表达式让 lint 知道它是故意的。
-   */
-  void historyTick;
+  // ---- 撤销 / 重做：委托给页面级的文档历史栈（见文件上方那段注释） ----
   const editedCount = editEnabled ? editCount(edits) : 0;
 
-  /** 清空所有手工编辑（可撤销：整批合成一条 delta 反转） */
+  /** 还原全部手改格子。真正的写回在父级做 —— 要进统一历史栈，才能撤销回来 */
   const clearEdits = useCallback(() => {
-    if (!onEditsChange) return;
-    const cur = editsRef.current;
-    const cells = Object.keys(cur)
-      .map(Number)
-      .filter((i) => Number.isInteger(i));
-    if (cells.length === 0) return;
-    const delta: EditDelta = {
-      cells,
-      before: cells.map((c) => cur[c]),
-      after: cells.map(() => undefined as string | undefined),
-    };
-    /*
-     * 压栈的是**原始** delta，不要在这里预反转 —— undoEdit 会调 invertDelta
-     * 再翻一次。早先预反转了一次，结果"还原"撤不回（撤销后仍是 0 格）。
-     */
-    pushUndo({ kind: 'edits', delta });
-    editsRef.current = EMPTY_EDITS;
-    onEditsChange(EMPTY_EDITS, [delta]);
-  }, [onEditsChange, pushUndo]);
+    onResetEdits?.();
+  }, [onResetEdits]);
 
-  // ---- 撤销 / 清空 ----
+  // ---- 撤销 / 清空（刷区域工具条） ----
   /*
    * 两者都优先作用在**草稿**上：草稿是用户刚画、还没提交的东西，
    * 撤销它不需要等重算，是最便宜也最符合直觉的操作。草稿空了才动
-   * 已应用的部分（那才需要走 onBrushesChange 触发重算）。
+   * 已应用的部分。
+   *
+   * 已应用的选区不再由画布"自己砍掉最后一簇" —— 那条路径一次可能砍掉
+   * 好几块（`clusterBrushes` 会把挨得近的两笔并在同一簇里），而且它绕过
+   * 了历史栈，砍掉之后连撤销都救不回来。现在改成退文档层面的上一步，
+   * 砍多少由那一步本身就决定的快照说了算。
    */
   const undoBrush = useCallback(() => {
     const drafts = pendingRef.current;
@@ -3756,17 +3715,8 @@ export function usePatternCanvas(
       setPendingStrokes(drafts.slice(0, -1));
       return;
     }
-    const cur = brushesRef.current ?? [];
-    if (cur.length === 0) return;
-    // 整笔撤掉：按簇算出最后一笔占多少个点，一次砍掉它们
-    const clusters = pattern
-      ? clusterBrushes(cur, pattern.cols, pattern.rows)
-      : [cur];
-    const lastLen = clusters.length > 0 ? clusters[clusters.length - 1].length : 1;
-    const next = cur.slice(0, Math.max(0, cur.length - lastLen));
-    brushesRef.current = next;
-    onBrushesChange?.(next);
-  }, [onBrushesChange, setPendingStrokes, pattern]);
+    onUndo?.();
+  }, [onUndo, setPendingStrokes]);
 
   const clearBrushes = useCallback(() => {
     if (pendingRef.current.length > 0) {
@@ -3778,8 +3728,13 @@ export function usePatternCanvas(
     onBrushesChange?.([]);
   }, [onBrushesChange, setPendingStrokes]);
 
-  /** 撤销/清空按钮是否该亮：草稿或已应用任一非空 */
-  const canUndo = pendingCount > 0 || appliedCount > 0;
+  /**
+   * 撤销/清空按钮是否该亮。
+   *
+   * 草稿优先（那是画布自己管得着的东西）；草稿为空时看父级历史栈 ——
+   * 撤销现在退的是文档层面的上一步，不再只限"已应用的选区"。
+   */
+  const canUndo = pendingCount > 0 || (canUndoDoc ?? false);
   const hasAnything = canUndo;
 
   /**
@@ -3901,7 +3856,6 @@ export function usePatternCanvas(
     canRedoEdit,
     clearEdits,
     editedCount,
-    editHistoryTick: historyTick,
     hud: pattern
       ? {
           cols: pattern.cols,

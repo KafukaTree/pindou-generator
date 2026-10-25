@@ -101,6 +101,23 @@ export interface PatternCanvasProps {
    * 不传时缩放组退回工具条内联渲染，功能不丢（组件被别处复用时不会白屏）。
    */
   zoomSlot?: HTMLElement | null;
+  /*
+   * ---------------- 撤销 / 重做 / 还原（全部可选） ----------------
+   *
+   * 这三件事的真相在父级：一份图纸的"文档"包含图源、画板尺寸、参数、
+   * 手改格、区域笔刷，画布只看得见后两样。所以栈由页面统一持有
+   * （`src/hooks/useDocHistory.ts`），画布只负责把"用户点了按钮"传出去。
+   * 不传时按钮自然 disabled —— 不会出现"能点但点了没反应"。
+   */
+  /** 撤销一步 */
+  onUndo?: () => void;
+  /** 重做一步 */
+  onRedo?: () => void;
+  /** 把所有手改格子还原成引擎生成的样子（进历史栈，可撤销） */
+  onResetEdits?: () => void;
+  /** 父级历史栈现在能不能撤销 / 重做 */
+  canUndoDoc?: boolean;
+  canRedoDoc?: boolean;
 }
 
 /**
@@ -235,6 +252,11 @@ export function PatternCanvas({
   initialTool,
   onActivityChange,
   zoomSlot: zoomSlotProp,
+  onUndo,
+  onRedo,
+  onResetEdits,
+  canUndoDoc,
+  canRedoDoc,
 }: PatternCanvasProps) {
   /**
    * 「编辑」是总开关（默认关）。
@@ -258,6 +280,11 @@ export function PatternCanvas({
     onCurrentCodeChange,
     initialTool,
     editing: editActive,
+    onUndo,
+    onRedo,
+    onResetEdits,
+    canUndoDoc,
+    canRedoDoc,
   });
   const {
     hostRef,
@@ -793,24 +820,16 @@ export function PatternCanvas({
   const onKeyDown = useCallback(
     (e: KeyboardEvent<HTMLDivElement>) => {
       /*
-       * 撤销/重做：Ctrl+Z / Cmd+Z，以及 Ctrl+Shift+Z / Ctrl+Y 重做。
+       * 撤销/重做**不在这里处理**。
        *
-       * 放在最前面，且**不管编辑模式开没开**都生效 —— 撤销是对已发生的
-       * 操作的回退，不该要求用户先切进某个模式。刷区域的隐式应用也在这
-       * 条历史里（见 hook 的 applyPending），所以刷完直接 Ctrl+Z 就能退。
+       * 这里原来有一份，window 上还有一份兜底 —— 两个都挂着的时候按一次
+       * Ctrl+Z 会连退两步（键盘事件先从内层容器冒泡到 window，两条路径各
+       * 调一次 undo）。实测：画两笔、按一次撤销，两笔一起没了。
+       *
+       * 现在只有 window 那一份（见下方 effect），统一在一处判定，顺便也
+       * 覆盖"焦点不在画布上"的情况。
        */
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && (e.key === 'z' || e.key === 'Z')) {
-        e.preventDefault();
-        if (e.shiftKey) redoEdit();
-        else undoEdit();
-        return;
-      }
-      if (mod && (e.key === 'y' || e.key === 'Y')) {
-        e.preventDefault();
-        redoEdit();
-        return;
-      }
       // 编辑模式下的工具快捷键（1–4：手绘/橡皮/取色/油漆桶），Esc 退出
       if (editActive && !mod) {
         if (e.key === 'Escape') {
@@ -890,8 +909,6 @@ export function PatternCanvas({
       applyPending,
       cancelPending,
       undoBrush,
-      undoEdit,
-      redoEdit,
       editActive,
       setEditTool,
       onEditPointerLeave,
@@ -899,20 +916,25 @@ export function PatternCanvas({
   );
 
   /*
-   * 全局撤销快捷键。
+   * 全局撤销快捷键 —— **唯一**的一处。
    *
-   * scrollRef 上的 onKeyDown 只在容器有焦点时触发，而用户点完色卡/按钮后
-   * 焦点就跑到按钮上了 —— 那时 Ctrl+Z 会落到按钮身上，"撤销不灵"的印象
-   * 就是这么来的。这里再挂一个 window 监听兜底：
-   *   - 焦点在输入框/文本域里时让路（那里 Ctrl+Z 是撤销输入，不能抢）；
-   *   - 有组合键修饰（shift/alt）且不是 shift+z 的，也不抢。
+   * 原来容器上还有一份 onKeyDown 也处理 Ctrl+Z，两份同时挂着时按一次会
+   * 连退两步：键盘事件先从内层容器冒泡，容器的 React 处理器退一次，接着
+   * 冒到 window 又退一次。实测「画两笔、按一次撤销，两笔一起没了」。
+   *
+   * 统一挂 window 的好处：焦点不用在画布上也能用。用户点完色卡/按钮后
+   * 焦点就跑到按钮身上了，只在容器上监听会"撤销不灵"。
+   *
+   * 两个让路条件：
+   *   - 焦点在输入框 / 文本域 / 可编辑区里（那里的 Ctrl+Z 是撤销输入）；
+   *   - 有其它修饰键（alt）的，不是我们的事。
    */
   useEffect(() => {
     /*
-     * 挂的条件是"有可撤销的东西"，不能只看 editEnabled —— 刷区域的隐式应用
-     * 也要能 Ctrl+Z 撤销（lead 明确要求），而刷区域不依赖编辑层。
+     * 不再用 editEnabled/brushEnabled 当开关：撤销现在退的是**整份文档**的
+     * 上一步，跟"当前在不在编辑模式"无关。用户看完图想退掉刚才那次换尺寸，
+     * 不该要求他先切进编辑模式。有没有得退由 canUndoEdit 自己表达。
      */
-    if (!editEnabled && !brushEnabled) return;
     const onWindowKey = (e: globalThis.KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
@@ -930,7 +952,7 @@ export function PatternCanvas({
     };
     window.addEventListener('keydown', onWindowKey);
     return () => window.removeEventListener('keydown', onWindowKey);
-  }, [editEnabled, brushEnabled, undoEdit, redoEdit]);
+  }, [undoEdit, redoEdit]);
 
   /*
    * 色板浮层打开时的 Esc。

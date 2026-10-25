@@ -73,6 +73,7 @@ import {
   resizePatternToCanvas,
 } from '@/lib/pattern/canvas-resize';
 import { readStorage, writeStorage } from '@/hooks/useLocalStorage';
+import { useDocHistory } from '@/hooks/useDocHistory';
 import {
   clearWorkspaceSession,
   decodePatternSnapshot,
@@ -161,6 +162,33 @@ const THEME_KEY = 'pindou.theme';
 const FOCUS_KEY = 'pindou.leftCollapsed';
 
 type Theme = 'light' | 'dark';
+
+/**
+ * 一份"文档"的完整快照 —— 撤销栈里存的就是它。
+ *
+ * 划分标准是"用户会不会觉得这是另一个东西"：换图、换画板尺寸会换掉整个
+ * 上下文，换参数会换整张图，手绘和区域笔刷是局部改动，边距/羽化改变排版。
+ * 这些全算同一份文档的不同状态，所以撤销能一路走回去。
+ *
+ * 路径依赖的细节：
+ *  - `pattern` 与 `outlinePattern` 是**派生**结果，但它们必须进快照 ——
+ *    「居中」「放大约到边」直接改 cells，只靠图源+参数重算永远回不到
+ *    居中之前的那个结果。
+ *  - `outlineSpace` 是描边所在网格空间的记录（见 outlineSpaceRef），
+ *    不还回去的话，撤销后描边 effect 会把 edits 再迁移一遍。
+ */
+interface DocSnapshot {
+  sourceDataUrl: string | null;
+  blankCanvas: { cols: number; rows: number; id: string } | null;
+  options: GenerateOptions;
+  edits: EditMap;
+  brushes: DetailBrush[];
+  margin: MarginMode;
+  regionFeather: number;
+  pattern: PatternResult | null;
+  outlinePattern: PatternResult | null;
+  outlineSpace: { cols: number; rows: number; mode: MarginMode } | null;
+}
 
 export default function Home() {
   const { isLoaded, addToHistory } = useHistory();
@@ -269,6 +297,16 @@ export default function Home() {
    * 值进去就用它，用完立刻清空。
    */
   const carriedRef = useRef<PatternResult | null>(null);
+  /*
+   * 这一帧的 blankCanvas 变化是"撤销/重做写回来的"，不是"用户新建板子"。
+   *
+   * 下面那条 `blankCanvas → 造图纸` 的 effect 只依赖 blankCanvas，它分不清
+   * 这两种情况：撤销把画板从 57 换回 29 时，它会以为用户新建了一块板，
+   * 于是 `setPattern(makeBlankPattern(...))` 把刚还原的图案盖成空板，
+   * 只剩手绘覆盖层还浮在上面。实测表现：重做到 57×57 后颗数显示 8
+   * （应为 28）—— 图案没了，只有 8 颗手绘的豆子。
+   */
+  const docApplyRef = useRef(false);
 
   // ---- 输出 --------------------------------------------------------------
   const [pattern, setPattern] = useState<PatternResult | null>(null);
@@ -429,6 +467,8 @@ export default function Home() {
       // 同理，手工覆盖层是按"格子下标"存的，换一张图后同一套下标
       // 指向的完全是别的位置 —— 不清就会把上一张图的改动套到新图上
       setEdits(EMPTY_EDITS);
+      // 新文档：旧索引对新图毫无意义，历史必须清零
+      setDocEpoch((n) => n + 1);
     },
     [],
   );
@@ -463,6 +503,26 @@ export default function Home() {
   const [sessionBooting, setSessionBooting] = useState(true);
   /* restore effect 刚把 sourceDataUrl/blankCanvas 补上（首帧它们还是 null） */
   const restoredThisTickRef = useRef(false);
+  /*
+   * 启动恢复那一次变化不算用户的"上一步"。
+   *
+   * 恢复会把图源、画布、edits 一次性补上来，若不拦住，撤销栈的第一条就是
+   * "空工作区" —— 用户刷新一下再点撤销，刚画的东西凭空消失。用 ref 而不是
+   * 布尔 prop：恢复和 setSessionBooting(false) 在同一批里，下一轮渲染时布尔
+   * 已经翻回去了，拦不住；而"恢复 effect 先跑、历史 effect 后跑"的顺序由
+   * 声明顺序保证，ref 最可靠。
+   */
+  const docHistorySuppressRef = useRef(false);
+  /*
+   * 文档身份。换了身份（放新图 / 清空 / 从空态新建画布）就要清空撤销历史。
+   *
+   * 不清的后果是实测出来的：放一张示例图后按 Ctrl+Z，会退回"空工作区"——
+   * 而空工作区里画布组件根本不渲染，撤销/重做按钮和快捷键跟着一起消失，
+   * 用户再也回不去，只能刷新。打开新文档重置历史是所有编辑器的一致做法。
+   *
+   * 换尺寸**不**换身份：那是同一份图纸换了块板子，要能撤销。
+   */
+  const [docEpoch, setDocEpoch] = useState(0);
 
   useEffect(() => {
     if (sessionRestoredRef.current) return;
@@ -473,6 +533,7 @@ export default function Home() {
       return;
     }
     restoredThisTickRef.current = true;
+    docHistorySuppressRef.current = true;
     setSessionBooting(false);
 
     if (session.blankCanvas) {
@@ -795,6 +856,14 @@ export default function Home() {
    */
   useEffect(() => {
     if (!blankCanvas) return;
+    /*
+     * 撤销/重做刚写回来的画板：pattern 已经随快照一起还原了，再造一张
+     * 空板只会把它盖掉（实测：重做到 57×57 后图案消失，只剩手绘的 8 颗）。
+     */
+    if (docApplyRef.current) {
+      docApplyRef.current = false;
+      return;
+    }
     const carried = carriedRef.current;
     carriedRef.current = null;
     setPattern(carried ?? makeBlankPattern(blankCanvas.cols, blankCanvas.rows, options));
@@ -1117,6 +1186,156 @@ export default function Home() {
   }, [pattern, outlinePattern, edits, editedCount, options.brand]);
 
   /*
+   * ---------------------------------------------------------------
+   * 文档级撤销 / 重做
+   * ---------------------------------------------------------------
+   *
+   * 用户原话：「撤销和还原，还有还原到最初的那个就是有点不太对，尤其是你
+   * 涂了某些区域应用算法之后，它就有点怪怪的。而且还有改画幅什么什么的，
+   * 我觉得这都挺怪的，没有串起来。」
+   *
+   * 根本原因是回退能力散在三处互不相干的地方（画布内部的 delta 栈、刷区域
+   * 工具条的撤销、编辑工具条的还原），每处只认识自己那一小块数据；而换图 /
+   * 换尺寸 / 居中 / 放大这些**改变文档本身**的动作完全不进任何栈。详见
+   * `src/hooks/useDocHistory.ts` 开头的长注释。
+   *
+   * 这里把整份文档当一个对象交给它：变化前后各拍一个快照。快照里全是引用
+   * （每次变化 pattern/edits/brushes 都是新对象），所以"拍快照"只是几个指针。
+   *
+   * 记「意图」不记「派生」：`pattern` 是引擎算出来的，brushes 一变它几百
+   * 毫秒后自己就变，若两个变化都记一笔，撤销一次只会退掉那次重算（图案闪
+   * 回旧结果、选区还在图上）—— 这正是用户说的"怪怪的"。所以只有 sig 里那
+   * 几项（图源、画板、参数、edits、brushes、边距、羽化）变了才记，pattern
+   * 与描边结果只作为快照的一部分带着走（居中/放大直接改 cells，撤销得把
+   * 那份 cells 一起还回去）。
+   */
+  const docSnapshot = useMemo<DocSnapshot>(
+    () => ({
+      sourceDataUrl,
+      blankCanvas,
+      options,
+      edits,
+      brushes,
+      margin,
+      regionFeather,
+      pattern,
+      outlinePattern,
+      outlineSpace: outlineSpaceRef.current,
+    }),
+    [
+      sourceDataUrl,
+      blankCanvas,
+      options,
+      edits,
+      brushes,
+      margin,
+      regionFeather,
+      pattern,
+      outlinePattern,
+    ],
+  );
+
+  const docSig = useMemo(
+    () => [
+      sourceDataUrl,
+      blankCanvas,
+      /*
+       * 参数逐项展开而不是整个 options 对象：源图解码完会顺手把 aspect
+       * 改成图片真实比例，那不是用户动作。若整个对象进签名，每换一张图
+       * 都会多记一笔"什么都没变"的历史，撤销要多按一次。
+       */
+      options.gridSize,
+      options.brand,
+      options.colorLimit,
+      options.fit,
+      options.smoothing,
+      options.autoCrop,
+      options.background,
+      options.chromaBoost,
+      options.dither,
+      options.detail,
+      edits,
+      brushes,
+      margin,
+      regionFeather,
+    ],
+    [sourceDataUrl, blankCanvas, options, edits, brushes, margin, regionFeather],
+  );
+
+  const applyDoc = useCallback((d: DocSnapshot) => {
+    /*
+     * 顺序不重要（React 会把这一批合并成一次渲染），但**全都得设**：
+     * 少设一样，撤销后图上就是"半旧半新"的状态，比不撤销更让人困惑。
+     */
+    /*
+     * 告诉"空白画布 → 造图纸"那条 effect：这一帧的 blankCanvas 变化是
+     * 还原历史写回来的，**不要**再造一张空板把 pattern 盖掉。见 docApplyRef。
+     */
+    if (d.blankCanvas) docApplyRef.current = true;
+    setSourceDataUrl(d.sourceDataUrl);
+    setBlankCanvas(d.blankCanvas);
+    setOptions(d.options);
+    setEdits(d.edits);
+    setBrushes(d.brushes);
+    setMargin(d.margin);
+    setRegionFeather(d.regionFeather);
+    setOutlinePattern(d.outlinePattern);
+    /*
+     * 描边所在空间也要还回去。描边 effect 每次跑都会拿它和新的行列数比，
+     * 不等就重新迁移一遍 edits —— 撤销时若不还，迁移就会以还原后的 edits
+     * 为输入再算一次，结果既不是撤销前也不是撤销后的样子。
+     */
+    outlineSpaceRef.current = d.outlineSpace;
+    setPattern(d.pattern);
+  }, []);
+
+  /*
+   * 哪几项变化要**单独**占一条历史。
+   *
+   * 与 docSig 逐位对齐。默认全部合并（拖动滑杆 3 秒 = 一步，撤销一次回到
+   * 拖动前），但这几样是用户心里有明确边界的离散动作，一次就是一步：
+   *
+   *   - 换图 / 换画板：上下文整个换了
+   *   - 手绘、区域笔刷：一笔就是一笔，连画十几笔只留一条就退不回去了
+   *   - 边距：三个按钮切换，不是滑杆
+   *
+   * 反过来，gridSize / colorLimit / chromaBoost 这些连着滑的必须合并。
+   */
+  const docSigImmediate = useMemo(
+    () => [
+      true, // sourceDataUrl
+      true, // blankCanvas
+      false, // gridSize
+      false, // brand（点选，但改了会整张重算，合并成本低、体验更连贯）
+      false, // colorLimit
+      false, // fit
+      false, // smoothing
+      false, // autoCrop
+      false, // background
+      false, // chromaBoost
+      false, // dither
+      false, // detail
+      true, // edits
+      true, // brushes
+      true, // margin
+      false, // regionFeather
+    ],
+    [],
+  );
+
+  const docHistory = useDocHistory(docSnapshot, docSig, applyDoc, {
+    suppressRef: docHistorySuppressRef,
+    immediate: docSigImmediate,
+    resetKey: docEpoch,
+  });
+
+  /** 「还原」= 把全部手改格子擦掉。走 jumpTo，所以撤销得回来 */
+  const handleResetEdits = useCallback(() => {
+    if (editCount(docSnapshot.edits) === 0) return;
+    docHistory.jumpTo({ ...docSnapshot, edits: EMPTY_EDITS });
+  }, [docHistory, docSnapshot]);
+
+  /*
    * 02 参数面板的节点，抽出来是为了让**桌面左栏**与**手机抽屉**共用同一份。
    *
    * 为什么要共用：两边各写一遍的话，以后加一个参数只改了一处，另一处就
@@ -1142,12 +1361,20 @@ export default function Home() {
       toast.info('图案已经在正中央了');
       return;
     }
-    setPattern(r.pattern);
-    setEdits(r.edits);
+    /*
+     * 走 jumpTo 而不是直接 setPattern：居中只改 `cells`，**不动**图源、
+     * 参数、edits 这些"意图"。若直接 set，历史层看到的意图没有任何变化，
+     * 这一步就不会被记 —— 用户点了居中，Ctrl+Z 撤掉的却是更早的那一笔，
+     * 表现得就像"居中不可撤销"。这正是用户说的"改画幅什么挺怪的"。
+     *
+     * jumpTo 会先把**现在**压进撤销栈、再把目标写回去，所以撤一次就回到
+     * 居中之前，且再重做又能居中回去。
+     */
+    docHistory.jumpTo({ ...docSnapshot, pattern: r.pattern, edits: r.edits });
     toast.success(
       `已居中：四边余量从 ${r.marginBefore} 格调到 ${r.marginAfter} 格`,
     );
-  }, [displayPattern, edits]);
+  }, [displayPattern, edits, docHistory, docSnapshot]);
 
   const handleScaleToFit = useCallback(() => {
     if (!displayPattern) return;
@@ -1156,14 +1383,14 @@ export default function Home() {
       toast.info('已经铺满画板，或放大倍数不到 2 倍（拼豆只做整数倍放大）');
       return;
     }
-    setPattern(r.pattern);
-    setEdits(r.edits);
+    // 同居中：只改 cells，必须显式进历史（见 handleCenter 的注释）
+    docHistory.jumpTo({ ...docSnapshot, pattern: r.pattern, edits: r.edits });
     toast.success(
       r.raggedCells > 0
         ? `已放大 ${r.amount} 倍，有 ${r.raggedCells} 格宽度不齐`
         : `已放大 ${r.amount} 倍，无空洞无锯齿`,
     );
-  }, [displayPattern, edits]);
+  }, [displayPattern, edits, docHistory, docSnapshot]);
 
   const sizeCm = pattern?.meta.sizeCm ?? null;
   const paramsNode = pattern || blankCanvas ? (
@@ -1422,6 +1649,8 @@ export default function Home() {
       setBrushes([]);
       setEdits(carried ? carried.edits : EMPTY_EDITS);
       setOptions((prev) => ({ ...prev, brand }));
+      // 从空态新建 = 新文档（清历史）；同一份图纸换板子 = 不换身份（可撤销）
+      if (!displayPattern) setDocEpoch((n) => n + 1);
       setBlankCanvas({ cols, rows, id: makeBlankId() });
       // 记一笔历史时不要让"签名相同"挡住
       lastRecordedRef.current = '';
@@ -1447,6 +1676,7 @@ export default function Home() {
   );
 
   const handleClear = useCallback(() => {
+    setDocEpoch((n) => n + 1);
     setSourceDataUrl(null);
     setBlankCanvas(null);
     setImageInfo(null);
@@ -2082,6 +2312,19 @@ export default function Home() {
                     isWorking={isWorking}
                     onActivityChange={setCanvasActivity}
                     zoomSlot={zoomSlot}
+                    /*
+                     * 撤销 / 重做 / 还原全部上交给页面级的文档历史栈。
+                     *
+                     * 画布内部原来自己有一套，但那只认识 edits 和 brushes 两样
+                     * 东西 —— 换图、换尺寸、居中、放大改的是整份文档，画布看不见
+                     * 也清不掉，撤销一去就把旧网格的下标写到新画布上。详见
+                     * `src/hooks/useDocHistory.ts` 开头。
+                     */
+                    onUndo={docHistory.undo}
+                    onRedo={docHistory.redo}
+                    onResetEdits={handleResetEdits}
+                    canUndoDoc={docHistory.canUndo}
+                    canRedoDoc={docHistory.canRedo}
                   />
                 )}
 
