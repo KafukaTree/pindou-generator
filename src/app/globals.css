@@ -425,17 +425,45 @@
     box-shadow: var(--shadow-px-btn);
     cursor: pointer;
     user-select: none;
-    transition: transform 0.06s steps(2), box-shadow 0.06s steps(2), background-color 0.12s linear;
-    /* 硬投影 = 立体感，按下时整体下沉 */
+    transition:
+      transform 0.08s steps(2),
+      box-shadow 0.08s steps(2),
+      background-color 0.12s linear,
+      border-color 0.12s linear;
+    /*
+     * 悬停**不位移**，只改颜色和投影深浅。这是个刻意的限制。
+     *
+     * 最早写的是「悬停浮起 2px + 投影 3→5px」，看起来像实体键帽在壳里
+     * 进退，很像素风。但用户提醒了一句关键的：这些按钮大量排在一起
+     * ——网格档位 32/48/64/96/160/320 六个一排（gap 6px）、品牌五个一
+     * 排、顶栏工具条七八个一排，而且上下都紧贴 `.px-rule` 分隔线。
+     * 一旦某个按钮往上浮 2px，它的上边缘就会压到上面那条分隔线上，
+     * 投影拉到 5px 也会探进下一行；鼠标在整排上横扫时，整排按钮此起
+     * 彼伏地跳，比没有反馈更花。
+     *
+     * 所以这里只用不会越界的手段：
+     *   1) 底色抬一档（paper-raised → paper-hi）
+     *   2) 描边染成陶土色 —— 4 个方向各 1px，不会串到邻居身上
+     *   3) 投影加深（3px → 4px，只往下探 1px，小于任何一处的 gap）
+     * 三条都在按钮自己的盒子内生效，紧挨分隔线也不会打架。
+     */
   }
 
   .px-btn:hover:not(:disabled) {
     background: var(--paper-hi);
+    /*
+     * 描边变色是**主**暗示，不是补充。
+     *
+     * 深色主题下投影本身是黑的，3px→4px 在深底上几乎读不出来；描边从
+     * 墨色染成陶土色则两种主题都成立，且完全不占额外空间。
+     */
+    border-color: var(--clay);
+    box-shadow: 0 4px 0 0 var(--line-strong);
   }
 
   .px-btn:active:not(:disabled) {
     transform: translateY(3px);
-    box-shadow: 0 0 0 0 rgba(67, 47, 30, 0.85);
+    box-shadow: 0 0 0 0 var(--line-strong);
   }
 
   .px-btn:disabled {
@@ -455,6 +483,9 @@
 
   .px-btn-primary:hover:not(:disabled) {
     background: var(--clay-deep);
+    border-color: var(--clay-deep);
+    /* 主按钮已是实色，描边再染陶土看不出来，改用"实底加深一档"做主暗示 */
+    box-shadow: 0 4px 0 0 var(--clay-deep);
   }
 
   .px-btn-primary:active:not(:disabled) {
@@ -479,11 +510,42 @@
   .px-btn-ghost:hover:not(:disabled) {
     background: var(--paper-sunken);
     color: var(--ink);
+    /*
+     * ghost 不加描边：它平时 border-color 是 transparent，一悬停突然出现
+     * 一圈方框，视觉上比底色变化更响，图标反倒被框住了。只加深底色。
+     */
+    box-shadow: none;
   }
 
   .px-btn-ghost:active:not(:disabled) {
     transform: translateY(1px);
     box-shadow: none;
+  }
+
+  /*
+   * 选中态（aria-pressed=true 的开关，如色号/网格/标尺）。
+   *
+   * 用类而不是行内 style：行内 style 的优先级压过 :hover，实测打开
+   * 开关后再悬停完全没有反应。选中态悬停时底色再深一档（clay-deep），
+   * 保证"已选中"和"正悬停"两个信息能同时读出来。
+   */
+  .px-btn-on {
+    color: var(--on-clay);
+    background: var(--clay);
+    border-color: var(--clay-deep);
+    box-shadow: 0 3px 0 0 var(--clay-deep);
+  }
+
+  .px-btn-on:hover:not(:disabled) {
+    color: var(--on-clay);
+    background: var(--clay-deep);
+    border-color: var(--clay-deep);
+    box-shadow: 0 4px 0 0 var(--clay-deep);
+  }
+
+  .px-btn-on:active:not(:disabled) {
+    transform: translateY(3px);
+    box-shadow: 0 0 0 0 var(--clay-deep);
   }
 
   .px-btn-sm {
@@ -501,6 +563,8 @@
 
   .px-btn-danger:hover:not(:disabled) {
     background: var(--berry-soft);
+    border-color: var(--berry);
+    box-shadow: 0 4px 0 0 var(--berry);
   }
 
   .px-btn-danger:active:not(:disabled) {

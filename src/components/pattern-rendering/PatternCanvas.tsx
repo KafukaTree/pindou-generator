@@ -1085,16 +1085,16 @@ export function PatternCanvas({
   ) => (
     <button
       type="button"
-      className="px-btn px-btn-sm"
+      /*
+       * 选中态曾经写成行内 style，行内优先级高于类，把 :hover 的底色和
+       * 描边全压掉了 —— 色号/网格/标尺三个开关打开后再悬停毫无反应。
+       * 改用 px-btn-on 类，让选中态也参与层叠，悬停依然有反馈。
+       */
+      className={active ? 'px-btn px-btn-sm px-btn-on' : 'px-btn px-btn-sm'}
       onClick={onClick}
       disabled={disabled}
       aria-pressed={active}
       title={title}
-      style={
-        active
-          ? { background: 'var(--clay)', borderColor: 'var(--clay-deep)', color: 'var(--on-clay)' }
-          : undefined
-      }
     >
       {label}
     </button>
@@ -1160,7 +1160,17 @@ export function PatternCanvas({
             // 编辑与刷区域互斥：两套拖动语义打架
             if (brushMode) setBrushMode(false);
           },
-          '手工改格子：手绘 / 橡皮 / 取色 / 油漆桶（可 Ctrl+Z 撤销）',
+          /*
+           * 提示文字必须跟着**当前状态**走，不能只写进入编辑后能做什么。
+           *
+           * 原来无论进出都是「手工改格子：手绘 / 橡皮 / 取色 / 油漆桶」。
+           * 用户悬停已经写着「退出编辑」的按钮时，看到的是另一句介绍编辑
+           * 功能的话 —— 想退出的人被告诉"你可以手绘、橡皮……"，等于答非
+           * 所问。截图里那条黑色长条正好落在这一处，问题最刺眼。
+           */
+          editActive
+            ? '退出编辑：收起工具条，回到看图状态（已画的格子不会丢）'
+            : '手工改格子：手绘 / 橡皮 / 取色 / 油漆桶（可 Ctrl+Z 撤销）',
         )}
       {toggleBtn(showCodes, '色号', () => setShowCodes((v) => !v), '显示/隐藏每颗豆子的色号')}
       {toggleBtn(showGrid, '网格', () => setShowGrid((v) => !v), '显示/隐藏网格线')}

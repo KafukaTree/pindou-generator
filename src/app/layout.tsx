@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from 'next';
 import { Silkscreen } from 'next/font/google';
+import { PixelTooltip } from '@/components/ui/PixelTooltip';
 import './globals.css';
 
 /**
@@ -69,7 +70,14 @@ export default function RootLayout({
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInit }} />
       </head>
-      <body className={`${silkscreen.variable} antialiased`}>{children}</body>
+      <body className={`${silkscreen.variable} antialiased`}>
+        {children}
+        {/*
+          全站接管原生 title 提示条。放在 body 末尾：它只画一个 fixed 定位的
+          气泡，不参与任何布局，放在最后可以避免成为某些 flex 容器的额外子项。
+        */}
+        <PixelTooltip />
+      </body>
     </html>
   );
 }

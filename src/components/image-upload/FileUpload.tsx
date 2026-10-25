@@ -392,11 +392,13 @@ export function FileUpload({
           onKeyDown={handleKeyDown}
           {...interactiveProps}
           className={cn(
-            'relative flex min-h-[168px] cursor-pointer flex-col items-center justify-center gap-2 px-4 py-6 text-center transition-colors duration-100',
+            'group relative flex min-h-[168px] cursor-pointer flex-col items-center justify-center gap-2 px-4 py-6 text-center transition-colors duration-100',
             // 虚线边框：空态用 ink-3，拖拽态换成 clay 并走马灯
+            // 悬停时虚线先一步染上陶土色，比"点了才知道能点"更早给出暗示；
+            // 拖拽态优先级更高，所以用 isDragging 覆盖掉 hover
             isDragging
               ? 'border-2 border-dashed border-[var(--clay)] bg-[var(--clay-soft)]'
-              : 'border-2 border-dashed border-[var(--ink-3)] bg-[var(--paper-sunken)]',
+              : 'border-2 border-dashed border-[var(--ink-3)] bg-[var(--paper-sunken)] hover:border-[var(--clay)] hover:bg-[var(--clay-soft)]',
             disabled && 'cursor-not-allowed opacity-55',
           )}
           style={
@@ -427,7 +429,7 @@ export function FileUpload({
               'flex h-11 w-11 items-center justify-center border-2 transition-transform duration-100',
               isDragging
                 ? '-translate-y-0.5 border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)]'
-                : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink-2)]',
+                : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink-2)] group-hover:border-[var(--clay)] group-hover:bg-[var(--clay)] group-hover:text-[var(--on-clay)]',
             )}
             aria-hidden
           >

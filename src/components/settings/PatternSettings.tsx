@@ -268,7 +268,7 @@ export function PatternSettings({
                 onClick={() => patch({ gridSize: preset })}
                 className={cn(
                   'px-btn px-btn-sm !px-2 !py-1 !text-[11.5px]',
-                  active && '!bg-[var(--clay)] !text-[var(--on-clay)] !border-[var(--clay-deep)]',
+                  active && 'px-btn-on',
                 )}
               >
                 {preset}
@@ -363,8 +363,10 @@ export function PatternSettings({
                   'flex flex-col items-center justify-center gap-0.5 border-2 px-1 py-1.5 transition-[background-color,box-shadow,transform] duration-75',
                   active
                     ? // 选中：clay 底 + 内阴影下沉（看起来被按进去了）
-                      'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)] shadow-[inset_0_2px_0_0_rgba(0,0,0,0.22)]'
-                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:bg-[var(--paper-hi)]',
+                      // 选中态也要有悬停反应：默认选中的那一个（MARD）如果不动，
+                      // 用户会以为整排"坏了"。加深一档实底即可，不加位移。
+                      'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)] shadow-[inset_0_2px_0_0_rgba(0,0,0,0.22)] hover:bg-[var(--clay-deep)]'
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:border-[var(--clay)] hover:bg-[var(--paper-hi)]',
                   disabled && 'cursor-not-allowed',
                 )}
               >
@@ -417,7 +419,7 @@ export function PatternSettings({
                   'flex flex-col items-center gap-0.5 border-2 px-2 py-1.5 transition-[background-color,box-shadow] duration-75',
                   active
                     ? 'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)] shadow-[inset_0_2px_0_0_rgba(0,0,0,0.22)]'
-                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:bg-[var(--paper-hi)]',
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:border-[var(--clay)] hover:bg-[var(--paper-hi)]',
                   disabled && 'cursor-not-allowed',
                 )}
               >
@@ -466,7 +468,7 @@ export function PatternSettings({
                   'flex flex-col items-start gap-0.5 border-2 px-2 py-1.5 text-left transition-[background-color,box-shadow] duration-75',
                   active
                     ? 'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)] shadow-[inset_0_2px_0_0_rgba(0,0,0,0.22)]'
-                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:bg-[var(--paper-hi)]',
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:border-[var(--clay)] hover:bg-[var(--paper-hi)]',
                   disabled && 'cursor-not-allowed',
                 )}
               >

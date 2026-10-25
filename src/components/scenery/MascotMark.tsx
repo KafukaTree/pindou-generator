@@ -160,7 +160,12 @@ export function MascotMark({
          */
         className={[
           'cursor-pointer transition-transform duration-150',
-          'hover:-translate-y-0.5 hover:scale-[1.06]',
+          /*
+           * 只放大不位移。页头那只鸭子四周虽然是空的，但它上边缘离
+           * 视口顶只有 8px，往上抬会贴着浏览器边缘、看着别扭；放大
+           * 6% 已经足够当"这里能点"的暗示。
+           */
+          'hover:scale-[1.06]',
           'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2',
           className,
         ]

@@ -2621,8 +2621,9 @@ function EmptyStage({
             disabled={pending !== null}
             title={`用示例图「${s.label}」试试（${s.hint}）`}
             className={cn(
-              'group flex flex-col items-stretch gap-1 border-2 border-[var(--line)] bg-[var(--paper-raised)] p-1 text-left transition-[transform,border-color] duration-100',
-              'hover:-translate-y-0.5 hover:border-[var(--clay)] active:translate-y-0',
+              'group flex flex-col items-stretch gap-1 border-2 border-[var(--line)] bg-[var(--paper-raised)] p-1 text-left transition-[box-shadow,border-color,background-color] duration-100',
+              // 示例图四张一排（gap 8px），浮起会撞到相邻格子的边框，只改颜色
+              'hover:border-[var(--clay)] hover:bg-[var(--paper-hi)] hover:shadow-[0_3px_0_0_var(--line-strong)]',
               pending !== null && 'opacity-60',
             )}
           >
