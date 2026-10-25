@@ -1451,7 +1451,12 @@ export default function Home() {
 
       {/* ============================ 顶栏 ============================ */}
       <header className="relative z-20 shrink-0 border-b-2 border-[var(--line-strong)] bg-[var(--paper-raised)]/92 backdrop-blur-[2px]">
-        <div className="relative flex items-center justify-between gap-4 px-4 py-2.5">
+        {/*
+          手机（<sm）把左右内边距和中间间距收窄一档：390 宽下原来只剩
+          358px 给「吉祥物 + 标题」和「历史/导出/主题」两坨，差 2px 装不下，
+          标题末尾的「坊」被切掉半个字。收一档后富余 6px。
+        */}
+        <div className="relative flex items-center justify-between gap-2 px-3 py-2.5 sm:gap-4 sm:px-4">
           {/*
             左：吉祥物 + （手机上）标题。
             这个 div 是 `relative` 的，聊天气泡挂在它下面 —— 气泡要贴着
@@ -1495,7 +1500,15 @@ export default function Home() {
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
+          {/*
+            `shrink-0`：右侧这排按钮**不许被压缩**。
+            用户截图（真机 393 逻辑宽）里「历史」被挤成竖排两行（历 / 史），
+            按钮高从 31px 涨到 46px，整条顶栏跟着变扭。原因是这个 div 是
+            flex 子项、默认 `flex-shrink: 1`，而它内部按钮的文字默认
+            `white-space: normal` —— 差 4px 时浏览器优先折文字而不是截标题。
+            让位应该由左边的标题承担（它本来就有 `truncate`）。
+          */}
+          <div className="flex shrink-0 items-center gap-2">
             {displayPattern && (
               <span className="hidden items-center gap-1.5 lg:flex">
                 <span className="px-tag px-tag-leaf">
