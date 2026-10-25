@@ -2029,7 +2029,16 @@ export function usePatternCanvas(
     const fitW = Math.floor(availW / Math.max(1, pattern.cols));
 
     let fit = fitW;
-    if (editing) {
+    /*
+     * 刷区域模式也用编辑态这套 sizing（用户：「刷区域模式要向编辑模式的那个
+     * 画板框扩大学习」）。
+     *
+     * 两个模式都是"整块注意力在画布上、正在往里落笔"，尺寸策略上不该有区别。
+     * 早先只认 editing，实测 1600×1000 刷区域画布 768×648，而编辑态是
+     * 896×756 —— 同一块屏，切个模式画布缩一圈，观感上像"模式切换把画布
+     * 弄小了"，用户直接圈出来了。
+     */
+    if (editing || brushMode) {
       /*
        * 编辑态：**宽度优先**，画板吃满可用宽度。
        *
@@ -2103,6 +2112,7 @@ export function usePatternCanvas(
     zoom,
     useFill,
     editing,
+    brushMode,
     canvasGutter,
   ]);
 

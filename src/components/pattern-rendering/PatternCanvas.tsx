@@ -192,7 +192,7 @@ const BRUSH_BAR_CLASSES =
   'flex-nowrap gap-x-2.5 overflow-x-auto overflow-y-hidden ' +
   '[&>*]:shrink-0 ' +
   // 桌面：折行，信息全部可见，不用拨
-  'lg:flex-wrap lg:gap-x-3 lg:gap-y-2 lg:overflow-visible lg:[&>*]:shrink';
+  'xl:flex-wrap xl:gap-x-3 xl:gap-y-2 xl:overflow-visible xl:[&>*]:shrink';
 /** 横滚容器的 inline style（Tailwind 没有 -webkit-overflow-scrolling 类） */
 const BRUSH_BAR_SCROLL_STYLE: React.CSSProperties = {
   WebkitOverflowScrolling: 'touch',
@@ -1106,8 +1106,32 @@ export function PatternCanvas({
         toggleBtn(
           brushMode,
           brushMode ? '退出刷子' : '刷区域',
-          // 退出时若有未提交的草稿，自动应用（见 hook 里 exitBrushMode 的注释）
-          () => (brushMode ? exitBrushMode() : setBrushMode(true)),
+          /**
+           * 进刷区域时**自动退出编辑**，两个模式严格互斥。
+           *
+           * 用户原话：「我觉得刷区域和编辑，点击出来不能共存，就是只有一行
+           * 比较好，点这个那个自动退出」。
+           *
+           * 之前只有一半互斥（进编辑会退刷子），反向没有 —— 于是在编辑态点
+           * 「刷区域」，两条工具条会同时挂在画布上方，占两行高，画布被压掉
+           * 一截；而且两套拖动语义叠在一起，拖动到底是涂抹还是画格子全看
+           * 谁先绑上 pointer。
+           *
+           * 退出方向也要清理：`exitBrushMode()` 会把未提交的草稿自动应用
+           * （见 hook 里 exitBrushMode 的注释），直接 setBrushMode(false)
+           * 会把用户涂了一半的选区悄悄丢掉。
+           */
+          () => {
+            if (brushMode) {
+              exitBrushMode();
+              return;
+            }
+            if (editActive) {
+              setEditActive(false);
+              onEditPointerLeave(); // 清掉落点方框，别留在画布上
+            }
+            setBrushMode(true);
+          },
           '在图上刷一块区域，用不同的精细度算法重算（其余部分不变）',
         )}
       {editEnabled &&
@@ -1177,7 +1201,10 @@ export function PatternCanvas({
           剩下的功能开关单独一行时不能用 justify-between（会把它顶到右端），
           用 justify-end 保持和标题栏动作按钮一条竖线。 */}
       {!(zoomSlot && isDesktop) && (
-        <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
+        <div
+          className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden pb-0.5 [&>*]:shrink-0 xl:flex-wrap xl:justify-end xl:overflow-visible xl:[&>*]:shrink"
+          style={BRUSH_BAR_SCROLL_STYLE}
+        >
           {zoomGroup}
           {toolbarButtons}
         </div>
@@ -1205,11 +1232,28 @@ export function PatternCanvas({
           {/* ---------------- 编辑工具条（父组件接管 edits 时出现） ---------------- */}
           {editEnabled && editActive && (
             <div
-              className="px-panel-flat flex flex-col gap-2 px-2.5 py-2"
+              className="px-panel-flat flex shrink-0 flex-col gap-2 px-2.5 py-2"
               role="region"
               aria-label="编辑工具条"
             >
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              {/*
+                窄屏压成**单行横滚**，理由与刷区域工具条相同（见
+                BRUSH_BAR_CLASSES 的注释）：390 宽下这排控件总宽 565px，
+                在 338px 里按 flex-wrap 折成两行 = 92px 高，画布白丢 40px。
+                用户第二次提这件事时直接圈了整屏说「这些也要一行」。
+
+                桌面 `xl:`（=1280px）才维持折行。1024–1279 这段虽然也是
+                桌面，但中栏只有 640–976px 宽，这排控件 565px + 五个工具按钮
+                的容器余量不够，实测 1024×768 仍会折成两行（82px）—— 那正好
+                落在用户抱怨"占两行"的区间里，所以断点抬到 xl。
+
+                子项必须 `shrink-0`：默认 flex-shrink 是 1，338px 塞 10 个
+                按钮一定会把按钮压扁到点不中（刷区域工具条踩过同一个坑）。
+              */}
+              <div
+                className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden pb-0.5 [&>*]:shrink-0 xl:flex-wrap xl:overflow-visible xl:[&>*]:shrink"
+                style={BRUSH_BAR_SCROLL_STYLE}
+              >
                 {/* 五个工具：抓手 + 手绘 / 橡皮 / 取色 / 油漆桶 */}
                 <div className="flex items-center gap-1" role="group" aria-label="编辑工具">
                   {EDIT_TOOLS.map(({ tool, label, title, icon }) => {
@@ -1395,7 +1439,7 @@ export function PatternCanvas({
           {/* ---------------- 刷区域工具条（只在父组件接管 brushes 时出现） ---------------- */}
           {brushEnabled && brushMode && (
         <div
-          className={BRUSH_BAR_CLASSES}
+          className={`${BRUSH_BAR_CLASSES} shrink-0`}
           style={BRUSH_BAR_SCROLL_STYLE}
           role="region"
           aria-label="刷区域工具条"

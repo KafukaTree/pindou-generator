@@ -940,8 +940,15 @@
    *
    * 用 `:has()` 认编辑态：`编辑工具条` 只在编辑模式渲染，且就在这个面板
    * 里面 —— 这样不用给 page.tsx 加 prop，CSS 自己就能判断。
+   *
+   * **刷区域工具条也算**（用户：「刷区域模式要向编辑模式的那个画板框扩大
+   * 学习」）。两个模式都是"整块注意力在画布上"，都该把面板撑到满、都不该
+   * 能滑走 —— 早先只认编辑工具条，刷区域模式仍走 54dvh 那套，画布区在
+   * 390×844 上只有 200px。两条选择器写成同一份声明，避免以后加第三个模式
+   * 时又漏一个。
    */
-  .wb-mid:has([aria-label="编辑工具条"]) {
+  .wb-mid:has([aria-label="编辑工具条"]),
+  .wb-mid:has([aria-label="刷区域工具条"]) {
     height: calc(100dvh - 96px);
     /*
      * 560px 的下限只在竖屏生效。
@@ -1026,7 +1033,8 @@
    * 横屏本来就不是画拼豆的姿态（画布会被压成一条），维持原样即可。
    */
   @media (max-aspect-ratio: 1/1) {
-    .wb:has([aria-label="编辑工具条"]) {
+    .wb:has([aria-label="编辑工具条"]),
+    .wb:has([aria-label="刷区域工具条"]) {
       /*
        * 不可滚是这条需求的**核心**，不是顺手写的。padding/gap 归零是为了让
        * 画板框贴到屏幕边缘 —— 内容已只剩一个，再留 12px 的缝只是浪费。
@@ -1044,7 +1052,8 @@
      * 它必须从**这个容器**下手 —— 对着三个 section 一个个 `display:none`
      * 会和它们各自的 `order-1/3/4` 打架，还漏得掉以后新加的块。
      */
-    .wb:has([aria-label="编辑工具条"]) .wb-left {
+    .wb:has([aria-label="编辑工具条"]) .wb-left,
+    .wb:has([aria-label="刷区域工具条"]) .wb-left {
       display: none;
     }
 
@@ -1061,7 +1070,8 @@
      * 直接 flex 撑满可视区，再用 560 当地板只会在 360×640 这类矮屏上把面板
      * 顶出视口，而 `.wb` 已经 `overflow: hidden`，超出部分会被直接裁掉。
      */
-    .wb:has([aria-label="编辑工具条"]) .wb-mid {
+    .wb:has([aria-label="编辑工具条"]) .wb-mid,
+    .wb:has([aria-label="刷区域工具条"]) .wb-mid {
       flex: 1 1 auto;
       height: auto;
       min-height: 0;
