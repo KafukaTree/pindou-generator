@@ -298,6 +298,7 @@ export function PatternCanvas({
     regionSummary,
     useFill,
     canvasGutter,
+    canvasGutterBottom,
     pendingCount,
     pendingLabel,
     livePreview,
@@ -1139,10 +1140,23 @@ export function PatternCanvas({
           editActive,
           editActive ? '退出编辑' : '编辑',
           () => {
-            setEditActive((v) => {
-              if (v) onEditPointerLeave(); // 关掉时清掉落点方框
-              return !v;
-            });
+            const next = !editActive;
+            setEditActive(next);
+            if (!next) onEditPointerLeave(); // 关掉时清掉落点方框
+            /*
+             * 每次**进入**编辑态都回到抓手，不记忆上次用的工具。
+             *
+             * 用户原话（m09361）：「然后点击编辑的默认应该是抓手比较好一些」。
+             *
+             * 为什么不是"记住上次的工具"：进入编辑态的头一个动作，九成是
+             * 先把画板挪到要看的位置 —— 刚进来时视口还停在看图的位置，底
+             * 下几行根本不在屏幕里。这时候如果上次留在橡皮上，第一下拖动
+             * 就擦掉一片豆，而且撤销栈里已经写了一条，用户未必立刻察觉。
+             *
+             * 抓手的代价只是"想画要再点一下手绘"；留在橡皮/油漆桶的代价是
+             * **误改作品**。不对称的错误，往安全那侧倒。
+             */
+            if (next) setEditTool('pan');
             // 编辑与刷区域互斥：两套拖动语义打架
             if (brushMode) setBrushMode(false);
           },
@@ -1755,17 +1769,31 @@ export function PatternCanvas({
             /*
              * 画布四周的留白做在**滚动内容**上，不做在滚动容器上。
              *
-             * 用户反馈「下面的不容易看到并拖动编辑…要把画板周围的拖动底部
-             * 空间预留的大一点」。实测（编辑态 1600×1000，duck 52×64）滚到
-             * 四边极限时到容器边框的距离是 左 18 / 上 2 / 右 30 / 下 2 ——
-             * 上下贴死了，边缘格既点不准也看不出下沿还有内容。
-             *
              * 为什么不能做成滚动容器的 padding：内容滚动时会滑进 padding 区，
              * 从 sticky 标尺旁边漏出来（容器那条 `padding: 0` 的注释就是这个
              * 教训）。做在内容上，这块空白就跟着画布一起滚 —— 滚到底时它就是
              * "画布之外还看得见的一片纸"，正是落笔需要的余量。
+             *
+             * **底部单独给更大的值**（只在编辑态/刷区域态，见
+             * CANVAS_GUTTER_BOTTOM）。用户原话：「现在的状态是下面的不用容易
+             * 看到并【拖动编辑】，我猜测可能要把画板的周围的拖动底部空间预留
+             * 的大一点」。
+             *
+             * 光有四周均等的 8/20px 不够：编辑态画布本来就比视口高
+             * （EDIT_TALL_FACTOR = 3），必须滚到底才看得见最后几行；均等留白
+             * 意味着滚到底时最后一行只离容器下沿 10–22px（含 2px 边框），手指
+             * 按上去就压在屏幕边上，更抓不到空白拖动画板。
+             *
+             * 这个 padding **不参与 cellPx 的算式**：底部多留白只让滚动内容变长
+             * （scrollHeight / maxScrollY 变大），不会把画布挤出容器，所以格子
+             * 大小不变、横向也不会溢出。反过来说，把它扣进 availH 会让编辑态
+             * 的格子小一档 —— 那是用「画布变小」换「底部变空」，与用户「画板
+             * 占主要面积」的诉求相反。
              */
-            padding: canvasGutter,
+            paddingTop: canvasGutter,
+            paddingRight: canvasGutter,
+            paddingBottom: canvasGutterBottom,
+            paddingLeft: canvasGutter,
           }}
         >
           {/* 左上角 */}
