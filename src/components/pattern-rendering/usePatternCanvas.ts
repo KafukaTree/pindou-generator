@@ -100,6 +100,42 @@ export const CANVAS_GUTTER = 20;
 export const CANVAS_GUTTER_NARROW = 8;
 
 /**
+ * 编辑态 / 刷区域态**底部**额外留白（CSS px）。
+ *
+ * 上面那对 CANVAS_GUTTER 是四周均等的（桌面 20 / 窄屏 8）。问题在于编辑态
+ * 画布本来就比视口高 —— `EDIT_TALL_FACTOR = 3` 允许画布高到可视区的 3 倍，
+ * 52×64 的图在 1600×1000 上是 884×1088，而滚动容器只有 740px 高，**必须
+ * 滚动才看得到底行**。而四周均等的留白意味着滚到底时最后一行只离容器下沿
+ * 20+2px（2 是容器边框）：手指按上去就压在边框和屏幕边上，既看不清、也没
+ * 地方落笔，更抓不到空白去拖动画板。用户原话：「现在的状态是下面的不用
+ * 容易看到并【拖动编辑】，我猜测可能要把画板的周围的拖动底部空间预留的
+ * 大一点」。
+ *
+ * 实测滚到底时的下沿余量（改前，均等于 gutter + 容器边框 2px）：
+ *   视口        滚动容器    画布        下沿余量  |
+ *   673×889     645×594     572×704     10        |
+ *   1024×768    640×508     520×640     10        |
+ *   1440×900    848×640     728×896     22        |
+ *   1920×1080   996×820     884×1088    22        |
+ *   390×844     362×567     260×320     115（画布比容器小，本来不用滚）
+ *
+ * 取值的判据是「滚到底时下沿余量 ≥ max(64px, 3×格高)」：3 格是肉眼能确认
+ * 「下面是画布外面」的最小尺度，64px 是拇指按下去不会压到屏幕边的最小尺度。
+ * 桌面格高在 11–17px 之间，3 格 = 33–51px，所以 64px 是实际生效的那条。
+ * 桌面为什么给到 96：编辑态画布高度常见 700–1100px，底部要留到能看见
+ * 「画布到此为止」而不是「再滚还有」，96px 大约是一屏高度的 1/8。
+ */
+export const CANVAS_GUTTER_BOTTOM = 96;
+/**
+ * 窄屏编辑态底部留白。
+ *
+ * 72 而不是 96：手机竖屏可视高度只有 500–600px，96px 会吃掉将近 1/6 屏。
+ * 72+2 = 74px 已经满足「≥64px」并且能容下 3 格（手机格高 8–15px）。
+ * 宽度方向不吃这个值 —— 它只加在 padding-bottom 上，不影响 cellPx。
+ */
+export const CANVAS_GUTTER_BOTTOM_NARROW = 72;
+
+/**
  * 边缘自动滚动的热区宽度（CSS px）与速度区间（px / 帧）。
  *
  * 指针进入滚动容器**可视边**往里 EDGE_ZONE 的这条带，画面就开始朝那个
@@ -2015,6 +2051,24 @@ export function usePatternCanvas(
    */
   const canvasGutter =
     viewportW > 0 && viewportW < NARROW_VIEWPORT ? CANVAS_GUTTER_NARROW : CANVAS_GUTTER;
+  /*
+   * 底部额外的留白，只在编辑态/刷区域态生效。
+   *
+   * 为什么**不**把它扣进 availH：多出来的底部空白只是让滚动内容变长
+   * （scrollHeight 变大、maxScrollY 变大），画布本身并不会被推出容器，
+   * 所以不需要动格子大小的算式。反过来，如果把它扣进 availH，编辑态的
+   * `EDIT_TALL_FACTOR` 分支会因此把格子算小一档 —— 等于用「画布变小」换
+   * 「底部变空」，与用户「画板占主要面积」的诉求相反。
+   *
+   * 只有底部变大、左右和上方仍用 canvasGutter，所以这块空白不会挤掉一列，
+   * 横向不会有溢出。
+   */
+  const canvasGutterBottom =
+    editing || brushMode
+      ? viewportW > 0 && viewportW < NARROW_VIEWPORT
+        ? CANVAS_GUTTER_BOTTOM_NARROW
+        : CANVAS_GUTTER_BOTTOM
+      : canvasGutter;
 
   const cellPx = useMemo(() => {
     if (!pattern) return 16;
@@ -3792,6 +3846,11 @@ export function usePatternCanvas(
     useFill,
     /** 画布外那一圈留白的宽度（窄屏更窄，见 CANVAS_GUTTER_NARROW） */
     canvasGutter,
+    /**
+     * 底部留白（编辑态/刷区域态更大，见 CANVAS_GUTTER_BOTTOM）。
+     * 左/上/右用 canvasGutter，下用这个值 —— 滚到底时画面下方才有地方落笔。
+     */
+    canvasGutterBottom,
     // ---- 编辑（② 工具栏） ----
     displayPattern,
     editEnabled,
