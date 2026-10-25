@@ -10,12 +10,14 @@ import {
   PanelLeftOpen,
   Grid2x2,
   RefreshCw,
+  SlidersHorizontal,
   X,
 } from 'lucide-react';
 
 import { FileUpload } from '@/components/image-upload/FileUpload';
 import { NewCanvasDialog } from '@/components/blank-canvas/NewCanvasDialog';
 import { PatternSettings } from '@/components/settings/PatternSettings';
+import { MobileDrawer } from '@/components/pattern-rendering/MobileDrawer';
 import {
   PatternCanvas,
   type CanvasActivity,
@@ -841,6 +843,18 @@ export default function Home() {
     mode: MarginMode;
   } | null>(null);
   /*
+   * 手机端的参数抽屉。
+   *
+   * 02 参数面板有 1260px 高，比一屏还高。窄屏上它排在图纸下方，用户往下
+   * 拖到底改一个滑杆，画布早就滑出视野了 —— 而画布变化正是调参数的唯一
+   * 判断依据。抽屉是覆盖层，开合时画布尺寸一格都不动，抽出来的同时右侧
+   * 还留着阴影和一条画布边缘可以瞄。
+   *
+   * 只在 lg 以下用它：桌面左栏本来就与画布并排，看得见。
+   */
+  const [paramsOpen, setParamsOpen] = useState(false);
+  const paramsBtnRef = useRef<HTMLButtonElement | null>(null);
+  /*
    * edits 的即时镜像。描边 effect 需要读当前编辑内容去迁移，但**不能**把
    * edits 放进它的 deps —— 那样每涂一笔就要重算一次描边（320 格约 1 秒）。
    */
@@ -1084,6 +1098,43 @@ export default function Home() {
     if (editedCount === 0) return base;
     return applyEdits(base, edits, options.brand);
   }, [pattern, outlinePattern, edits, editedCount, options.brand]);
+
+  /*
+   * 02 参数面板的节点，抽出来是为了让**桌面左栏**与**手机抽屉**共用同一份。
+   *
+   * 为什么要共用：两边各写一遍的话，以后加一个参数只改了一处，另一处就
+   * 静默少一个控件 —— 手机上看起来像"这个功能没有"，桌面却正常。这种分裂
+   * 只有人肉点两遍才发现。共用一份节点就不存在这个问题。
+   *
+   * 空白画布走 BlankSettings：它不走引擎，网格/色数/精细度/成片度/彩度
+   * 全都不生效，给一堆假滑杆比不给更糟。
+   */
+  const sizeCm = pattern?.meta.sizeCm ?? null;
+  const paramsNode = pattern || blankCanvas ? (
+    blankCanvas ? (
+      <BlankSettings
+        brand={options.brand}
+        onBrandChange={(brand) => setOptions((prev) => ({ ...prev, brand }))}
+        cols={blankCanvas.cols}
+        rows={blankCanvas.rows}
+        onResize={() => setNewCanvasOpen(true)}
+      />
+    ) : (
+      <PatternSettings
+        value={options}
+        onChange={setOptions}
+        actualCols={pattern?.cols}
+        actualRows={pattern?.rows}
+        sizeCm={sizeCm}
+        isWorking={isWorking}
+        outline={outline}
+        onOutlineChange={setOutline}
+        outlineNote={outlineNote}
+        margin={margin}
+        onMarginChange={setMargin}
+      />
+    )
+  ) : null;
 
   /*
    * 历史签名 = 参数 + 网格 + 颗数 + **手改格数**。
@@ -1336,8 +1387,6 @@ export default function Home() {
     return '新建画布会替换掉当前这张从图片生成的图纸（原图仍留在历史记录里，可以随时恢复）。';
   }, [hasImage, blankCanvas, editedCount]);
 
-  const sizeCm = pattern?.meta.sizeCm ?? null;
-
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
       <Toaster position="top-center" richColors />
@@ -1358,6 +1407,31 @@ export default function Home() {
         onCreate={handleCreateBlank}
         replaceWarning={replaceWarning}
       />
+
+      {/*
+       * 手机端参数抽屉。
+       *
+       * 内容直接就是 `paramsNode`（与桌面左栏同一份节点），所以桌面加的
+       * 每一个参数都自动出现在这里，不存在"手机上少一个控件"的分裂。
+       *
+       * 变更**不会**自动关闭抽屉：调参数时最需要看的就是画布变化，抽屉
+       * 一关就把判断依据收走了。关闭只有遮罩/Esc/X/右滑四种主动操作。
+       */}
+      <MobileDrawer
+        open={paramsOpen}
+        onClose={() => setParamsOpen(false)}
+        title="02 图案参数"
+        hint={
+          isWorking
+            ? '重算中…'
+            : displayPattern
+              ? `${displayPattern.palette.length} 色 · 约 ${Math.round(displayPattern.totalBeads / 100) / 10}k 颗`
+              : '实时预览'
+        }
+        returnFocusTo={paramsBtnRef}
+      >
+        {paramsNode}
+      </MobileDrawer>
 
       {/* 背景布景：花朵与草木，压在内容之下 */}
       <div className="pointer-events-none fixed inset-0 z-0">
@@ -1650,7 +1724,18 @@ export default function Home() {
                 hint={isWorking ? '重算中…' : '实时预览'}
                 busy={isWorking}
                 hideHeader
-                className="order-3"
+                /*
+                 * 窄屏**不内联渲染**这块 —— 参数已经在叠层抽屉里了。
+                 *
+                 * 用户原话：「既然在叠层了，竖版的下面就没必要出现了吧」。
+                 * 两份一样的控件摆着，坏的还不只是占地方：抽屉里改一项、
+                 * 收起抽屉又看到一块长得一样的面板，用户根本分不清哪个是
+                 * 真的，改完还怀疑没生效。
+                 *
+                 * 桌面（lg 以上）仍然内联：左栏与画布并排，改参数时画布
+                 * 一直可见，这就是它该在的地方，没必要多点一次。
+                 */
+                className="order-3 hidden lg:block"
               >
                 {/*
                  * 空白画布只有"色号体系"一个参数是有意义的。
@@ -1664,29 +1749,7 @@ export default function Home() {
                  * 所以这里换成一个只含品牌选择的窄面板，并把"其余参数对
                  * 空白画布不生效"直接写在界面上。
                  */}
-                {blankCanvas ? (
-                  <BlankSettings
-                    brand={options.brand}
-                    onBrandChange={(brand) => setOptions((prev) => ({ ...prev, brand }))}
-                    cols={blankCanvas.cols}
-                    rows={blankCanvas.rows}
-                    onResize={() => setNewCanvasOpen(true)}
-                  />
-                ) : (
-                  <PatternSettings
-                    value={options}
-                    onChange={setOptions}
-                    actualCols={pattern?.cols}
-                    actualRows={pattern?.rows}
-                    sizeCm={sizeCm}
-                    isWorking={isWorking}
-                    outline={outline}
-                    onOutlineChange={setOutline}
-                    outlineNote={outlineNote}
-                    margin={margin}
-                    onMarginChange={setMargin}
-                  />
-                )}
+                {paramsNode}
               </Section>
             ) : (
               <div className="px-panel-flat order-3 px-5 py-6">
@@ -1772,6 +1835,34 @@ export default function Home() {
                   ref={setZoomSlot}
                   className="ml-auto hidden shrink-0 items-center gap-1.5 lg:flex"
                 />
+                {/*
+                 * 窄屏的「参数」入口。
+                 *
+                 * 竖屏编辑态下 `.wb-left` 整块不渲染（那是"整屏只剩一个框"
+                 * 的规则），于是手机上根本没有地方改参数。不给出路的话，
+                 * 用户唯一的办法是退出编辑再滚下去找 —— 而调参数恰恰是他
+                 * 一边画一边想做的事。
+                 *
+                 * 窄屏唯一的参数入口 —— 上面对应那块 02 面板在窄屏是
+                 * `hidden`，所以这里必须常驻，不能只在编辑态出现，否则
+                 * 非编辑态的手机用户没有任何地方能改参数。
+                 *
+                 * `lg:hidden`：桌面左栏就在旁边，再加一个按钮是重复入口。
+                 * 重复入口的坏处不是"多一个按钮"，而是用户不确定该点哪个。
+                 */}
+                {hasImage && paramsNode ? (
+                  <button
+                    ref={paramsBtnRef}
+                    type="button"
+                    onClick={() => setParamsOpen(true)}
+                    className="px-btn px-btn-sm ml-auto shrink-0 justify-center px-2 lg:hidden"
+                    data-testid="open-params"
+                    title="调整网格、色数、配色和线条"
+                  >
+                    <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden />
+                    参数
+                  </button>
+                ) : null}
                 {/*
                  * 这里原本还有一个「展开左栏」按钮（收起态才出现）。
                  *
