@@ -172,6 +172,39 @@ export function MobileDrawer({
     if (!open) setDragX(0);
   }, [open]);
 
+  /**
+   * 收掉正文里那份重复的标题。
+   *
+   * 抽屉头部已经写着「02 图案参数」，而 PatternSettings / BlankSettings 自带
+   * 一行同款标题（序号 + .px-section-title）。实测 320/360/390/430 四档全部
+   * 是上下两行一样的字，白占 31px，而且第一眼看上去像渲染重了。
+   *
+   * 为什么用运行时比对而不是写死 CSS：空白画布那块正文标题是「画布参数」，
+   * 与抽屉的「图案参数」**不同**，那时两行各有信息，不该收。所以必须比文本。
+   *
+   * 比对时把抽屉标题开头的序号剥掉（"02 图案参数" → "图案参数"）再比。
+   * 命中的是该标题所在的**行**（序号 + 标题那个 flex），同级右侧的「重算中」/
+   * 「空白」标记留着 —— 它们是状态，不是标题重复。
+   *
+   * 用 class 而不是内联 style / 属性选择器：class 选择器在 Tailwind 产物里
+   * 稳定编得进去，属性选择器踩过坑（`[data-testid="collapse-left"]` 那条
+   * 一直编不进产物）。而内联 style 会被 React 的 style diff 覆盖掉。
+   */
+  React.useEffect(() => {
+    if (!open) return;
+    const body = bodyRef.current;
+    if (!body) return;
+    const heading = body.querySelector<HTMLElement>('h2.px-section-title, h3.px-section-title');
+    const row = heading?.parentElement;
+    if (!row) return;
+    const headingText = (heading.textContent || '').trim();
+    const titleText =
+      typeof title === 'string' ? title.replace(/^\s*\d+\s*/, '').trim() : null;
+    if (!titleText || headingText !== titleText) return;
+    row.classList.add('px-drawer-dup-title');
+    return () => row.classList.remove('px-drawer-dup-title');
+  }, [open, title]);
+
   const onPointerDown = (e: React.PointerEvent) => {
     // 只在主键/单指时接管
     if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -323,7 +356,7 @@ export function MobileDrawer({
         */}
         <div
           ref={bodyRef}
-          className="min-h-0 flex-1 overflow-y-auto px-3 py-3"
+          className="px-drawer-body min-h-0 flex-1 overflow-y-auto px-3 py-3"
           style={{ overscrollBehavior: 'contain', touchAction: 'pan-y' }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}

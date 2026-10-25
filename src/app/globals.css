@@ -711,6 +711,28 @@
   }
 
   /*
+   * 抽屉正文里与抽屉头部重复的那行标题（MobileDrawer 在运行时比对文本后挂上）。
+   *
+   * 为什么需要：抽屉头已经写着「02 图案参数」，而 PatternSettings 自带一行
+   * 同款标题，实测 320/360/390/430 四档都是上下两行一样的字，白占 31px。
+   *
+   * 为什么不是一律隐藏 .px-section-title：空白画布时正文标题是「画布参数」，
+   * 与抽屉标题不同、各有信息，那时两行都得留。所以只由组件按文本比对后
+   * 精确给这一行挂类。
+   *
+   * 用 `display: none` 而不是 `visibility: hidden`：要真的把 31px 让给内容区，
+   * 不是留个空档。
+   *
+   * `!important` 在这里不是偷懒：被收的那一行带 Tailwind 的 `.flex` 工具类，
+   * 而 `@layer utilities` 排在 `@layer components` **之后**，两者特异度又都是
+   * (0,1,0) —— 不加 important 的话 `.flex { display: flex }` 永远赢。实测
+   * 类确实挂上了、`getComputedStyle` 仍是 `display: flex`，卡在这里。
+   */
+  .px-drawer-dup-title {
+    display: none !important;
+  }
+
+  /*
    * 抽屉关闭时的退场不用动画：卸载即可。
    * 理由 —"关"是用户已经做完动作的结果，多 180ms 反而挡着他继续画；
    * 而且退场期间遮罩还在，会吞掉一次点击。
