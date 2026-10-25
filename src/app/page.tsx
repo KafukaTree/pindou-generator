@@ -1420,7 +1420,18 @@ export default function Home() {
       <MobileDrawer
         open={paramsOpen}
         onClose={() => setParamsOpen(false)}
-        title="02 图案参数"
+        /*
+         * 标题跟着内容走。
+         *
+         * 空白画布的正文标题是「画布参数」而不是「图案参数」，抽屉头若写死
+         * 「02 图案参数」，就会出现「02 图案参数」压着「02 画布参数」两行 ——
+         * 序号重复、两个标题又极其相似，读起来像同一句话说了两遍。
+         *
+         * 跟着走的额外好处：抽屉自带"标题与正文标题相同就收掉正文那行"的
+         * 去重逻辑（MobileDrawer 里按文本比对），这里一改成一致，空白画布
+         * 也自动少一行，不用另加特例。
+         */
+        title={blankCanvas ? '02 画布参数' : '02 图案参数'}
         hint={
           isWorking
             ? '重算中…'
