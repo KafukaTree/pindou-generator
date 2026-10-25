@@ -84,9 +84,6 @@ export function ColorLegend({
       {/* ---------- 顶部汇总 ---------- */}
       <div className="flex items-baseline justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="px-section-no" aria-hidden>
-            03
-          </span>
           <h3 className="px-section-title">用料清单</h3>
         </div>
         <span className="px-label text-[11px] tracking-normal text-[var(--ink-2)]">{brand}</span>

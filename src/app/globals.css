@@ -606,21 +606,6 @@
   }
 
   /* ---------------- 分区标题 ---------------- */
-  .px-section-no {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    font-family: var(--font-pixel);
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--on-clay);
-    background: var(--clay);
-    border: 2px solid var(--clay-deep);
-    flex: none;
-  }
-
   .px-section-title {
     font-family: var(--font-display);
     font-size: 15px;
@@ -974,17 +959,6 @@
    */
   .wb:has([data-canvas-surface]) .wb-mid {
     order: 0;
-  }
-
-  /*
-   * 窄屏不显示「04」这个序号。
-   *
-   * 序号是桌面分区编号（01/02 在左栏，04 在中栏），手机竖排成一列时
-   * 一组 01→04→02 只会让人以为中间漏了 03。用户也说「尤其是 04 在那里
-   * 标着，就不好看」。标题「图纸」留着，序号收掉。
-   */
-  .wb-mid .px-section-no {
-    display: none;
   }
 
   /* ==========================================================

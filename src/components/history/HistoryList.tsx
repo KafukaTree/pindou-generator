@@ -176,9 +176,6 @@ export function HistoryList({ onRestore, className }: HistoryListProps) {
         <DialogHeader className="space-y-0 border-b-2 border-[var(--line)] px-3.5 py-2.5">
           <div className="flex items-center justify-between gap-2">
             <DialogTitle className="flex items-center gap-2 text-[14px] font-semibold text-[var(--ink)]">
-              <span className="px-section-no" aria-hidden>
-                04
-              </span>
               历史记录
               <span className="text-[11.5px] tabular-nums text-[var(--ink-2)]">
                 {history.length}

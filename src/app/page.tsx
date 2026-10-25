@@ -1763,7 +1763,6 @@ export default function Home() {
           {/* ---------------------- 左栏：输入与参数（内部滚动） ---------------------- */}
           <div className="wb-left">
             <Section
-              index="01"
               title={blankCanvas ? '空白画布' : '放一张图'}
               hint={
                 blankCanvas
@@ -1874,7 +1873,6 @@ export default function Home() {
             {/* 没图的时候，参数面板只露一个引导，避免空滑杆让人无所适从 */}
             {hasImage ? (
               <Section
-                index="02"
                 title="调参数"
                 hint={isWorking ? '重算中…' : '实时预览'}
                 busy={isWorking}
@@ -1921,7 +1919,6 @@ export default function Home() {
             {/* 用料清单在窄屏（没有右栏时）留在左栏底部 */}
             {displayPattern && displayPattern.palette.length > 0 && (
               <Section
-                index="03"
                 title="用料清单"
                 hint={`${displayPattern.palette.length} 色`}
                 hideHeader
@@ -1945,7 +1942,6 @@ export default function Home() {
             <div className="px-panel relative flex min-h-0 flex-1 flex-col overflow-hidden">
               <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b-2 border-[var(--line)] px-3.5 py-2">
                 <div className="flex items-baseline gap-2.5">
-                  <span className="px-section-no">04</span>
                   <h2 className="font-display text-[15px] font-bold tracking-tight">
                     图纸
                   </h2>
@@ -2216,7 +2212,6 @@ function MascotMark({ brand }: { brand: string }) {
 
 /** 带编号的区块外壳，把"01/02/03"做成图纸上的章节号 */
 function Section({
-  index,
   title,
   hint,
   busy,
@@ -2226,7 +2221,6 @@ function Section({
   action,
   children,
 }: {
-  index: string;
   title: string;
   hint?: string;
   /** 标题栏最右侧的动作按钮（排在手写 hint 左边） */
@@ -2252,7 +2246,6 @@ function Section({
     <section className={cn('px-panel', className)}>
       <div className="flex items-center justify-between gap-2 border-b-2 border-[var(--line)] px-4 py-2.5">
         <div className="flex min-w-0 items-baseline gap-2.5">
-          <span className="px-section-no shrink-0">{index}</span>
           {/*
             标题不许折行。
             动作按钮放大到 32px 后，左栏 320px 宽时标题栏的可用宽度被压掉
@@ -2382,9 +2375,6 @@ function BlankSettings({
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="px-section-no" aria-hidden>
-            02
-          </span>
           <h3 className="px-section-title">画布参数</h3>
         </div>
         <span className="px-tag px-tag-clay" style={{ fontSize: 10 }}>

@@ -206,9 +206,6 @@ export function PatternSettings({
       {/* 头部：标题 + 重算提示（不阻塞） */}
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="px-section-no" aria-hidden>
-            02
-          </span>
           <h3 className="px-section-title">图案参数</h3>
         </div>
         <span
