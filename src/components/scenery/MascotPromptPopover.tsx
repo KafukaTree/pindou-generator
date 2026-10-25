@@ -9,8 +9,25 @@ import { cn } from '@/lib/utils';
 /**
  * MascotPromptPopover — 「让 AI 先画一张能拼的图」弹窗。
  *
- * 由页头吉祥物触发。给出可直接复制的英文提示词，让外部生图工具
- * （豆包 / Qwen / 即梦 / Midjourney…）先产出一张**这个引擎吃得进去**的源图。
+ * 由页头吉祥物触发。给出可直接复制的**中文**提示词，让外部生图工具
+ * （豆包 / 元宝 / 即梦 / Qwen…）先产出一张**这个引擎吃得进去**的源图。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么正文是中文而不是英文
+ * ---------------------------------------------------------------------------
+ * 用户原话（m08868）：「现在的提示词不好，英文太多，用户可能看不懂（变成中英的
+ * 会比较好，默认中文）……因为面向大众市场」。
+ *
+ * 这不是妥协。豆包 / 元宝 / 即梦 / Qwen 的中文语料占优，对中文提示词的理解
+ * 不比英文差；而 40 个英文单词挤在一起，非英语用户既看不懂也无法校对哪里该改。
+ * 英文技术词（no anti-aliasing / flat solid background / chunky pixels）以括号
+ * 形式保留 —— 一部分模型对这类固定术语确实更敏感，而且它们是这一行的行话，
+ * 用中文硬译反而失真。
+ *
+ * 同一条用户需求还有一句：「几乎不要用户在特定地方补位语言才是合适的提示词」。
+ * 所以下面每一条都是**完整可用**的句子：主体位置已经用「一只橘猫」这类示例词
+ * 填好，用户直接复制就能发；想换就往那句话里换词，不必先在英文模板里
+ * 找到一个 `{subject}` token 再替换。**不要再引入任何占位符。**
  *
  * ---------------------------------------------------------------------------
  * 为什么这些词这么写（这一节比提示词本身更值钱，换任何模型都成立）
@@ -33,7 +50,7 @@ interface PromptItem {
   id: string;
   /** 中文：这条适合什么 */
   fit: string;
-  /** 英文正文，可直接粘进生图工具 */
+  /** 正文，可直接粘进生图工具。中文为主，英文术语放括号里。 */
   text: string;
   /** 可选的中文补充提醒 */
   note?: string;
@@ -46,39 +63,175 @@ interface PromptGroup {
   items: readonly PromptItem[];
 }
 
-/**
- * 共用尾巴。这几条是"能不能进引擎"的物理条件，每条提示词都不能省。
+/* ===========================================================================
+ * 提示词的装配顺序（这个顺序本身就是一条设计决策）
+ * ===========================================================================
+ * AI 出图样本（r1–r7）共同的规格是：一整片纯色平背景、约 100 格宽的粗网格、
+ * 硬边、色块大而少、主体居中。要让模型复现这些，约束的**排列顺序**必须和
+ * 「这件事有多容易被违背」一致：
  *
- * 注意这里**不含** limited palette —— 每条提示词自己写色数（8/12/16…），
- * 因为在尾巴里再写一遍会出现 "limited palette of 8 colors, ..., limited
- * color palette, ..." 这种自我重复，模型会当成两个不同的约束。
+ *   主体是什么 → 背景规定 → 像素规格 → 颜色规定 → 负面约束
+ *
+ * 反例是之前那版：把 `flat solid background` 埋在尾巴的一长串并列末尾。模型对
+ * 长串末尾的权重要弱得多，实测最常被违背的恰恰是背景（出来带渐变、带光晕、
+ * 带地面阴影），因为那是训练数据里"好看的图"的默认长相——**必须明文压制**，
+ * 而且要放在前面。
  */
-const TAIL =
-  'flat solid background, clean hard pixel edges, no anti-aliasing, no gradients, no soft shadows, no text, no watermark';
+
+/**
+ * 固定约束的写法：一条只压一个失败模式，且尽量短。
+ *
+ * 之前的版本每条都写成 40–70 字的长句，一条完整提示词 341–431 字里约 290 字
+ * 是这些固定约束 —— 主体信息只占一成半。这是错的：约束之间互相稀释，模型
+ * 会把注意力平均分给七八条并列要求，反而哪条都不够硬；用户自己也读不出
+ * 哪句是他真该改的。
+ *
+ * 现在的原则是**一条约束对应一个实测会出的毛病**（去掉了"光晕"这种从没
+ * 单独出现过的，也去掉了"点阵纹理/细线"这类其实被 no anti-aliasing 覆盖的）。
+ * 固定部分从 ~290 字压到 ~170 字，主体回到句子的主位。
+ */
+
+/** 背景：这 7 张样本最统一的一条，也是进引擎的前提。必须排在最前面。 */
+const BG =
+  '背景是一整片纯色平涂（flat solid background），整张背景上下左右都不能有深浅变化，不要渐变、纹理、阴影、地面或任何场景装饰';
+
+/** 像素规格：格大、对齐、硬边。 */
+const GRID =
+  '像素格子要大（整张图约 100 格宽）并严格对齐成网格，色块边缘是阶梯状直角锯齿（no anti-aliasing），不要柔化模糊过渡';
+
+/** 色块：面数少、面积大、用色阶跳变代替渐变。 */
+const BLOCK = '色块要大块平涂，明暗只用 2 到 3 档色阶跳变，不要抖动噪点';
+
+/** 构图：正方形、居中、留白。 */
+const FRAME = '正方形构图，主体居中、正面、完整，四周留白';
+
+/** 负面：平台水印我们控制不了，所以只能显式要求不要出现文字类内容。 */
+const NEG = '不要文字、水印、签名、边框';
+
+/**
+ * 拼装一条完整提示词。
+ *
+ * 注意这里**没有占位符**：主体句由各条目自己写全（「一只橘猫」这类示例词），
+ * 用户复制即可直接发，想换主体就在那句话里换词。
+ */
+function prompt(parts: {
+  subject: string;
+  colors: string;
+  tail?: string;
+}): string {
+  return [parts.subject, BG, GRID, BLOCK, parts.colors, FRAME, parts.tail, NEG]
+    .filter(Boolean)
+    .join('，');
+}
+
+/**
+ * 「图生图」组专用拼装：必须先声明"参考我上传的这张图"，再讲只改什么、不改什么。
+ * 这是与纯文生图完全不同的指令结构 —— 文生图是"从无到有"，图生图是"保留主体，
+ * 只替换表现手法"。写成同一种句式，模型会把参考图也当成风格参考而重画主体。
+ */
+function refPrompt(parts: { keep: string; convert: string; colors: string }): string {
+  return [
+    '参考我上传的这张图',
+    parts.keep,
+    parts.convert,
+    BG,
+    GRID,
+    BLOCK,
+    parts.colors,
+    FRAME,
+    NEG,
+  ].join('，');
+}
 
 const GROUPS: readonly PromptGroup[] = [
   {
     id: 'pixel',
     label: '像素画 · 拼豆专用',
     blurb:
-      '想直接拿到一张"格子感"的图，转成图纸几乎一步到位。这类成功率最高，建议先从这里试。',
+      '没有任何参考图、纯靠一句话让 AI 从零画出来。成品可以直接转成图纸，成功率最高，建议先试这组。',
     items: [
       {
         id: 'pixel-grid',
-        fit: '标准起步：32×32 上下的小图标、挂件、钥匙扣图案。',
-        text: `pixel art sprite of a {subject}, front view, idle pose, 8-bit style, exactly 16 blocks wide, chunky square pixels, bold black outline, limited palette of 14 colors, ${TAIL}`,
-        note: '换成你要画的东西即可。「exactly 16 blocks wide」是让模型去数格子，比只写 32×32 更有效。',
+        fit: '标准起步：小图标、挂件、钥匙扣这类 32 格上下的图案。',
+        text: prompt({
+          subject:
+            '像素画，一只橘猫，正面坐着，静止站姿，8-bit 风格，粗描边，轮廓完整清晰',
+          colors: '最多用 14 种颜色',
+        }),
+        note: '想换成别的东西，直接把「一只橘猫」这四个字换掉即可，句子其余部分不用动。',
       },
       {
         id: 'pixel-mid',
-        fit: '中等复杂：小动物、食物、小场景，48×48 左右，细节与可拼性平衡最好。',
-        text: `16-bit pixel art of a {subject}, centered, front facing, sitting pose, 48 by 48 grid, crisp square pixels, thick clean outline, distinct flat color blocks, limited color palette of 12 to 18 colors, no dithering, ${TAIL}`,
+        fit: '中等复杂：小动物、食物、简单小场景，48 格左右，细节和可拼性最平衡。',
+        text: prompt({
+          subject:
+            '像素画，一个蘑菇小屋，正面，居中，画面里只有这一个主体，16-bit 风格，粗而干净的描边',
+          colors: '用 12 到 18 种颜色，同一种颜色只出现一个色号',
+        }),
       },
       {
         id: 'pixel-rescue',
-        fit: '已经"有点像像素画但边缘发糊"的图，用这段重生成来救。',
-        text: `strict pixel art, every pixel is a perfect square, aligned to a visible grid, no smoothing, flat colors only, hard stepped edges, {subject}, front view, isolated on a plain background, limited palette of 16 colors, ${TAIL}`,
-        note: '关键是 no anti-aliasing 与 no smoothing 同时出现；只写一个，模型常理解成风格而不是技术约束。',
+        fit: '出来的图「有点像像素画但边缘发糊」时，用这段重新生成来救。',
+        text: prompt({
+          subject:
+            '严格的像素画，每一个像素都是完美的正方形并对齐到可见的网格上，一只橘猫，正面，孤立在画面中央',
+          colors: '最多用 16 种颜色',
+          tail: '这不是"像素风滤镜"，而是真正的低分辨率像素图（真正的 pixel art，不是 pixelated filter）',
+        }),
+        note: '关键是"无抗锯齿"和"无平滑"要同时出现；只写一个，模型常理解成风格而不是技术要求。',
+      },
+    ],
+  },
+  {
+    id: 'reference',
+    label: '图生图 · 参考图',
+    blurb:
+      '手上已经有一张图（照片、手绘草图、别人的画、已经生成的像素画），要把它变成能拼的拼豆图纸。用法：先把图传给豆包/元宝，再把下面的提示词贴上去。',
+    items: [
+      {
+        id: 'ref-photo',
+        fit: '照片转拼豆：真人照、宠物照、物品照，想做成纪念款。',
+        text: refPrompt({
+          keep:
+            '保持原图里主体的样子、姿态、朝向和主要配色，不要换掉主体，也不要增加原图里没有的东西',
+          convert:
+            '把它转换成一幅像素画：把照片里的明暗和细节简化为大块的平涂色块，去掉毛发、布纹、噪点这类细碎质感，只保留能辨认出主体的关键形状',
+          colors: '最多用 16 种颜色',
+        }),
+        note: '照片直接转通常要丢很多细节；主体在画面里越居中、越大，成品越好。',
+      },
+      {
+        id: 'ref-sketch',
+        fit: '草图 / 手绘 / 线稿转拼豆：自己画的、或是从别处描的轮廓。',
+        text: refPrompt({
+          keep: '完全保持原图画的东西和它的轮廓，不要重新设计造型，不要添加原图没有的细节',
+          convert:
+            '把这些线条变成像素画的硬边轮廓，线要加粗到至少一格的宽度，线条内部填成平涂色块，并把线条的抖动和不规整处拉直成阶梯状直角',
+          colors: '最多用 12 种颜色',
+        }),
+        note: '线条太细是手绘转拼豆最常失败的原因 —— 一根发丝宽的线在 64 格里放不进一颗豆，一定要它加粗。',
+      },
+      {
+        id: 'ref-pixel',
+        fit: '已有像素画优化：本来就是像素画，但格子大小不一、边缘发糊、颜色太多。',
+        text: refPrompt({
+          keep: '保持原图的内容、构图和配色不变，不要重画主体',
+          convert:
+            '把这张图重新整理成规整的像素画：统一所有像素格的大小，让它们严格对齐到同一个网格，消除大小不一和错位的像素，把所有发糊的边缘改成硬边的直角锯齿',
+          colors: '把颜色数量压缩到 16 种以内，面积很小的杂色直接合并到邻近的主色里',
+        }),
+        note: '这一条正是为了修「AI 直出的像素画不够规整」——整理完再传进来，转换会干净很多。',
+      },
+      {
+        id: 'ref-scene',
+        fit: '多主体 / 场景转拼豆：一张照片里有人有背景，或想要一整幅画。',
+        text: refPrompt({
+          keep: '保持原图里各个主体的相对位置和大小关系，不要删掉主体，也不要增加新的主体',
+          convert:
+            '把整个场景简化成像素画：把背景里杂乱的细节合并成几大块纯色，只保留能认出场景的轮廓，去掉所有细碎纹理',
+          colors: '最多用 20 种颜色',
+        }),
+        note: '场景图拼出来格数需求比单个主体大得多。52 格以内做单个主体，场景建议 96 格以上。',
       },
     ],
   },
@@ -90,14 +243,22 @@ const GROUPS: readonly PromptGroup[] = [
       {
         id: 'char-full',
         fit: '全身立绘：角色、cos、自画像，站姿正面。',
-        text: `pixel art full-body character sprite, {subject}, front view, standing straight, arms slightly away from body, clear silhouette, bold uniform outline around the whole figure, flat cel shading with 2 to 3 tones per color, limited palette of 16 to 20 colors, no thin lines, ${TAIL}`,
-        note: '「arms slightly away from body」很重要：手贴身时手臂会与躯干融成一块，缩小后结构就没了。',
+        text: prompt({
+          subject:
+            '像素画全身人物立绘，一个穿黄色卫衣的短发女孩，正面站姿，双脚分开站立，手臂与身体之间留出空隙，轮廓清楚，整圈有统一的深色描边，平涂上色、每个颜色只用 2 到 3 档明暗',
+          colors: '用 16 到 20 种颜色',
+        }),
+        note: '「手臂与身体之间留出空隙」很重要：手贴身时手臂会和躯干融成一整块，缩小后结构就没了。',
       },
       {
         id: 'char-bust',
         fit: '头像 / 半身：适合做 64 格以内的徽章、杯垫。',
-        text: `pixel art bust portrait of {subject}, front facing, head and shoulders only, symmetrical framing, large eyes with a single white highlight pixel, distinct color blocks for hair skin and clothes, thick dark outline, limited palette under 14 colors, ${TAIL}`,
-        note: '「a single white highlight pixel」能让眼睛活下来 —— 眼睛是缩小后最先糊掉的特征。',
+        text: prompt({
+          subject:
+            '像素画人物头像，一个戴眼镜的短发男生，正面，只画头和肩膀，构图左右对称，眼睛要大并且每只眼睛只用一颗白色高光像素，头发、皮肤、衣服各用一组分明的色块，深色粗描边',
+          colors: '最多用 14 种颜色',
+        }),
+        note: '「每只眼睛只用一颗白色高光像素」能让眼睛活下来 —— 眼睛是缩小后最先糊掉的特征。',
       },
     ],
   },
@@ -108,14 +269,22 @@ const GROUPS: readonly PromptGroup[] = [
     items: [
       {
         id: 'pet',
-        fit: '真实宠物的头像或全身，想做纪念款时用。',
-        text: `pixel art of a {subject}, front view, full body, sitting symmetrically, bold graphic silhouette, simplified fur as large flat color blocks (no individual hairs), rounded friendly shapes, thick outline, limited palette of 8 to 14 colors picked from the subject's real colors, no texture, ${TAIL}`,
-        note: '「no individual hairs」是宠物图失败的头号原因：一根根毛会变成几百个碎像素，引擎只能合并成糊面。',
+        fit: '猫狗这类宠物的全身或头像，想做纪念款时用。',
+        text: prompt({
+          subject:
+            '像素画，一只柴犬的全身，正面，对称坐着，剪影粗壮好辨认；毛发不要一根根画，而是简化成几大块平涂色块，形状圆润友好，深色粗描边，不要任何毛绒质感',
+          colors: '用 8 到 14 种颜色，颜色取自这只狗真实的毛色',
+        }),
+        note: '「不要一根根画毛」是宠物图失败的头号原因：一根根毛会变成几百个碎像素，引擎只能合并成一片糊面。',
       },
       {
         id: 'animal-face',
-        fit: '动物小图标 / 表情包风格的圆脸。',
-        text: `cute pixel art animal face icon of a {subject}, perfectly centered, front facing, symmetric, big simple eyes, small nose, minimal details, 24 by 24 grid, very limited palette of 6 colors, black outline, no shading, ${TAIL}`,
+        fit: '动物小图标、表情包风格的圆脸。',
+        text: prompt({
+          subject:
+            '可爱的像素画动物圆脸图标，一只橘猫，正中构图，正面，左右对称，眼睛又大又简单，鼻子很小，细节尽量少，黑色描边，不要阴影',
+          colors: '最多用 6 种颜色',
+        }),
       },
     ],
   },
@@ -127,13 +296,22 @@ const GROUPS: readonly PromptGroup[] = [
       {
         id: 'game-sprite',
         fit: '经典游戏精灵：RPG 小怪、勇者、宝箱、药水。',
-        text: `retro video game sprite of a {subject}, NES-era 8-bit style, front view, static idle frame, strict grid alignment, chunky pixels, bold black outline, limited palette of 8 to 12 saturated colors, no drop shadow, ${TAIL}`,
-        note: '「static idle frame」能避免模型画成 sprite sheet（多帧拼一张），那种图没法直接进引擎。',
+        text: prompt({
+          subject:
+            '复古电子游戏精灵图，一个手持木剑的勇者，NES 时代的 8-bit 风格，正面，单帧静止姿势，严格对齐网格，像素块粗大，黑色粗描边',
+          colors: '用 8 到 12 种饱和度较高的颜色',
+        }),
+        note: '「单帧静止姿势」能避免模型画成多帧拼一张的 sprite sheet，那种图没法直接进引擎。',
       },
       {
         id: 'game-monster',
-        fit: '怪物 / 龙 / 机甲这类形状复杂的角色。',
-        text: `pixel art monster character, {subject}, front view, centered, aggressive readable silhouette, simplified anatomy with large distinct shapes, thick outline, two-tone flat shading only, limited palette of 14 colors, no glow, no particles, ${TAIL}`,
+        fit: '怪物、龙、机甲这类形状复杂的角色。',
+        text: prompt({
+          subject:
+            '像素画怪物角色，一只长着三只眼睛的紫色史莱姆，正面，居中，剪影粗壮好辨认，把复杂结构简化成几大块形状，深色粗描边，只用两档平涂明暗',
+          colors: '用 14 种颜色',
+          tail: '不要发光、不要粒子特效',
+        }),
       },
     ],
   },
@@ -145,27 +323,42 @@ const GROUPS: readonly PromptGroup[] = [
       {
         id: 'object-item',
         fit: '单件物品：一杯咖啡、一片叶子、一个蘑菇、一台游戏机。',
-        text: `pixel art icon of a {subject}, single object, centered, front or slight 3/4 view, clean recognizable silhouette, large flat color areas, bold outline, subtle 2-tone shading on one side only, limited palette of 8 colors, ${TAIL}`,
+        text: prompt({
+          subject:
+            '像素画图标，一杯冒着热气的咖啡，只画这一个物体，居中，正面略微四分之三视角，轮廓干净好辨认，大块平涂颜色，深色粗描边，只在一侧用两档明暗',
+          colors: '最多用 8 种颜色',
+        }),
       },
       {
         id: 'object-letter',
         fit: '字母 / 数字 / 小招牌，适合做名字牌、门牌。',
-        text: `pixel art of the letter "{letter}", single character, centered, blocky geometric construction, thick uniform stroke, sharp corners, flat single color on a plain contrasting solid background, no outline effects, no shadow, symmetry preserved, no anti-aliasing, no gradients`,
-        note: '一定要写「single character」；写成单词时模型会排成一整行，字宽和行距都不稳。',
+        text: prompt({
+          subject:
+            '像素画，一个大写字母 A，只画这一个字符，居中，用方块几何结构拼出字形，笔画粗细一致，转角是直角，单色平涂，背景用一种对比明显的纯色',
+          colors: '最多用 4 种颜色',
+          tail: '不要发光、不要投影，字形保持左右对称',
+        }),
+        note: '一定要写「只画这一个字符」；写成单词时模型会排成一整行，字宽和行距都不稳。',
       },
       {
         id: 'object-logo',
-        fit: '把已有 logo / 图标转成拼豆版（配"图生图 / 参考图"使用）。',
-        text: `simplify this logo into pixel art, keep the recognizable silhouette and exact color identity, reduce to a limited palette of under 10 flat colors, remove all fine detail, gradients and thin lines, thicken outlines, align everything to a strict pixel grid, centered on a plain solid background, no anti-aliasing, no shadows`,
-        note: '这条要配参考图用；纯文生图请把 logo 的特征直接写进描述。',
+        fit: '把已有 logo / 图标转成拼豆版（要用上面的「图生图」方式，先把 logo 传上去）。',
+        text: refPrompt({
+          keep: '只保留这个 logo 的轮廓特征和主色，不要改成别的形状，也不要添加新元素',
+          convert:
+            '把 logo 简化成像素画：去掉所有细节、渐变和细线，笔画加粗到至少一格宽，整体对齐到严格网格，居中放在画面里',
+          colors: '最多用 10 种颜色',
+        }),
+        note: '纯文生图做 logo 基本不可控，这条一定要配参考图用。',
       },
     ],
   },
 ];
 
-/** 通用负面词。有 negative prompt 框就一起粘，效果更稳。 */
+/** 通用负面词。有 negative prompt 输入框就一起粘进去，效果更稳。 */
 const NEGATIVE =
-  'blurry, anti-aliased, smooth, gradient, soft shading, glow, drop shadow, photorealistic, 3d render, jpeg artifacts, noisy texture, thin lines, text, watermark, signature, extra limbs, deformed';
+  '模糊、柔化、平滑过渡、渐变、柔和阴影、发光、投影、照片写实、3D 渲染、JPEG 压缩噪点、细碎纹理、细线条、文字、水印、签名、抖动噪点（dithering）、多余的肢体、变形';
+
 
 export interface MascotPromptPopoverProps {
   open: boolean;
@@ -262,8 +455,8 @@ function PixelClose({ onClose }: { onClose: () => void }) {
  * 提示词正文块：左侧一道陶土色硬边。
  *
  * 这里**故意用等宽系统字体而不是 --font-pixel**：Silkscreen 只有大写字形，
- * 40 个英文单词的提示词渲染成全大写后基本没法校对（用户要改 {subject}、
- * 要确认 no anti-aliasing 有没有漏）。像素字体留给短标签用。
+ * 整句渲染成全大写后基本没法校对 —— 中文没有大小写，但混在里面的
+ * no anti-aliasing 会被写成 NO ANTI-ALIASING，反而更费劲。像素字体留给短标签。
  */
 function PromptBlock({ text, accent }: { text: string; accent: string }) {
   return (
@@ -328,7 +521,7 @@ export function MascotPromptPopover({ open, onOpenChange, brand }: MascotPromptP
               让 AI 先画一张「能拼」的图
             </DialogTitle>
             <DialogDescription className="mt-0.5 text-[11.5px] leading-snug text-[var(--ink-2)]">
-              复制英文提示词到豆包 / Qwen / 即梦 / Midjourney，把生成的图传进来，图纸会干净很多。
+              复制一段提示词到豆包 / 元宝 / 即梦，把生成的图传进来，图纸会干净很多。想照着自己的图做，用「图生图」那一组。
             </DialogDescription>
           </div>
           <PixelClose onClose={() => onOpenChange(false)} />
@@ -388,6 +581,31 @@ export function MascotPromptPopover({ open, onOpenChange, brand }: MascotPromptP
             ))}
           </ul>
 
+          <p className="mt-2.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+            每条都是<strong className="text-[var(--ink-2)]">可以直接发的完整句子</strong>，主体位置已经填好示例词（比如「一只橘猫」）。
+            想换成自己要的东西，就把那句话里的主体换掉，其余不用动 —— 不用去找任何占位符。
+            正文用中文，是因为豆包 / 元宝 / 即梦这些模型读中文不比英文差；
+            括起来的英文术语是这一行的固定说法，留着能让模型更准确地理解技术要求。
+          </p>
+
+          {/* ─────────── 什么样的图适合本工具（管理预期） ─────────── */}
+          <section className="mt-2.5 border-2 border-[var(--line)] bg-[var(--paper-sunken)] px-2.5 py-2">
+            <h3 className="font-display text-[12px] font-bold text-[var(--ink)]">什么样的图最适合本工具</h3>
+            <div className="mt-1.5 grid grid-cols-1 gap-1.5 text-[11px] leading-relaxed text-[var(--ink-2)] sm:grid-cols-2">
+              <p>
+                <span aria-hidden className="mr-1 text-[var(--leaf)]">✔</span>
+                背景是一整片纯色、格子清晰、色块大、主体居中完整。
+              </p>
+              <p>
+                <span aria-hidden className="mr-1 text-[var(--bloom)]">✘</span>
+                手机照片直出、背景杂乱、大片渐变、细节很碎 —— 也能转，但会丢掉不少东西。
+              </p>
+            </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+              判断标准很简单：把图缩小成一张 32×32 的缩略图，还认得出是什么，就能拼得好看。
+            </p>
+          </section>
+
           {/* ─────────── 为什么这样写（这个功能真正的价值所在） ─────────── */}
           <section className="mt-3.5 border-2 border-[var(--line-strong)] bg-[var(--paper-sunken)] px-3 py-2.5">
             <h3 className="font-display text-[12.5px] font-bold text-[var(--ink)]">
@@ -431,17 +649,6 @@ export function MascotPromptPopover({ open, onOpenChange, brand }: MascotPromptP
             <PromptBlock text={NEGATIVE} accent="border-[var(--bloom)]" />
           </section>
 
-          <p className="mt-2.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
-            提示词里的{' '}
-            <code className="border border-[var(--line)] bg-[var(--paper-raised)] px-1 font-mono text-[10px] text-[var(--ink)]">
-              {'{subject}'}
-            </code>{' '}
-            与{' '}
-            <code className="border border-[var(--line)] bg-[var(--paper-raised)] px-1 font-mono text-[10px] text-[var(--ink)]">
-              {'{letter}'}
-            </code>{' '}
-            是占位符，换成你要画的东西就好。英文对这些模型更有效，所以正文保持英文。
-          </p>
         </div>
       </DialogContent>
     </Dialog>
