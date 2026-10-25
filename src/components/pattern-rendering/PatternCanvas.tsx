@@ -1260,7 +1260,7 @@ export function PatternCanvas({
           用 justify-end 保持和标题栏动作按钮一条竖线。 */}
       {!(zoomSlot && isDesktop) && (
         <div
-          className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden pb-0.5 [&>*]:shrink-0 xl:flex-wrap xl:justify-end xl:overflow-visible xl:[&>*]:shrink"
+          className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden py-1 -mb-1.5 [&>*]:shrink-0 xl:flex-wrap xl:justify-end xl:overflow-visible xl:[&>*]:shrink"
           style={BRUSH_BAR_SCROLL_STYLE}
         >
           {zoomGroup}
@@ -1309,7 +1309,7 @@ export function PatternCanvas({
                 按钮一定会把按钮压扁到点不中（刷区域工具条踩过同一个坑）。
               */}
               <div
-                className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden pb-0.5 [&>*]:shrink-0 xl:flex-wrap xl:overflow-visible xl:[&>*]:shrink"
+                className="flex shrink-0 flex-nowrap items-center gap-x-3 overflow-x-auto overflow-y-hidden py-1 -mb-1.5 [&>*]:shrink-0 xl:flex-wrap xl:overflow-visible xl:[&>*]:shrink"
                 style={BRUSH_BAR_SCROLL_STYLE}
               >
                 {/* 五个工具：抓手 + 手绘 / 橡皮 / 取色 / 油漆桶 */}
