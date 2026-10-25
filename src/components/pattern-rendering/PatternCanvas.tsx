@@ -160,6 +160,46 @@ const SWATCH_DESKTOP = 24;
 const SWATCH_MOBILE = 28;
 
 /**
+ * 刷区域工具条：窄屏压成**单行横滚**。
+ *
+ * 用户原话（390×844 编辑态）：「还有刷区域会把这个画板压得很扁，不易操作」。
+ *
+ * 实测那一屏：工具条 `flex-wrap` 在 362px 宽里折成 3 行 = 108px 高，画布
+ * 外框从 498 掉到 **339**。而这条工具条里真正高频的只有「应用重建」一个
+ * 按钮，其余（算法四选一、笔刷/过渡两根滑杆、撤销清空）是低频设置项 ——
+ * 让低频项折行吃掉 60px 画布，是本末倒置。
+ *
+ * 所以窄屏改成不折行 + 横向滚动：一行约 46px，画布拿回 60 多 px。用户
+ * 想看别的选项就横着拨一下，比"画布永久变矮"划算得多。桌面宽度足够，
+ * 维持折行（信息全可见，不用拨）。
+ *
+ * 两个必须记住的细节：
+ *   1. iOS Safari 的横滚容器默认**没有惯性**，要 `-webkit-overflow-scrolling:
+ *      touch`；这条属性 Tailwind 没有对应类，走 inline style。
+ *   2. 横滚里的子项必须 `shrink-0`，否则 flex 会把按钮压扁到点不中
+ *      （默认 flex-shrink: 1，362px 塞 6 个组一定会压）。
+ */
+/*
+ * 断点用 Tailwind 的 `lg:`（= 64rem = 1024px），与 globals.css 的 `.wb` 和
+ * 本文件里的 DESKTOP_QUERY 同一个断点，三处一起变。
+ *
+ * 写成纯响应式类而不是 JS 分支（isDesktop）：这条工具条在服务端也要能渲染，
+ * 用 JS 判定会让首帧闪一次折行 → 单行的跳变。
+ */
+const BRUSH_BAR_CLASSES =
+  'px-panel-flat flex items-center px-2.5 py-2 ' +
+  // 窄屏：一行 + 横滚
+  'flex-nowrap gap-x-2.5 overflow-x-auto overflow-y-hidden ' +
+  '[&>*]:shrink-0 ' +
+  // 桌面：折行，信息全部可见，不用拨
+  'lg:flex-wrap lg:gap-x-3 lg:gap-y-2 lg:overflow-visible lg:[&>*]:shrink';
+/** 横滚容器的 inline style（Tailwind 没有 -webkit-overflow-scrolling 类） */
+const BRUSH_BAR_SCROLL_STYLE: React.CSSProperties = {
+  WebkitOverflowScrolling: 'touch',
+  overscrollBehaviorX: 'contain',
+};
+
+/**
  * 断点判定：用 matchMedia 而不是量 host 宽度。
  *
  * 依据是"窗口一行还能不能并排放两栏"，那是媒体查询的事，不是画布容器的事 ——
@@ -1355,7 +1395,8 @@ export function PatternCanvas({
           {/* ---------------- 刷区域工具条（只在父组件接管 brushes 时出现） ---------------- */}
           {brushEnabled && brushMode && (
         <div
-          className="px-panel-flat flex flex-wrap items-center gap-x-3 gap-y-2 px-2.5 py-2"
+          className={BRUSH_BAR_CLASSES}
+          style={BRUSH_BAR_SCROLL_STYLE}
           role="region"
           aria-label="刷区域工具条"
         >
@@ -1434,8 +1475,14 @@ export function PatternCanvas({
           {/*
             两步式的核心按钮，放在撤销/清空左边 —— 它才是这个工具条里
             用户唯一"必须点"的动作，位置和 primary 配色都要压过其它按钮。
+
+            窄屏（横滚态）要把它挪到**最前面**：那一行可滚 822px 而可视只有
+            358px，按原顺序它落在 x≈585 —— 用户必须先把横滚条拨到右边才看得见
+            唯一必须点的按钮，等于藏起来了。「应用重建」是这一步的终点，
+            它必须在起手就能按到的地方；算法和两根滑杆是低频设置，往右拨一下
+            才是合理的代价。桌面宽度足够、不横滚，顺序维持原样。
           */}
-          <div className="flex flex-wrap items-center gap-1.5">
+          <div className="order-first flex flex-wrap items-center gap-1.5 lg:order-none">
             <button
               type="button"
               className="px-btn px-btn-primary px-btn-sm"

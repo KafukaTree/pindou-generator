@@ -678,10 +678,50 @@
     animation: px-blink 5.2s steps(1, end) infinite;
   }
 
+  /*
+   * ---------------- 手机侧边抽屉（MobileDrawer） ----------------
+   *
+   * 用户原话：「我觉得可以做成手机式的那种侧边栏，就是像社交媒体软件一样，
+   * 往左滑就会出现叠层，但是只有左边大半个屏幕被占用，右边是偏阴影」。
+   *
+   * 位移用 `translate: -100%` → `0`，而不是改 `left`：translate 走合成层，
+   * 手机上不触发重排。两层都挂在这两个类上（抽屉本体 + 遮罩），由
+   * MobileDrawer.tsx 的 open 状态切换。
+   *
+   * 时长压在 180ms：社交媒体那种抽屉的手感是"跟手、不拖沓"。再慢一点
+   * 用户会以为没点中。用 steps() 而不是 ease —— 整套视觉语言是像素风，
+   * 缓动曲线在这里会显得突兀（对齐 .px-rise 的做法）。
+   */
+  @keyframes px-drawer-in {
+    from { translate: -100% 0; }
+    to { translate: 0 0; }
+  }
+
+  @keyframes px-mask-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .px-drawer {
+    animation: px-drawer-in 0.18s steps(6, end) both;
+  }
+
+  .px-mask {
+    animation: px-mask-in 0.18s steps(4, end) both;
+  }
+
+  /*
+   * 抽屉关闭时的退场不用动画：卸载即可。
+   * 理由 —"关"是用户已经做完动作的结果，多 180ms 反而挡着他继续画；
+   * 而且退场期间遮罩还在，会吞掉一次点击。
+   */
+
   @media (prefers-reduced-motion: reduce) {
     .px-rise,
     .px-bob,
-    .px-blink {
+    .px-blink,
+    .px-drawer,
+    .px-mask {
       animation: none !important;
     }
     .px-btn,
