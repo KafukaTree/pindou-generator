@@ -72,6 +72,21 @@ import {
   writeWorkspaceSession,
 } from '@/hooks/useWorkspaceSession';
 import { parseHex } from '@/lib/color/oklab';
+import {
+  DEFAULT_OUTLINE,
+  OUTLINE_KEY,
+  sanitizeOutline,
+  type OutlineSettings,
+} from '@/lib/pattern/outline-settings';
+import {
+  DEFAULT_MARGIN,
+  MARGIN_KEY,
+  applyMargin,
+  remapEditsBetween,
+  sanitizeMargin,
+  type MarginMode,
+} from '@/lib/pattern/margin';
+import { applyCartoonOutline, buildOutlineGuide } from '@/lib/pattern/outline';
 import { cn } from '@/lib/utils';
 
 /* ============================================================
@@ -193,6 +208,22 @@ export default function Home() {
       null,
     );
     return saved ? { ...DEFAULT_OPTIONS, ...saved } : DEFAULT_OPTIONS;
+  });
+
+  /*
+   * ---- 卡通黑边（可选的渲染层描边） --------------------------------------
+   *
+   * 默认关闭。开启后，在引擎结果之上再算一遍轮廓并盖一层纯黑豆，
+   * **不改** 原始 `pattern`（引擎结果永远是基线，历史、恢复、参数重算
+   * 都回到它）。
+   *
+   * 惰性初始化读 localStorage：这个值不影响首帧 DOM 结构（只是决定
+   * 一段 effect 要不要跑），所以不会造成水合不一致 —— 与 `leftCollapsed`
+   * 那种直接改 className 的情况不同。
+   */
+  const [outline, setOutline] = useState<OutlineSettings>(() => {
+    if (typeof window === 'undefined') return DEFAULT_OUTLINE;
+    return sanitizeOutline(readStorage<unknown>(OUTLINE_KEY, null));
   });
 
   /*
@@ -334,6 +365,36 @@ export default function Home() {
   useEffect(() => {
     writeStorage(OPTIONS_KEY, options);
   }, [options]);
+
+  /*
+   * 卡通黑边偏好单独一个键。
+   *
+   * 不并进 OPTIONS_KEY：那份是引擎的量化配方，而描边是量化之后的渲染层
+   * 偏好（见 outline-settings.ts 的说明）。混在一起会让"历史记录里的
+   * 参数"多出一个不影响量化结果的字段，恢复历史时还会把别人的描边偏好
+   * 一起套上去。
+   */
+  useEffect(() => {
+    writeStorage(OUTLINE_KEY, outline);
+  }, [outline]);
+
+  /*
+   * ---- 画布边距策略 ------------------------------------------------------
+   *
+   * 与 options 分开存：它决定的是"给源图裁多少、画布多大"，属于出图尺寸
+   * 的一部分，但改它不需要重跑描边本身 —— 反而要重跑量化。放进 options
+   * 会让 optionsKey 变化，而 options 会被原样交给 generatePattern。
+   *
+   * 惰性初始化同样安全：只决定重算 effect 里的一个分支，不影响首帧 DOM。
+   */
+  const [margin, setMargin] = useState<MarginMode>(() => {
+    if (typeof window === 'undefined') return DEFAULT_MARGIN;
+    return sanitizeMargin(readStorage<unknown>(MARGIN_KEY, null));
+  });
+
+  useEffect(() => {
+    writeStorage(MARGIN_KEY, margin);
+  }, [margin]);
 
   /* ---------------------------------------------------------------
    * 选图：只管把图片解码好，真正出图交给下面的统一重算效应
@@ -724,8 +785,271 @@ export default function Home() {
   }, [blankCanvas]);
 
   /* ---------------------------------------------------------------
-   * 历史：只在"图案真的变了"之后记一条
-   * --------------------------------------------------------------- */
+   * 卡通黑边：在引擎结果之上再盖一层纯黑轮廓
+   * ---------------------------------------------------------------
+   *
+   * ---- 为什么单独一条 effect，不并进上面的重算 effect ----
+   *
+   * 量化（generatePattern）与描边是两件事：前者决定"每格是什么颜色"，
+   * 后者只是在这个结果上再加几颗黑豆。并在一起的话，用户切换"细/中/粗"
+   * 会把整个量化流程重跑一遍（320 格要 1 秒），而实际上只有描边那一步
+   * 需要重算。分开之后：改粗细只跑 10–410ms 的描边，不碰量化。
+   *
+   * ---- 为什么 guide 要缓存 ----
+   *
+   * `buildOutlineGuide` 是这个模块里最贵的一步（实测 135–290ms），
+   * 而它只取决于「源图 + 网格 + 裁切/背景/fit」—— 与粗细、样式都无关。
+   * 所以只要 pattern 没换（= 量化没重跑），粗细来回切都复用同一份 guide。
+   *
+   * ---- 为什么读 imageDataRef 而不进依赖 ----
+   *
+   * ref 不是响应式的，但这里的时序是确定的：上面的重算 effect 先
+   * `ensureSource()` 更新 imageDataRef，再 `generatePattern()` 产出
+   * 新的 pattern 对象。也就是说 `pattern` 一变，ref 里一定已经是与它
+   * 配套的 ImageData。把 ref 放进依赖只会引入无意义的空转。
+   */
+  const outlineGuideRef = useRef<{
+    pattern: PatternResult;
+    guide: ReturnType<typeof buildOutlineGuide>;
+  } | null>(null);
+  const [outlinePattern, setOutlinePattern] = useState<PatternResult | null>(
+    null,
+  );
+  /*
+   * `outlinePattern` 所属的「显示空间」。
+   *
+   * 为什么必须跟着描边结果一起记：边距会改变网格（expand 加 6 行 6 列），
+   * 而用户的手绘 edits 是按**他当时看到的那个网格**存下标的。只要网格变了，
+   * 旧下标就全部错位 —— 表现是手绘的豆子飘到别处，颗数却还是对的，极难查。
+   *
+   * 单独存一份而不是从 `margin` 现推：`margin` 是用户点击后立刻变的，而
+   * `outlinePattern` 要等描边 effect 跑完才更新。中间那 300ms 里若按 `margin`
+   * 现推，算出来的空间与手上的 `outlinePattern` 并不匹配，迁移必然算错。
+   * 这里记的是"产出这份 outlinePattern 时用的边距"。
+   */
+  /*
+   * 「上一轮描边结果所在的显示空间」。
+   *
+   * 为什么用 ref 而不是 state：描边 effect 需要把"上一轮的空间"和"这一轮的
+   * 空间"同时拿在手上才能算坐标迁移，而 state 在同一个 effect 里刚 set 完
+   * 读回来还是旧值（setState 到下一次渲染才生效）。这个值也不参与渲染，
+   * 没有理由触发重渲染。
+   */
+  const outlineSpaceRef = useRef<{
+    cols: number;
+    rows: number;
+    mode: MarginMode;
+  } | null>(null);
+  /*
+   * edits 的即时镜像。描边 effect 需要读当前编辑内容去迁移，但**不能**把
+   * edits 放进它的 deps —— 那样每涂一笔就要重算一次描边（320 格约 1 秒）。
+   */
+  const editsRef = useRef<EditMap>(EMPTY_EDITS);
+  editsRef.current = edits;
+  /*
+   * 描边失败的原因。不弹 toast：用户可能只是随手点开看一眼，而"色位满了"
+   * 这种情况本来就是正常的边界（黑色要占一个名额）。在参数面板的开关下面
+   * 显示一行说明，比打断操作的红色提示合适。
+   */
+  const [outlineNote, setOutlineNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    /*
+     * 关闭 = 立刻回到原始图纸，且不保留上一份描边结果 —— 否则关掉开关
+     * 还留着一份 outlinePattern 在内存里，下次打开会先闪一下旧的粗细。
+     */
+    if (!outline.enabled || !pattern || blankCanvas) {
+      const baseCols = pattern?.cols ?? 0;
+      const baseRows = pattern?.rows ?? 0;
+      /*
+       * 关掉描边 = 回到引擎原始图纸，而原始图纸是**未经边距变换**的空间。
+       * 若之前开着 expand（画布 58×70），手绘格要搬回 52×64 才不会飘。
+       */
+      const prevSpace = outlineSpaceRef.current;
+      if (
+        prevSpace &&
+        baseCols > 0 &&
+        (prevSpace.mode !== 'occupy' ||
+          prevSpace.cols !== baseCols ||
+          prevSpace.rows !== baseRows)
+      ) {
+        setEdits(
+          remapEditsBetween(editsRef.current, prevSpace, {
+            cols: baseCols,
+            rows: baseRows,
+            mode: 'occupy',
+          }),
+        );
+      }
+      outlineSpaceRef.current = null;
+      setOutlinePattern(null);
+      setOutlineNote(null);
+      return;
+    }
+    const data = (() => {
+      /*
+       * 自己保证源图解码到位，不等重算 effect 顺手填。
+       *
+       * `imageDataRef` 唯一的写入点是 `ensureSource`，而它原来只在重算
+       * effect 里被调用。刷新页面时快照先恢复出图纸（100ms 级），此时
+       * ref 还是空的 —— 描边 effect 只能空手回去等，于是用户先看到
+       * 一张没有黑边的图，等引擎重算完（约 2.5 秒）黑边才突然出现。
+       *
+       * 实测时间线（只加 imageReady 依赖时仍是这个形状）：
+       *   256ms  画出无黑边的 1552 颗
+       *   2606ms 才变 1925 颗
+       *
+       * 这里主动解码一次：ensureSource 内部有"已解码边长够用就跳过"的
+       * 判断，与重算 effect 共用同一个缓存，不会重复解码。
+       */
+      let d = imageDataRef.current;
+      if (!d && sourceRef.current) {
+        ensureSource(sourceRef.current, options.gridSize);
+        d = imageDataRef.current;
+      }
+      return d;
+    })();
+    if (!data) {
+      /*
+       * 源图还没解码好，这一轮算不了 —— 但**必须**留下重试的钩子。
+       * `imageReady` 是解码完成时自增的显式信号（与重算 effect 共用），
+       * 放进 deps 保证解码完成后自动补一次。
+       */
+      setOutlinePattern(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    try {
+      // guide 复用：只有 pattern 换过才重算（粗细/线条画法/边距都不影响它）
+      let cached = outlineGuideRef.current;
+      if (!cached || cached.pattern !== pattern) {
+        cached = { pattern, guide: buildOutlineGuide(data, pattern, {}) };
+        outlineGuideRef.current = cached;
+      }
+
+      /*
+       * 边距在描边**之前**：黑边是往主体外侧长，长的地方就是这里补出来的
+       * 空白格。顺序反过来（先描边再扩画布）等于黑边已经贴着边界画完了，
+       * 之后再补空白也补不出线来。
+       *
+       * applyMargin 同时搬 cells 和 guide，所以下面两者网格一定对齐；
+       * 它不重跑量化，expand 只是加空格、shrink 是最近邻降采样。
+       */
+      const margined = applyMargin(pattern, cached.guide, margin);
+
+      const result = applyCartoonOutline(margined.pattern, margined.guide, {
+        enabled: true,
+        thickness: outline.thickness,
+        style: outline.style,
+        // 线条两种：卡通线条=内部也描，轮廓黑边=只描最外圈
+        internal: outline.lines === 'cartoon',
+        experimentalParts: outline.experimentalParts,
+      });
+      if (cancelled) return;
+
+      /*
+       * skippedReason 只有几种，逐一翻译成人话。
+       * `disabled` 不会走到这里（上面已经 return），但留着兜底：
+       * 万一 outline.enabled 与传下去的值不同步，不要静默当成成功。
+       */
+      const reason = result.diagnostics.skippedReason;
+      if (reason === 'no-free-color-slot') {
+        setOutlinePattern(null);
+          setOutlineNote(
+          `颜色数已经用满 ${pattern.meta.colorLimit} 个，黑色占不到名额。把「颜色数量」调高 1 个，或者减少一种颜色再试。`,
+        );
+        return;
+      }
+      if (reason === 'no-brand-stroke-color') {
+        setOutlinePattern(null);
+          setOutlineNote('这个品牌色卡里没有中性深色，画不出黑边。换个品牌试试。');
+        return;
+      }
+      if (reason) {
+        setOutlinePattern(null);
+          setOutlineNote(null);
+        return;
+      }
+
+      setOutlineNote(
+        result.diagnostics.touchesCanvasEdge
+          ? '主体贴着画布边缘，最外圈没办法再往外扩一格；把「适配方式」改成完整放入会好一些。'
+          : null,
+      );
+      setOutlinePattern(result.pattern);
+      /*
+       * 记下这份结果所在的显示空间。applyMargin 的 expand 会加 6 行 6 列，
+       * shrink 保持行列数不变，所以直接读 margined.pattern 的行列数，
+       * 而不是从 options.gridSize 反推。
+       */
+      const nextSpace = {
+        cols: margined.pattern.cols,
+        rows: margined.pattern.rows,
+        mode: margin,
+      };
+      /*
+       * 迁移手绘格：只在这两张图纸**格数不同**时才搬。
+       *
+       * 同一行列数下不动的原因：expand↔occupy 在长宽比恰好落在整数格时
+       * 可能算出同样的 cols/rows，此时若照搬一遍"迁移"，等于把 edits 原样
+       * 返回（remapEditsBetween 会短路），白跑一趟；而如果误判成"空间变了"
+       * 又没短路，反而会叠加偏移。宁可少搬一次也不要多搬。
+       */
+      /*
+       * 没有 prevSpace（描边刚被打开）时，手上那批 edits 属于**基础空间**
+       * —— 也就是引擎原始图纸、没经过任何边距变换的那个网格。漏掉这一步
+       * 会让"先画几笔、再打开黑边"的手绘格整体错位：画布从 52×64 变成
+       * 58×70，但下标没跟着挪，同一个数字现在指向另一格，豆子就飘了。
+       */
+      const prevSpace = outlineSpaceRef.current ?? {
+        cols: pattern.cols,
+        rows: pattern.rows,
+        mode: 'occupy' as MarginMode,
+      };
+      if (
+        prevSpace.cols !== nextSpace.cols ||
+        prevSpace.rows !== nextSpace.rows
+      ) {
+        setEdits(remapEditsBetween(editsRef.current, prevSpace, nextSpace));
+      }
+      outlineSpaceRef.current = nextSpace;
+    } catch (err) {
+      /*
+       * 描边是可选装饰，它失败不该把整张图纸弄没。捕获后回落到原始图纸，
+       * 让用户至少还能看、能导出、能继续编辑。
+       */
+      if (cancelled) return;
+      console.error('[pindou] outline failed', err);
+      setOutlinePattern(null);
+      setOutlineNote('这次描边没算出来，先显示原始图纸。改一下粗细或换张图再试。');
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    outline.enabled,
+    outline.thickness,
+    outline.style,
+    outline.lines,
+    // 边距会改变画布行列数（expand +6），必须重算描边
+    margin,
+    outline.experimentalParts,
+    pattern,
+    blankCanvas,
+    /*
+     * 源图解码完成信号：没有它，刷新后描边会静默放弃且永不重试。
+     * 详见上面 `if (!data)` 分支里记录的实测时间线。
+     */
+    imageReady,
+    ensureSource,
+    // ensureSource 用 gridSize 决定解码精度；它变了要重新解码再描边
+    options.gridSize,
+  ]);
+
+
   /*
    * 用户眼里的图纸 = 引擎结果 + 手工覆盖层。
    *
@@ -746,9 +1070,20 @@ export default function Home() {
   const editedCount = useMemo(() => editCount(edits), [edits]);
   const displayPattern = useMemo(() => {
     if (!pattern) return null;
-    if (editedCount === 0) return pattern;
-    return applyEdits(pattern, edits, options.brand);
-  }, [pattern, edits, editedCount, options.brand]);
+    /*
+     * 管线顺序：引擎量化 → 卡通黑边 → 手工覆盖层。
+     *
+     * 描边必须排在手工编辑**之前**：用户在描边结果上刷了一笔，那一格
+     * 就该是他的颜色，不能又被黑边盖回去。反过来若先套编辑再描边，
+     * 用户刚把某格改成白色、描边又给它画成黑 —— 这就是"改了没用"。
+     *
+     * outlinePattern 为 null 时（关闭/失败/不支持）完全等价于原先的行为，
+     * 是同一个对象引用，所以关闭描边不会带来任何额外开销。
+     */
+    const base = outlinePattern ?? pattern;
+    if (editedCount === 0) return base;
+    return applyEdits(base, edits, options.brand);
+  }, [pattern, outlinePattern, edits, editedCount, options.brand]);
 
   /*
    * 历史签名 = 参数 + 网格 + 颗数 + **手改格数**。
@@ -1345,6 +1680,11 @@ export default function Home() {
                     actualRows={pattern?.rows}
                     sizeCm={sizeCm}
                     isWorking={isWorking}
+                    outline={outline}
+                    onOutlineChange={setOutline}
+                    outlineNote={outlineNote}
+                    margin={margin}
+                    onMarginChange={setMargin}
                   />
                 )}
               </Section>
@@ -1461,7 +1801,20 @@ export default function Home() {
                   />
                 ) : (
                   <PatternCanvas
-                    pattern={pattern}
+                    /*
+                     * 传给画布的必须是**描边后**的结果，不是裸 `pattern`。
+                     *
+                     * 踩过的坑：一开始这里给的是 `pattern`，画布内部自己
+                     * 叠加 edits 画出来。于是开了黑边之后，顶部统计显示
+                     * 1925 颗、用料清单也列了黑豆，**画布上却一根黑边都
+                     * 没有** —— 数字与画面互相矛盾，是那种最让人怀疑
+                     * 工具坏了的错位。
+                     *
+                     * 顺序与 displayPattern 一致：引擎 → 描边 → 手工编辑。
+                     * 画布内部本来就会在传入的 pattern 上叠 edits，所以这里
+                     * 只需要把 base 换成描边结果，手绘的豆子仍然盖在黑边之上。
+                     */
+                    pattern={outlinePattern ?? pattern}
                     brand={options.brand}
                     fill
                     /*

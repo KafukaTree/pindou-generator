@@ -10,6 +10,16 @@ import {
   DETAIL_META,
   type DetailAlgorithm,
 } from '@/lib/pattern/detail';
+import {
+  LINES_META,
+  THICKNESS_META,
+  type OutlineSettings,
+} from '@/lib/pattern/outline-settings';
+import {
+  DEFAULT_MARGIN,
+  MARGIN_META,
+  type MarginMode,
+} from '@/lib/pattern/margin';
 import { cn } from '@/lib/utils';
 
 /**
@@ -39,6 +49,29 @@ export interface PatternSettingsProps {
   sizeCm?: { w: number; h: number } | null;
   /** 父组件正在重算（debounce 中 / 同步计算中），显示轻提示但不阻塞操作 */
   isWorking?: boolean;
+  /**
+   * 卡通黑边设置。
+   *
+   * 为什么不塞进 `value: GenerateOptions`：那是量化配方，会被原样交给
+   * `generatePattern`。描边是量化**之后**的渲染层改动，用的是另一套
+   * 数据（源图梯度 + 轮廓路径）。混在一起会让"改粗细"触发整条量化
+   * 重跑（320 格要 1 秒），而实际只需要重算描边那一步。
+   */
+  outline?: OutlineSettings;
+  onOutlineChange?: (next: OutlineSettings) => void;
+  /** 描边当前算不出来的原因（色位满 / 主体贴边等），显示在开关下方 */
+  outlineNote?: string | null;
+  /**
+   * 画布边距策略。
+   *
+   * 它决定黑边有没有地方长：占原边（黑边可能被切）/ 缩小留边（内容变小）/
+   * 扩大画布（成品变大）。三种都是取舍，没有"更好的那个"，所以按用户要求
+   * 摆成三选一让他自己挑，而不是替他选一个。
+   *
+   * 只有开了黑边才有意义 —— 没黑边时留边只是白白浪费画布。
+   */
+  margin?: MarginMode;
+  onMarginChange?: (next: MarginMode) => void;
   className?: string;
 }
 
@@ -132,6 +165,11 @@ export function PatternSettings({
   actualRows,
   sizeCm = null,
   isWorking = false,
+  outline,
+  onOutlineChange,
+  outlineNote = null,
+  margin = DEFAULT_MARGIN,
+  onMarginChange,
   className,
 }: PatternSettingsProps) {
   const patch = useCallback(
@@ -521,6 +559,156 @@ export function PatternSettings({
           onChange={(next) => patch({ dither: next })}
         />
       </div>
+
+      {/*
+        ---------------- 卡通黑边 ----------------
+        单独一块、默认关闭，因为它会**多占一个颜色名额**（纯黑），
+        在「颜色数量」卡得很紧时开它可能把某个原本的色挤掉。所以文案
+        里要写清代价，而不是只写"更好看"。
+      */}
+      {outline && onOutlineChange ? (
+        <>
+          <div className="px-rule" />
+          <div className="space-y-2">
+            <SwitchRow
+              label="卡通黑边"
+              hint="沿轮廓盖一圈纯黑豆，卡通感和辨识度更强；会占用一个颜色名额"
+              checked={outline.enabled}
+              disabled={disabled}
+              onChange={(next) => onOutlineChange({ ...outline, enabled: next })}
+            />
+
+            {/*
+              只有开启时才露出粗细/样式：关着的时候露出一排点了没反应的
+              按钮，最容易让人以为界面坏了。
+            */}
+            {outline.enabled ? (
+              <div className="space-y-2.5 border-l-2 border-[var(--line)] pl-2.5">
+                <div>
+                  <span className="mb-1 block text-[11.5px] font-semibold leading-none text-[var(--ink)]">
+                    黑边粗细
+                  </span>
+                  <div className="flex gap-1.5">
+                    {THICKNESS_META.map((t) => (
+                      <button
+                        key={t.value}
+                        type="button"
+                        disabled={disabled}
+                        onClick={() =>
+                          onOutlineChange({ ...outline, thickness: t.value })
+                        }
+                        title={t.hint}
+                        aria-pressed={outline.thickness === t.value}
+                        className={cn(
+                          'px-btn px-btn-sm !px-2.5 !py-1 !text-[11.5px]',
+                          outline.thickness === t.value &&
+                            '!border-[var(--clay-deep)] !bg-[var(--clay)] !text-[var(--on-clay)]',
+                        )}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <span className="mb-1 block text-[11.5px] font-semibold leading-none text-[var(--ink)]">
+                    线条
+                  </span>
+                  <div className="flex gap-1.5">
+                    {LINES_META.map((s) => (
+                      <button
+                        key={s.value}
+                        type="button"
+                        disabled={disabled}
+                        onClick={() =>
+                          onOutlineChange({ ...outline, lines: s.value })
+                        }
+                        title={s.hint}
+                        aria-pressed={outline.lines === s.value}
+                        className={cn(
+                          'px-btn px-btn-sm !px-2.5 !py-1 !text-[11.5px]',
+                          outline.lines === s.value &&
+                            '!border-[var(--clay-deep)] !bg-[var(--clay)] !text-[var(--on-clay)]',
+                        )}
+                      >
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[11px] leading-snug text-[var(--ink-2)]">
+                    {LINES_META.find((s) => s.value === outline.lines)?.hint}
+                  </p>
+                </div>
+
+                {/*
+                  画布边距：黑边长在主体外侧的空白格里，留白不够就会被
+                  画布边界切掉。三种取舍都摆出来让用户自己挑 —— 缩小内容、
+                  放大画布、还是接受切角，没有普适的更优解。
+
+                  放在「线条」之后是有意的：用户先决定要不要描边、再决定
+                  怎么给描边腾地方，顺序反过来会先问一个还不存在的问题。
+                */}
+                {onMarginChange ? (
+                  <div>
+                    <span className="mb-1 block text-[11.5px] font-semibold leading-none text-[var(--ink)]">
+                      画布边距
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {MARGIN_META.map((m) => (
+                        <button
+                          key={m.value}
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => onMarginChange(m.value)}
+                          title={m.hint}
+                          data-testid={`margin-${m.value}`}
+                          aria-pressed={margin === m.value}
+                          className={cn(
+                            'px-btn px-btn-sm !px-2.5 !py-1 !text-[11.5px]',
+                            margin === m.value &&
+                              '!border-[var(--clay-deep)] !bg-[var(--clay)] !text-[var(--on-clay)]',
+                          )}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mt-1 text-[11px] leading-snug text-[var(--ink-2)]">
+                      {MARGIN_META.find((m) => m.value === margin)?.hint}
+                    </p>
+                  </div>
+                ) : null}
+
+                {/*
+                  实验能力必须自带"实验"标识。同色部件识别在验收里
+                  6 项只过 1 项（耳根处会把同一色的耳朵切成两半），
+                  不能让人以为这是稳定功能。
+                */}
+                <SwitchRow
+                  label="同色部件补线（实验）"
+                  hint="尝试把同色相邻部件之间也划开；目前不稳定，可能把一片同色切成两半"
+                  checked={outline.experimentalParts}
+                  disabled={disabled}
+                  onChange={(next) =>
+                    onOutlineChange({ ...outline, experimentalParts: next })
+                  }
+                />
+              </div>
+            ) : null}
+
+            {/*
+              算不出来时的原因。用说明文字而不是红色 toast：
+              "色位满了"是正常边界，用户可能只是点开看一眼。
+            */}
+            {outline.enabled && outlineNote ? (
+              <p className="border border-dashed border-[var(--line)] px-2 py-1.5 text-[11.5px] leading-snug text-[var(--ink-2)]">
+                {outlineNote}
+              </p>
+            ) : null}
+          </div>
+        </>
+      ) : null}
 
       {/* 禁用态说明：不让用户以为界面坏了 */}
       {disabled ? (
