@@ -93,8 +93,11 @@ interface PromptItem {
    * 让用户再写一句纯属多余；其余条目必须填，否则正文里只有 `【待填写】`。
    */
   needsSubject: boolean;
-  /** 入参是用户填的主体词（可能为空），返回可直接粘进生图工具的正文。 */
-  text: (subject: string) => string;
+  /**
+   * 入参是用户填的主体词与整图格数（格数 null = 用户没填，让模型先反问），
+   * 返回可直接粘进生图工具的正文。
+   */
+  text: (subject: string, grid: number | null) => string;
   /** 可选的中文补充提醒 */
   note?: string;
 }
@@ -158,9 +161,41 @@ const BG =
  * 多余背景（`findNativeSubjectBounds`），但裁切只能挽回"背景留得太多"，不能
  * 凭空造分辨率：主体本来就只画了 40 格，裁完还是 40 格。**源头就该画满**。
  */
-const GRID =
-  "像素规格：整张图严格是 96 × 96 个像素格（每格大小完全一致、对齐同一条网格），色块边缘是阶梯状直角锯齿（no anti-aliasing），不要柔化模糊过渡。" +
-  "主体要**铺满整个画面**：左右上下留白都不超过 2 格，不要把主体画小、不要四周空一大圈。";
+/** 引擎原生像素网格识别的有效区间（`native-pixel.ts` 的 MIN_BLOCK/MAX_BLOCK 按 1024px 出图换算）。 */
+const GRID_MIN = 16;
+const GRID_MAX = 128;
+const GRID_PRESETS = [48, 64, 96, 128] as const;
+
+/**
+ * 像素规格那一段。**格数改成用户可填**（用户 m11831）：
+ *
+ * 之前这里是写死的 96。写死有它的道理（96 = 32×3 = 48×2，能在三个常用档位上做
+ * 整数倍降采样），但它是「这张源图给引擎吃」的内部实现细节 —— 用户想直接画 48 格
+ * 的大块头、或者要 128 格塞更多细节，都被这一句堵死，只能自己去正文里改数字。
+ *
+ * 现在改成两个分支：
+ *   - 用户填了格数 → 按他的数字写进去（超范围的在 UI 层夹到 16–128）；
+ *   - 用户没填 → **别画，先问**。空着的那一版不能让模型自己挑一个数字硬画，
+ *     那等于替用户做了决定，而且事后看不出来是哪一步定的。
+ *
+ * 无论哪一支，后面那串「每格一致 / 阶梯锯齿 / 主体铺满」都必须跟着 —— 那是
+ * 引擎能不能吃进去的硬条件，跟格数无关。
+ */
+function gridSpec(cols: number | null): string {
+  const common =
+    "每格大小完全一致、对齐同一条网格，色块边缘是阶梯状直角锯齿（no anti-aliasing），不要柔化模糊过渡。" +
+    "主体要铺满整个画面：左右上下留白都不超过 2 格，不要把主体画小、不要四周空一大圈。";
+  if (cols === null) {
+    return (
+      "像素规格：整张图要多少格，我还没说 —— 这一条没定下来之前先别画。" +
+      "回我一条消息把缺的问我：① 想要多少格宽（48 / 64 / 96 / 128 里挑一个就行，也可以自己给 16 到 128 的数字）；" +
+      "② 如果我也没说清要画什么，顺便问我要画的是什么。" +
+      "等我答完再按我说的数字画，别自己挑一个。" +
+      common
+    );
+  }
+  return `像素规格：整张图严格是 ${cols} × ${cols} 个像素格。${common}`;
+}
 
 /** 色块：面数少、面积大、用色阶跳变代替渐变。 */
 const BLOCK = "色块要大块平涂，明暗只用 2 到 3 档色阶跳变，不要抖动噪点。";
@@ -209,14 +244,14 @@ function build(parts: {
   subject: (s: string) => string;
   colors: string;
   extra?: string;
-}): (subject: string) => string {
-  return (subject) => {
+}): (subject: string, grid: number | null) => string {
+  return (subject, grid) => {
     const s = spot(subject);
     return [
       OPEN,
       `要画的是：${parts.subject(s)}`,
       BG,
-      GRID,
+      gridSpec(grid),
       BLOCK,
       `${parts.colors}。`,
       FRAME,
@@ -398,7 +433,7 @@ const GROUPS: readonly PromptGroup[] = [
           subject: (s) => `${s}，保持各个主体的相对位置和大小关系，不要删掉主体也不要增加新的主体；把背景里杂乱的细节合并成几大块纯色，只保留能认出场景的轮廓。`,
           colors: "最多用 20 种颜色",
         }),
-        note: "场景要把好几样东西塞进同一块 96 格画板，所以每样都不大 —— 主体占一半画面，剩下的是能认出场景的几块色。",
+        note: "场景要把好几样东西塞进同一块画板，所以每样都不大 —— 主体占一半画面，剩下的是能认出场景的几块色。格数越小，能塞的东西越少。",
       },
       {
         id: "scene-group",
@@ -408,7 +443,7 @@ const GROUPS: readonly PromptGroup[] = [
           subject: (s) => `${s}，每个人都要完整可辨认，人与人之间留出空隙不要粘连，每个人的衣服和皮肤各用分明的色块，整圈有统一的深色描边。`,
           colors: "用 16 到 24 种颜色",
         }),
-        note: "96 格里塞三到四个人是上限，每个人约 20 格高 —— 再多就只剩色块了。",
+        note: "96 格以上才塞得下三到四个人，每个人约 20 格高；格数再小，人再多就只剩色块了。",
       },
     ],
   },
@@ -602,6 +637,19 @@ export function MascotPromptPopover({
    * 什么构图"，要画的东西没变；每切一次就清空会让人白写。
    */
   const [subject, setSubject] = useState("");
+  /**
+   * 整图格数。空串 = 用户没填 —— 这时提示词里那段会变成「先别画，回我问清楚」。
+   *
+   * 存**字符串**而不是 number：受控输入框里得允许「1」这种还没打完的中间态，
+   * 用 number 的话用户删到空会立刻变 NaN/0，光标跳位。真正的数字在 `gridCols`
+   * 里解析并夹到合法区间。
+   */
+  const [gridInput, setGridInput] = useState("");
+  const gridCols = useMemo(() => {
+    const n = Number.parseInt(gridInput.trim(), 10);
+    if (!Number.isFinite(n)) return null;
+    return Math.min(GRID_MAX, Math.max(GRID_MIN, n));
+  }, [gridInput]);
   const group = useMemo(
     () => GROUPS.find((g) => g.id === activeGroup) ?? GROUPS[0],
     [activeGroup],
@@ -650,6 +698,7 @@ export function MascotPromptPopover({
             <DialogDescription className="mt-0.5 text-[11.5px] leading-snug text-[var(--ink-2)]">
               先在框里写要画什么，再挑一条最接近的提示词整段复制走。
               发一张参考图、说一个角色名、或用一句话描述，三种都给得上。
+              格数可以不填 —— 空着时提示词会让 AI 先问你要多少格。
             </DialogDescription>
           </div>
           <PixelClose onClose={() => onOpenChange(false)} />
@@ -730,6 +779,78 @@ export function MascotPromptPopover({
             ) : null}
           </label>
 
+          {/*
+            整图格数（用户 m11831：「那个 AI 提示词的边也可以让用户自己填，没填写
+            就让 AI 自己问」）。
+
+            为什么不做成必填：格数和「要画什么」不一样 —— 不知道画什么就真的没法画，
+            而格数只是**源图规格**，模型手上没有这个信息时完全可以反问一句再动手，
+            出来的图反而更贴合用户。所以留空不是错误状态，是「让 AI 问」这个正当选择。
+
+            取值范围 16–128 来自引擎的原生像素网格识别窗口（`native-pixel.ts` 的
+            MIN_BLOCK/MAX_BLOCK 按 1024px 出图换算）。超出这个区间的数字写进提示词
+            也白写：识别不了就退回照片管线，等于这批约束全废。所以 UI 层直接夹住，
+            并在文案里说清为什么。
+          */}
+          <div className="mb-2.5 border-2 border-[var(--line)] bg-[var(--paper)] px-2 py-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="shrink-0 font-px text-[10px] leading-none text-[var(--ink-2)]">
+                整图格数
+              </span>
+              <input
+                value={gridInput}
+                onChange={(e) => setGridInput(e.target.value.replace(/[^0-9]/g, "").slice(0, 3))}
+                inputMode="numeric"
+                placeholder="留空 = 让 AI 问你"
+                aria-label="整图格数"
+                className="w-[9.5rem] min-w-0 border-2 border-[var(--line)] bg-[var(--paper-raised)] px-1.5 py-1 text-[12px] text-[var(--ink)] outline-none placeholder:text-[var(--ink-3)] focus:border-[var(--line-strong)]"
+              />
+              <div className="flex flex-wrap items-center gap-1">
+                {GRID_PRESETS.map((n) => {
+                  const on = gridCols === n;
+                  return (
+                    <button
+                      key={n}
+                      type="button"
+                      onClick={() => setGridInput(on ? "" : String(n))}
+                      aria-pressed={on}
+                      className={cn(
+                        "border-2 px-1.5 py-1 font-px text-[10px] leading-none transition-colors",
+                        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--clay)]",
+                        on
+                          ? "border-[var(--line-strong)] bg-[var(--clay)] text-[var(--paper-hi)]"
+                          : "border-[var(--line)] bg-[var(--paper-raised)] text-[var(--ink-2)] hover:border-[var(--line-strong)] hover:text-[var(--ink)]",
+                      )}
+                    >
+                      {n}
+                    </button>
+                  );
+                })}
+              </div>
+              {gridInput.trim() !== "" ? (
+                <button
+                  type="button"
+                  onClick={() => setGridInput("")}
+                  aria-label="清空格数"
+                  className="shrink-0 px-1 font-px text-[10px] leading-none text-[var(--ink-3)] hover:text-[var(--clay)]"
+                >
+                  清空
+                </button>
+              ) : null}
+            </div>
+            <p className="mt-1 text-[11px] leading-snug text-[var(--ink-3)]">
+              {gridCols !== null
+                ? `提示词里会写成 ${gridCols} × ${gridCols} 格。`
+                : "留空的话，提示词会让 AI 先反问你「想要多少格」，你答了它再画 —— 不会自己挑一个数字硬画。"}
+              {gridInput.trim() !== "" && gridCols !== null && String(gridCols) !== gridInput.trim() ? (
+                <span className="text-[var(--bloom)]">
+                  {" "}
+                  超出 16–128，已按 {gridCols} 写（再大的格子引擎认不出来）。
+                </span>
+              ) : null}
+            </p>
+          </div>
+
           <p
             className={cn(
               "mb-2.5 border-l-2 px-2 py-1.5 text-[11px] leading-relaxed text-[var(--ink-2)]",
@@ -761,7 +882,7 @@ export function MascotPromptPopover({
 
           <ul className="flex flex-col gap-2">
             {group.items.map((item) => {
-              const text = item.text(subject);
+              const text = item.text(subject, gridCols);
               const locked = item.needsSubject && !filled;
               return (
               <li
