@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
 import type { PatternResult } from '@/lib/pattern/generate';
+import type { BeadSize } from '@/lib/pattern/board';
 import type { Brand } from '@/lib/color/palette';
 
 /**
@@ -39,6 +40,8 @@ import type { Brand } from '@/lib/color/palette';
 interface PDFExportProps {
   pattern: PatternResult | null;
   brand: Brand;
+  /** 豆径：决定 PDF 上的成品尺寸与底板方案。不传按 5mm（历史行为）。 */
+  beadSize?: BeadSize;
   /**
    * 紧凑模式：只留一个图标按钮，用于顶栏这类空间紧张的地方。
    * 失败信息仍然通过 toast 提示，不在按钮下面再占一行 ——
@@ -162,6 +165,7 @@ const FORMATS: FormatOption[] = [
 export function PDFExport({
   pattern,
   brand,
+  beadSize,
   compact = false,
   className,
 }: PDFExportProps): JSX.Element {
@@ -209,6 +213,9 @@ export function PDFExport({
           body: JSON.stringify({
             ...payload,
             brand,
+            // 尺寸与底板方案是 PDF 封面的硬信息：缺了它 PDF 会按 5mm 印，
+            // 2.6mm 小豆用户的尺寸就整整错一倍
+            ...(beadSize ? { beadSize } : {}),
             generatedAt: new Date().toISOString(),
           }),
         });
@@ -253,7 +260,7 @@ export function PDFExport({
         setBusyFormat(null);
       }
     },
-    [brand, pattern, sizeLabel],
+    [brand, beadSize, pattern, sizeLabel],
   );
 
   const triggerTitle = !pattern

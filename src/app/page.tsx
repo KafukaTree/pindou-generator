@@ -60,6 +60,12 @@ import {
   type PatternResult,
 } from '@/lib/pattern/generate';
 import {
+  BEAD_SIZES,
+  BEAD_SPECS,
+  DEFAULT_BEAD_SIZE,
+  type BeadSize,
+} from '@/lib/pattern/board';
+import {
   blankSourceKey,
   blankThumbnail,
   makeBlankId,
@@ -1414,6 +1420,8 @@ export default function Home() {
       <BlankSettings
         brand={options.brand}
         onBrandChange={(brand) => setOptions((prev) => ({ ...prev, brand }))}
+        beadSize={options.beadSize ?? DEFAULT_BEAD_SIZE}
+        onBeadSizeChange={(beadSize) => setOptions((prev) => ({ ...prev, beadSize }))}
         cols={blankCanvas.cols}
         rows={blankCanvas.rows}
         onResize={() => setNewCanvasOpen(true)}
@@ -1427,6 +1435,7 @@ export default function Home() {
         onChange={setOptions}
         actualCols={pattern?.cols}
         actualRows={pattern?.rows}
+        patternAlign={pattern?.meta.boardAlign}
         sizeCm={sizeCm}
         isWorking={isWorking}
         outline={outline}
@@ -1907,7 +1916,12 @@ export default function Home() {
               </span>
             )}
             {isLoaded && <HistoryList onRestore={handleRestore} />}
-            <PDFExport pattern={displayPattern} brand={options.brand} compact />
+            <PDFExport
+              pattern={displayPattern}
+              brand={options.brand}
+              beadSize={options.beadSize ?? DEFAULT_BEAD_SIZE}
+              compact
+            />
             <button
               type="button"
               onClick={toggleTheme}
@@ -2078,6 +2092,7 @@ export default function Home() {
                   cols={blankCanvas.cols}
                   rows={blankCanvas.rows}
                   brand={options.brand}
+                  beadSize={options.beadSize ?? DEFAULT_BEAD_SIZE}
                   onResize={() => setNewCanvasOpen(true)}
                   onClear={handleClear}
                 />
@@ -2304,6 +2319,7 @@ export default function Home() {
                      */
                     pattern={outlinePattern ?? pattern}
                     brand={options.brand}
+                    beadSize={options.beadSize ?? DEFAULT_BEAD_SIZE}
                     fill
                     /*
                      * 空白画布下**不给**刷区域能力。
@@ -2613,6 +2629,8 @@ function CanvasCalibrateRow({
 function BlankSettings({
   brand,
   onBrandChange,
+  beadSize,
+  onBeadSizeChange,
   cols,
   rows,
   onResize,
@@ -2622,6 +2640,8 @@ function BlankSettings({
 }: {
   brand: Brand;
   onBrandChange: (b: Brand) => void;
+  beadSize: BeadSize;
+  onBeadSizeChange: (b: BeadSize) => void;
   cols: number;
   rows: number;
   onResize: () => void;
@@ -2629,7 +2649,7 @@ function BlankSettings({
   onScaleToFit: () => void;
   canCalibrate: boolean;
 }) {
-  const cm = estimateSizeCm(cols, rows);
+  const cm = estimateSizeCm(cols, rows, beadSize);
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
@@ -2668,6 +2688,35 @@ function BlankSettings({
       />
 
       <div className="px-rule" />
+
+      <div>
+        <p className="mb-1.5 text-[12px] font-semibold text-[var(--ink)]">豆径</p>
+        <div className="grid grid-cols-2 gap-1.5">
+          {BEAD_SIZES.map((id) => {
+            const active = beadSize === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={active}
+                onClick={() => onBeadSizeChange(id)}
+                title={BEAD_SPECS[id].hint}
+                className={cn(
+                  'border-2 px-2 py-1.5 text-[12px] font-semibold transition-colors duration-75',
+                  active
+                    ? 'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)]'
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] hover:bg-[var(--paper-hi)]',
+                )}
+              >
+                {BEAD_SPECS[id].label}
+              </button>
+            );
+          })}
+        </div>
+        <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--ink-3)]">
+          决定成品实际多大。同一套色号 2.6mm 和 5mm 都有，色号通用。
+        </p>
+      </div>
 
       <div>
         <p className="mb-1.5 text-[12px] font-semibold text-[var(--ink)]">色号体系</p>
@@ -2724,16 +2773,18 @@ function BlankCanvasCard({
   cols,
   rows,
   brand,
+  beadSize,
   onResize,
   onClear,
 }: {
   cols: number;
   rows: number;
   brand: Brand;
+  beadSize: BeadSize;
   onResize: () => void;
   onClear: () => void;
 }) {
-  const cm = estimateSizeCm(cols, rows);
+  const cm = estimateSizeCm(cols, rows, beadSize);
   return (
     <div className="space-y-2.5">
       <div className="px-inset flex items-center gap-2.5 p-2.5">

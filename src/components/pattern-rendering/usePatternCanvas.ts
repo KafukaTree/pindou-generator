@@ -59,6 +59,7 @@ import {
   type RegionField,
 } from '@/lib/pattern/regions';
 import { getDetailProfile, type DetailAlgorithm } from '@/lib/pattern/detail';
+import { boardSeams, type BeadSize } from '@/lib/pattern/board';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -235,6 +236,7 @@ const PREF_KEYS = {
   codes: 'showCodes',
   grid: 'showGrid',
   rulers: 'showRulers',
+  seams: 'showSeams',
   regionOverlay: 'regionOverlay',
 } as const;
 
@@ -520,6 +522,8 @@ interface CanvasTokens {
   paperHi: string;
   /** 手改标记 / 强调用的麦黄 */
   gold: string;
+  /** 拼缝用的品红（唯一冷调强调色，与网格线区分） */
+  bloom: string;
   goldDeep: string;
   /** 棋盘格双色：擦除预览要画成"和最终结果一样"的样子 */
   checkerA: string;
@@ -557,6 +561,7 @@ function readTokens(el: HTMLElement): CanvasTokens {
     skySoft: v('--sky-soft', '#DEEAEE'),
     paperHi: v('--paper-hi', '#FFFEF9'),
     gold: v('--gold', '#A87718'),
+    bloom: v('--bloom', '#C24463'),
     goldDeep: v('--gold-deep', '#8C6112'),
     checkerA: v('--checker-a', '#F3E9D7'),
     checkerB: v('--checker-b', '#FFFBF0'),
@@ -736,6 +741,12 @@ function drawPattern(
     view?: PatternView | null;
     /** 手工改过的格子标记（1 = 改过），用于画金色三角 */
     editMarks?: Uint8Array | null;
+    /** 显示底板拼缝（豆径决定每块板多少钉） */
+    showSeams?: boolean;
+    /** 拼缝用的豆径 */
+    beadSize?: BeadSize;
+    /** 用户自定义的板钉数（覆盖豆径的默认板规格） */
+    boardPlate?: number;
   },
 ) {
   const { cols, rows, cellDev, eff, cssW, cssH } = metrics;
@@ -804,6 +815,42 @@ function drawPattern(
   ctx.fillRect(0, d(devH - 1), d(devW), d(1));
   ctx.fillRect(0, 0, d(1), d(devH));
   ctx.fillRect(d(devW - 1), 0, d(1), d(devH));
+
+  /*
+   * ---- 2.5 底板拼缝 ----
+   *
+   * 用户 m11918 的疑问是「不知道实际拼的过程是什么样子的板子」。底板
+   * 规格算出来只是文字（「2×2 共 4 块」），真正摆的时候他需要知道的是
+   * **图上哪一条线是换板的位置** —— 摆到第 52 列要停下来换下一块板，
+   * 不先知道就会摆到半路发现板子接不上。
+   *
+   * 画法与网格线**必须能区分**：
+   *   · 网格线是实线、低对比（深棕 0.9 透明度，本来就是给人看的格线）
+   *   · 拼缝是**虚线 + 品红**，而且比 10 格线更粗
+   * 三条视觉差异叠起来，用户不会把拼缝当成"第 50 格的网格线"。
+   * 品红（--bloom）在陶土色系里是唯一的冷调强调色，扫一眼就跳出来。
+   */
+  if (opts.showSeams && opts.beadSize) {
+    const seams = boardSeams(cols, rows, opts.beadSize, opts.boardPlate);
+    const seamDev = Math.max(2, Math.round(1.5 * eff));
+    const dash = Math.max(6, Math.round(8 * eff));
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = tokens.bloom;
+    const drawDashedV = (col: number) => {
+      const x = Math.round(col * cellDev);
+      for (let y = 0; y < devH; y += dash * 2) {
+        ctx.fillRect(d(x), d(y), d(seamDev), d(Math.min(dash, devH - y)));
+      }
+    };
+    const drawDashedH = (row: number) => {
+      const y = Math.round(row * cellDev);
+      for (let x = 0; x < devW; x += dash * 2) {
+        ctx.fillRect(d(x), d(y), d(Math.min(dash, devW - x)), d(seamDev));
+      }
+    };
+    for (const col of seams.vertical) drawDashedV(col);
+    for (const row of seams.horizontal) drawDashedH(row);
+  }
 
   // ---- 3. 色号 ----
   if (opts.showCodes && cellCss >= 9) {
@@ -1485,6 +1532,13 @@ export interface UsePatternCanvasOptions {
   /** 父级历史栈现在能不能撤销 / 重做（决定按钮 disabled） */
   canUndoDoc?: boolean;
   canRedoDoc?: boolean;
+  /**
+   * 豆径。只用于「底板拼缝」叠加层 —— 拼缝位置由每块板多少钉决定，
+   * 不传时不画缝。
+   */
+  beadSize?: BeadSize;
+  /** 用户自定义的板钉数（覆盖豆径默认规格），拼缝按它切 */
+  boardPlate?: number;
 }
 
 export function usePatternCanvas(
@@ -1507,6 +1561,8 @@ export function usePatternCanvas(
     onResetEdits,
     canUndoDoc,
     canRedoDoc,
+    beadSize,
+    boardPlate,
   } = options;
 
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1552,6 +1608,8 @@ export function usePatternCanvas(
   const [showCodes, setShowCodesState] = useState(true);
   const [showGrid, setShowGridState] = useState(true);
   const [showRulers, setShowRulersState] = useState(true);
+  /** 底板拼缝叠加层。默认关 —— 大多数人拼小块，画上线只是噪声。 */
+  const [showSeams, setShowSeamsState] = useState(false);
   const [showRegionOverlay, setShowRegionOverlayState] = useState(true);
   const [hover, setHover] = useState<HoverCell | null>(null);
   const lastPointerRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -1884,6 +1942,8 @@ export function usePatternCanvas(
     setShowCodesState(readBoolPref(PREF_KEYS.codes, true));
     setShowGridState(readBoolPref(PREF_KEYS.grid, true));
     setShowRulersState(readBoolPref(PREF_KEYS.rulers, true));
+    // 拼缝默认关：只有大图才需要，默认画上线对小块图案只是噪声
+    setShowSeamsState(readBoolPref(PREF_KEYS.seams, false));
     setShowRegionOverlayState(readBoolPref(PREF_KEYS.regionOverlay, true));
   }, []);
 
@@ -1913,6 +1973,14 @@ export function usePatternCanvas(
     setShowRulersState((prev) => {
       const v = typeof next === 'function' ? next(prev) : next;
       writePref(PREF_KEYS.rulers, v ? '1' : '0');
+      return v;
+    });
+  }, []);
+
+  const setShowSeams = useCallback((next: boolean | ((p: boolean) => boolean)) => {
+    setShowSeamsState((prev) => {
+      const v = typeof next === 'function' ? next(prev) : next;
+      writePref(PREF_KEYS.seams, v ? '1' : '0');
       return v;
     });
   }, []);
@@ -3131,10 +3199,13 @@ export function usePatternCanvas(
       forceRebuild,
       view: computeView(),
       editMarks,
+      showSeams,
+      beadSize,
+      boardPlate,
     });
     // computeView 读的是 DOM 的实时位置，不能进依赖数组（每次渲染都是新函数）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [displayPattern, editMarks, metrics, showCodes, showGrid, themeTick, scrollTick]);
+  }, [displayPattern, editMarks, metrics, showCodes, showGrid, showSeams, beadSize, boardPlate, themeTick, scrollTick]);
 
   /**
    * 鼠标是否落在"已应用区域"内。
@@ -3789,10 +3860,12 @@ export function usePatternCanvas(
     showCodes,
     showGrid,
     showRulers,
+    showSeams,
     showRegionOverlay,
     setShowCodes,
     setShowGrid,
     setShowRulers,
+    setShowSeams,
     setShowRegionOverlay,
     hover,
     onPointerMove,

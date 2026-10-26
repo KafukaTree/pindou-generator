@@ -32,6 +32,7 @@
  */
 
 import type { DetailAlgorithm } from './detail';
+import { DEFAULT_BEAD_SIZE, type BeadSize } from './board';
 import { estimateSizeCm, type GenerateOptions, type PatternResult } from './generate';
 
 /** 空白画布允许的行列范围。上限与引擎的 320 格对齐（见 PatternSettings） */
@@ -97,6 +98,7 @@ export function makeBlankPattern(
     meanDeltaE: 0,
     meta: {
       brand: options.brand,
+      beadSize: (options.beadSize ?? DEFAULT_BEAD_SIZE) as BeadSize,
       colorLimit: options.colorLimit,
       fit: options.fit,
       smoothing: options.smoothing ?? 0.6,
@@ -107,7 +109,7 @@ export function makeBlankPattern(
       detail: (options.detail ?? 'balanced') as DetailAlgorithm,
       regionAlgorithms: [],
       regionCoverage: 0,
-      sizeCm: estimateSizeCm(safeCols, safeRows),
+      sizeCm: estimateSizeCm(safeCols, safeRows, options.beadSize ?? DEFAULT_BEAD_SIZE),
     },
   };
 }

@@ -37,6 +37,14 @@ import {
 } from '@/lib/color/palette';
 import { rgbToOklab, rgbToHex, type Oklab, type Rgb } from '@/lib/color/oklab';
 import {
+  BEAD_SPECS,
+  type BeadSize,
+  DEFAULT_BEAD_SIZE,
+  finishedSizeCm,
+  planBoards,
+  roundToBoardEdge,
+} from './board';
+import {
   bilateralLab,
   buildBackgroundMask,
   cropImageData,
@@ -82,6 +90,30 @@ export interface GenerateOptions {
   /** 原图宽高比 width / height */
   aspect: number;
   brand: Brand;
+  /**
+   * 豆径规格。决定成品边长，也决定「要几块板」。
+   *
+   * 它**不是**品牌属性：同一套 MARD 色卡同时有 2.6mm 软豆和 5mm 硬豆，
+   * 色号完全通用。所以这里是独立选项，不从 brand 推导。
+   */
+  beadSize?: BeadSize;
+  /**
+   * 短边是否向上对齐到整块底板（默认 **true**）。
+   *
+   * 用户 m12282：「最好是整个格子整个格子的取，不然实在不好看，比如 64
+   * 就是整的，然后五十几就不整」；m12286 补「也要支持用户自定义的，不然
+   * 没法调整」→ 默认开、可关，关掉回到"短边按比例算多少是多少"。
+   *
+   * 只动短边。长边是 `gridSize`（用户指定的目标），动它等于擅自改他的决定。
+   */
+  boardAlign?: boolean;
+  /**
+   * 对齐用的单块板钉数。省略用当前豆径的 `commonPlate`（2.6mm→52，5mm→29）。
+   *
+   * 必须可覆盖：用户手上可能是 14×14 小板或 78×78 大板，一律按 29 对齐
+   * 就是错的。
+   */
+  boardPlate?: number;
   /** 最多用几种颜色 */
   colorLimit: number;
   /** contain=完整放入并留白；cover=居中裁切填满 */
@@ -164,6 +196,8 @@ export interface PatternResult {
   /** 本次实际使用的参数（含默认值回填），供 UI/PDF 复现 */
   meta: {
     brand: Brand;
+    /** 本次成品按哪一档豆径算的尺寸。旧快照没有此字段时按默认档处理。 */
+    beadSize: BeadSize;
     colorLimit: number;
     fit: 'contain' | 'cover';
     smoothing: number;
@@ -177,8 +211,30 @@ export interface PatternResult {
     regionAlgorithms: DetailAlgorithm[];
     /** 区域覆盖率 0..1（按羽化后的格权重平均） */
     regionCoverage: number;
-    /** 成品尺寸估算（5mm 豆），单位 cm */
+    /** 成品尺寸（**熨烫前**，按 meta.beadSize 的豆径算），单位 cm */
     sizeCm: { w: number; h: number };
+    /**
+     * 短边对齐到整块底板留下了什么痕迹。没对齐或是原生像素路径直取时为
+     * undefined。
+     *
+     * 为什么要记在 meta 里、而不是让 UI 自己从 aspect 反推：`options.aspect`
+     * 只是"用户看到的原图比例"的缓存，引擎真正用的是**裁掉背景之后**的
+     * 比例（autoCrop 后可能完全不同）。UI 拿 options.aspect 反推会算出
+     * 一个不存在的短边（实测：64 列 54 行的图被算成"短边 64 行补到 87 行"）。
+     * 引擎是唯一知道"补之前是多少"的地方，就该由它写出来。
+     */
+    boardAlign?: {
+      /** 按比例算出来的原始短边（补之前） */
+      before: number;
+      /** 补齐之后的短边 */
+      after: number;
+      /** 补了几格 */
+      grown: number;
+      /** 对齐用的单块板钉数 */
+      plate: number;
+      /** 短边是行还是列 */
+      axis: 'rows' | 'cols';
+    };
     /**
      * 原生像素网格信息。走照片管线时为 null。
      *
@@ -237,18 +293,70 @@ function hasTransparency(img: ImageData): boolean {
 export function computeGridSize(
   aspect: number,
   gridSize: number,
+  /**
+   * 短边对齐到整块底板。`null`/省略 = 不对齐（保持"按比例算出来多少就是
+   * 多少"的原始行为，供不需要板子的调用方使用）。
+   *
+   * 传对象时短边会**向上**取整到 `n × plate` 的第一个值（见 board.ts 的
+   * `roundToBoardEdge`），长边一列不动 —— 长边是用户指定的目标。
+   */
+  align?: { beadSize: BeadSize; plate?: number } | null,
 ): { cols: number; rows: number } {
   const a = Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
   const long = Math.max(4, Math.round(gridSize));
+  const roundShort = (v: number): number => {
+    if (!align) return v;
+    /*
+     * 把长边一起传下去：`roundToBoardEdge` 要用它判断"这一档有没有一块板
+     * 已经能一次放下整张图"，能放下就一格都不补。少了这个参数，2.6mm 的
+     * 64×54 会被按 52 钉补成 64 —— 既没让任何板用满，又多 10 行空白。
+     */
+    const r = roundToBoardEdge(v, align.beadSize, align.plate, long);
+    if (!r.changed) return v;
+    /*
+     * 补完之后会超过长边时，**不补**。
+     *
+     * 这条守的是 `gridSize` 的语义：用户设的数是"长边"上的格数。若允许
+     * 短边补到比长边还大，长边就不再是长边了 —— 界面写着"48 格/长边"，
+     * 实际出来 48×58，用户无从判断自己设的 48 到底管哪一边。
+     *
+     * 实测撞到的例子：48 格 + 5mm（29 钉板），接近正方形的图短边是 41，
+     * 凑板边要 58 > 48。这时保持 48×41，由用户自己调「单块底板钉数」
+     * 或换成整块板能放下的格数（如 64）。
+     */
+    if (r.rows > long) return v;
+    return r.rows;
+  };
   if (a >= 1) {
-    return { cols: long, rows: Math.min(long, Math.max(4, Math.round(long / a))) };
+    return {
+      cols: long,
+      rows: Math.min(long, roundShort(Math.max(4, Math.round(long / a)))),
+    };
   }
-  return { cols: Math.min(long, Math.max(4, Math.round(long * a))), rows: long };
+  return {
+    cols: Math.min(long, roundShort(Math.max(4, Math.round(long * a)))),
+    rows: long,
+  };
 }
 
-/** 5mm 豆，每格 0.5cm */
-export function estimateSizeCm(cols: number, rows: number) {
-  return { w: +(cols * 0.5).toFixed(1), h: +(rows * 0.5).toFixed(1) };
+/**
+ * 成品尺寸（熨烫前）。**应传豆径**，省略则按默认档。
+ *
+ * 原来这里是 `cols * 0.5` 写死的 5mm / 每格 0.5cm —— 对 2.6mm 小豆整整
+ * 多算一倍（64 格：32cm vs 16.6cm）。用户拿这个数去买相框、判断放不放进
+ * 得下，错一倍是直接报废。
+ */
+/** 某档豆径的默认板钉数（避免各处重复写 BEAD_SPECS[x].commonPlate） */
+export function resolveDefaultPlate(size: BeadSize | undefined | null): number {
+  return BEAD_SPECS[size === 'mini' || size === 'midi' ? size : DEFAULT_BEAD_SIZE].commonPlate;
+}
+
+export function estimateSizeCm(
+  cols: number,
+  rows: number,
+  beadSize: BeadSize = DEFAULT_BEAD_SIZE,
+) {
+  return finishedSizeCm(cols, rows, beadSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +737,7 @@ export function generatePattern(
   options: GenerateOptions,
 ): PatternResult {
   const brand = options.brand;
+  const beadSize = options.beadSize ?? DEFAULT_BEAD_SIZE;
   const smoothing = clamp(options.smoothing ?? 0.6, 0, 1);
   const autoCrop = options.autoCrop ?? true;
   const background = options.background ?? 'ignore';
@@ -692,7 +801,51 @@ export function generatePattern(
   }
 
   const aspect = src.width / src.height;
-  const { cols, rows } = computeGridSize(aspect, options.gridSize);
+  /*
+   * 先把"不对齐时短边会是多少"算出来并存下，再对齐。
+   *
+   * 顺序不能反：对齐之后 cols/rows 已经是补齐值，再也无法反推原始短边。
+   * 这个 before/after 会写进 meta，UI 用它在界面上如实说明"补了几格"。
+   */
+  const rawDims = computeGridSize(aspect, options.gridSize);
+  const rawShort = Math.min(rawDims.cols, rawDims.rows);
+  /*
+   * 对齐用**哪块板的钉数**，必须跟界面上报的「底板 N×N」是同一块。
+   *
+   * 踩过的坑（实测）：2.6mm 档 160 格时，底板方案按 104 钉算（报 2×2
+   * 共 4 块 104×104），对齐却按常用板 52 钉算，把 135 行补到 156 ——
+   * 156 这个数既不是 104 的倍数，也没让任何一块板用满，界面上却写着
+   * 「已补到 156 行对齐整块板」。数字和说法对不上。
+   *
+   * 所以先用**原始**行列数问一次 planBoards，拿到它实际会用的板：
+   *   - 一块就能放下 → 根本不需要补，aligned = null；
+   *   - 放不下 → 用那块板的钉数去凑边界（累计 n × plate）。
+   */
+  const rawPlan = planBoards(
+    rawDims.cols,
+    rawDims.rows,
+    options.beadSize ?? DEFAULT_BEAD_SIZE,
+    options.boardPlate,
+  );
+  const aligned =
+    options.boardAlign === false || rawPlan.single
+      ? null
+      : {
+          beadSize: options.beadSize ?? DEFAULT_BEAD_SIZE,
+          plate: rawPlan.plate,
+        };
+  const { cols, rows } = computeGridSize(aspect, options.gridSize, aligned);
+  const shortAfter = Math.min(cols, rows);
+  const boardAlignMeta: PatternResult['meta']['boardAlign'] =
+    aligned && shortAfter !== rawShort
+      ? {
+          before: rawShort,
+          after: shortAfter,
+          grown: shortAfter - rawShort,
+          plate: aligned.plate ?? resolveDefaultPlate(aligned.beadSize),
+          axis: aspect >= 1 ? 'rows' : 'cols',
+        }
+      : undefined;
 
   // --- 1.5 前景遮罩 ------------------------------------------------------
   /*
@@ -736,6 +889,7 @@ export function generatePattern(
   if (nativeProbe?.detected) {
     return generateFromNativeGrid(src, nativeProbe, mask, cols, rows, {
       brand,
+      beadSize,
       colorLimit,
       fit,
       smoothing,
@@ -1338,6 +1492,7 @@ export function generatePattern(
   // --- 统计（唯一真相来源）----------------------------------------------
   return applyCanvasFit(finalize(finalCells, finalPalette, pooled, cols, rows, {
     brand,
+    beadSize,
     colorLimit,
     fit,
     smoothing,
@@ -1352,6 +1507,7 @@ export function generatePattern(
     regionCoverage: regionField.active ? coverageOf(regionField) : 0,
     // 走的是照片管线 → 没有原生网格信息
     nativePixel: null,
+    ...(boardAlignMeta ? { boardAlign: boardAlignMeta } : {}),
   }), canvasCenterOn, canvasScaleMode);
 }
 
@@ -1377,6 +1533,7 @@ function generateFromNativeGrid(
   rows: number,
   cfg: {
     brand: Brand;
+    beadSize: BeadSize;
     colorLimit: number;
     fit: 'contain' | 'cover';
     smoothing: number;
@@ -1645,6 +1802,7 @@ function generateFromNativeGrid(
   const wm = cfg.watermark;
   return applyCanvasFit(finalize(clipped.cells, clipped.palette, pooled, cols2, rows2, {
     brand,
+    beadSize: cfg.beadSize,
     colorLimit,
     fit: cfg.fit,
     smoothing: cfg.smoothing,
@@ -3815,7 +3973,7 @@ function finalize(
     palette: used.map((u, i) => ({ ...u, index: i })),
     totalBeads: total,
     meanDeltaE: deN ? de / deN : 0,
-    meta: { ...meta, sizeCm: estimateSizeCm(cols, rows) },
+    meta: { ...meta, sizeCm: estimateSizeCm(cols, rows, meta.beadSize) },
   };
 }
 

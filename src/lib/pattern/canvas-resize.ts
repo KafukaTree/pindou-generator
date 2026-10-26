@@ -90,7 +90,7 @@ export function resizePatternToCanvas(
       meta: {
         ...pattern.meta,
         brand,
-        sizeCm: estimateSizeCm(newCols, newRows),
+        sizeCm: estimateSizeCm(newCols, newRows, pattern.meta.beadSize),
         /*
          * 原图信息对这张板子已经不再成立（重采样过），源图也已被切断。
          * 留着 autoCrop 会让「参数面板」显示一个不再生效的开关。

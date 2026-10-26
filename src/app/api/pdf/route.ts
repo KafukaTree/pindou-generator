@@ -31,6 +31,12 @@ import { join } from 'node:path';
 import { jsPDF } from 'jspdf';
 import { BRANDS, type Brand } from '@/lib/color/palette';
 import { parseHex, readableInkFor, type Rgb } from '@/lib/color/oklab';
+import {
+  BEAD_SPECS,
+  boardSummary,
+  planBoards,
+  type BeadSize,
+} from '@/lib/pattern/board';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
@@ -166,6 +172,7 @@ interface IncomingBody {
   cols?: unknown;
   rows?: unknown;
   brand?: unknown;
+  beadSize?: unknown;
   cells?: unknown;
   palette?: unknown;
   totalBeads?: unknown;
@@ -186,12 +193,22 @@ interface CleanRequest {
   rows: number;
   brand: Brand;
   brandLabel: string;
+  /** 豆径：决定成品尺寸和「要几块板」。旧客户端不传时按 5mm（历史行为）。 */
+  beadSize: BeadSize;
+  /** 豆径的中文名，直接印在 PDF 上（2.6mm 小豆 / 5mm 大豆） */
+  beadLabel: string;
   cells: Int16Array;
   palette: CleanPaletteEntry[];
   totalBeads: number;
   blankCells: number;
   generatedAt: string;
 }
+
+/** 豆径毫米数。BEAD_SPECS 是唯一真相源，这里只做一层解引用。 */
+const BEAD_MM: Record<BeadSize, number> = {
+  mini: BEAD_SPECS.mini.mm,
+  midi: BEAD_SPECS.midi.mm,
+};
 
 function badRequest(error: string): NextResponse {
   return NextResponse.json({ error }, { status: 400 });
@@ -303,11 +320,15 @@ function validateBody(raw: IncomingBody): CleanRequest | NextResponse {
     ? new Date().toISOString()
     : generatedAtRaw;
 
+  const beadSize: BeadSize = raw.beadSize === 'mini' ? 'mini' : 'midi';
+
   return {
     cols,
     rows,
     brand,
     brandLabel: BRAND_LABEL[brand] ?? 'BRAND',
+    beadSize,
+    beadLabel: beadSize === 'mini' ? '2.6mm 小豆' : '5mm 大豆',
     cells,
     palette,
     totalBeads,
@@ -1492,8 +1513,8 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
   rule(doc, M, 43.5, PAGE_W - M, RULE, 0.4);
 
   // 规格表
-  const finishedW = ((cols * 5) / 10).toFixed(1);
-  const finishedH = ((rows * 5) / 10).toFixed(1);
+  const finishedW = ((cols * BEAD_MM[req.beadSize]) / 10).toFixed(1);
+  const finishedH = ((rows * BEAD_MM[req.beadSize]) / 10).toFixed(1);
   const trueScalePages = plan.pagesAtTrueScale;
   const scaledDown = plan.cell < TRUE_SCALE_CELL;
 
@@ -1503,7 +1524,11 @@ function drawCover(doc: Doc, req: CleanRequest, plan: PagePlan): void {
     ['颜色数', `${palette.filter((entry) => entry.count > 0).length}`],
     ['总豆子数', `${totalBeads}`],
     ['空白格', `${blankCells} 格（不拼豆）`],
-    ['成品尺寸', `5mm 豆，成品约 ${finishedW} × ${finishedH} cm`],
+    ['成品尺寸', `${req.beadLabel}，成品约 ${finishedW} × ${finishedH} cm（熨烫前）`],
+    [
+      '底板',
+      boardSummary(planBoards(cols, rows, req.beadSize)),
+    ],
     [
       '图纸页数',
       totalTiles === 1
@@ -1941,8 +1966,19 @@ function drawShoppingSummary(doc: Doc, req: CleanRequest, top: number): void {
   const cards: Array<[string, string, string]> = [
     ['总包数', `${used.length}`, '需要购买的颜色种数'],
     ['总颗数', `${totalBuy}`, `覆盖 ${totalBeads} 颗 + 10% 余量`],
-    ['成品尺寸', `${((cols * 5) / 10).toFixed(1)} × ${((rows * 5) / 10).toFixed(1)} cm`, '5mm 中豆'],
-    ['豆板数', `${Math.ceil(cols / 29)} × ${Math.ceil(rows / 29)}`, '按 29×29 大板计算'],
+    [
+      '成品尺寸',
+      `${((cols * BEAD_MM[req.beadSize]) / 10).toFixed(1)} × ${((rows * BEAD_MM[req.beadSize]) / 10).toFixed(1)} cm`,
+      `${req.beadLabel}（熨烫前）`,
+    ],
+    (() => {
+      const plan = planBoards(cols, rows, req.beadSize);
+      return [
+        '底板数',
+        plan.single ? `1 块` : `${plan.across} × ${plan.down} = ${plan.total} 块`,
+        `按 ${plan.plate}×${plan.plate} 板`,
+      ] as [string, string, string];
+    })(),
   ];
 
   const gap = 3;

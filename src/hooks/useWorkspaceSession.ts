@@ -448,6 +448,14 @@ function sanitizeMeta(v: unknown): PatternSnapshotMeta | null {
    * 导出/描边时被读一次，给了合法值就够用。
    */
   const brand = (typeof v.brand === 'string' ? v.brand : 'MARD') as PatternSnapshotMeta['brand'];
+  /*
+   * 旧快照没有 beadSize。退回默认档而不是丢弃整份快照 —— 丢快照等于
+   * 用户辛苦做的图纸没了，而豆径只影响尺寸文案，猜错代价极小。
+   */
+  const beadSizeRaw = v.beadSize;
+  const beadSize = (beadSizeRaw === 'mini' || beadSizeRaw === 'midi'
+    ? beadSizeRaw
+    : 'midi') as PatternSnapshotMeta['beadSize'];
   const fit = (typeof v.fit === 'string' ? v.fit : 'contain') as PatternSnapshotMeta['fit'];
   const background = (typeof v.background === 'string'
     ? v.background
@@ -457,6 +465,7 @@ function sanitizeMeta(v: unknown): PatternSnapshotMeta | null {
     : 'balanced') as PatternSnapshotMeta['detail'];
   return {
     brand,
+    beadSize,
     colorLimit: asFiniteNumber(v.colorLimit) ?? 16,
     fit,
     smoothing: asFiniteNumber(v.smoothing) ?? 0.6,

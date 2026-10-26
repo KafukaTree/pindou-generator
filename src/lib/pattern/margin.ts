@@ -23,6 +23,8 @@
  * resample、regions 一大串，而这里只需要两个接口类型。副作用是
  * `estimateSizeCm` 得复刻一份（见 `sizeCmOf`）；好处是测试脚本能直接
  * `node --experimental-strip-types` import 本文件，不必先搭 `@/` 别名解析。
+ * 同理 `board.ts`（豆径表）也复刻了最小的一份常数 —— 只用到两个毫米数，
+ * 为了它把整条色卡导入链拉进来不值。
  *
  * 坐标约定与引擎一致：行优先 `row * cols + col`，`-1` 是空白格。
  */
@@ -91,18 +93,28 @@ export interface MarginResult {
 // 尺寸
 // ---------------------------------------------------------------------------
 
-/** 每格 0.5cm（5mm 标准豆） */
-const GRID_CM = 0.5;
-
 /**
- * 复刻 `generate.ts:175 estimateSizeCm` 的 `+(cols * 0.5).toFixed(1)`。
+ * 豆径（毫米）→ 厘米。复刻 `board.ts` 的 `BEAD_SPECS`。
  *
  * 为什么不直接 import：见文件头，本模块零运行时依赖。两处必须保持一致的
  * 唯一原因是"PDF 上的尺寸标注"和"页面显示的尺寸"要是同一个数；改这里就得
- * 同时改 generate.ts，否则用户会看到两个尺寸。
+ * 同时改 board.ts，否则用户会看到两个尺寸。
  */
-function sizeCmOf(cols: number, rows: number): { w: number; h: number } {
-  return { w: +(cols * GRID_CM).toFixed(1), h: +(rows * GRID_CM).toFixed(1) };
+const BEAD_MM: Record<string, number> = { mini: 2.6, midi: 5 };
+
+/**
+ * 复刻 `generate.ts estimateSizeCm`（它自己已委托给 `board.finishedSizeCm`）。
+ *
+ * 豆径取自 `pattern.meta.beadSize`；旧数据没有这个字段时退回 5mm，与旧版
+ * 行为一致（旧版写死 0.5cm/格）。
+ */
+function sizeCmOf(
+  cols: number,
+  rows: number,
+  beadSize: string | undefined,
+): { w: number; h: number } {
+  const mm = BEAD_MM[beadSize ?? ''] ?? BEAD_MM.midi;
+  return { w: +((cols * mm) / 10).toFixed(1), h: +((rows * mm) / 10).toFixed(1) };
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +320,7 @@ export function applyMargin(
         // 平均色差是"与原图比"得来的；画布变大不会让它更准或更差
         meanDeltaE: pattern.meanDeltaE,
         // meta 其余字段原样浅拷贝（品牌、参数都是值语义），只重算 sizeCm
-        meta: { ...pattern.meta, sizeCm: sizeCmOf(newCols, newRows) },
+        meta: { ...pattern.meta, sizeCm: sizeCmOf(newCols, newRows, pattern.meta.beadSize) },
       },
       guide: {
         cols: newCols,

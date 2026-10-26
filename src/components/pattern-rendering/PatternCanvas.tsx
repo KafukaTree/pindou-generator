@@ -31,6 +31,7 @@ import { Slider } from '@/components/ui/slider';
 import { DETAIL_ALGORITHMS, DETAIL_META, type DetailAlgorithm } from '@/lib/pattern/detail';
 import type { DetailBrush } from '@/lib/pattern/regions';
 import type { EditDelta, EditMap } from '@/lib/pattern/edits';
+import { planBoards, type BeadSize } from '@/lib/pattern/board';
 import { PixelCursor, PixelSwatch } from '@/components/scenery';
 import { BrushSizeButton } from './BrushSizeButton';
 import { Hand, Redo2, RotateCcw, Undo2 } from 'lucide-react';
@@ -51,6 +52,16 @@ import {
 export interface PatternCanvasProps {
   pattern: PatternResult | null;
   brand: Brand;
+  /**
+   * 豆径 —— 只用来画「底板拼缝」这条叠加线。
+   *
+   * 拼缝是**摆放阶段**的信息，不是图纸本身：用户摆到一半要知道
+   * "这里换板"。所以它跟网格/标尺同级（显示开关），不写进 pattern。
+   * 不传时不画任何缝，行为与旧版一致。
+   */
+  beadSize?: BeadSize;
+  /** 用户自定义的板钉数（覆盖豆径默认规格），拼缝与"要不要拼"都按它算 */
+  boardPlate?: number;
   className?: string;
   /**
    * 填满父容器高度：外壳 height:100% 走 flex 列、滚动区吃掉剩余空间。
@@ -257,6 +268,8 @@ export function PatternCanvas({
   onResetEdits,
   canUndoDoc,
   canRedoDoc,
+  beadSize,
+  boardPlate,
 }: PatternCanvasProps) {
   /**
    * 「编辑」是总开关（默认关）。
@@ -285,6 +298,8 @@ export function PatternCanvas({
     onResetEdits,
     canUndoDoc,
     canRedoDoc,
+    beadSize,
+    boardPlate,
   });
   const {
     hostRef,
@@ -301,10 +316,12 @@ export function PatternCanvas({
     showCodes,
     showGrid,
     showRulers,
+    showSeams,
     showRegionOverlay,
     setShowCodes,
     setShowGrid,
     setShowRulers,
+    setShowSeams,
     setShowRegionOverlay,
     hover,
     onPointerMove,
@@ -1134,6 +1151,16 @@ export function PatternCanvas({
     </button>
   );
 
+  /*
+   * 这张图到底要不要拼板。单板时「拼缝」按钮置灰 —— 让它可见但不可用，
+   * 比直接隐藏更好：隐藏会让用户以为功能不存在，去别处找。
+   *
+   * 不用 useMemo：这里在 `if (!pattern) return` 之后（hooks 不能放在提前
+   * return 后面），而 planBoards 只是几次比较 + 一次小数组排序，比 memo
+   * 的开销还低。
+   */
+  const needsSeams = !planBoards(cols, rows, beadSize, boardPlate).single;
+
   /** 功能开关组。和 zoomGroup 一起被 portal 到标题栏，或窄屏时留在画布上方。 */
   const toolbarButtons = (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -1209,6 +1236,20 @@ export function PatternCanvas({
       {toggleBtn(showCodes, '色号', () => setShowCodes((v) => !v), '显示/隐藏每颗豆子的色号')}
       {toggleBtn(showGrid, '网格', () => setShowGrid((v) => !v), '显示/隐藏网格线')}
       {toggleBtn(showRulers, '标尺', () => setShowRulers((v) => !v), '显示/隐藏行列标尺')}
+      {/*
+        底板拼缝：只在"这一张图要拼板"时才有意义，所以单板时按钮显示为
+        不可用（而不是悄悄消失）—— 消失会让用户以为功能没做。
+        拼缝线是品红虚线，与网格线在粗细/颜色/虚实三个维度上都不同。
+      */}
+      {toggleBtn(
+        showSeams,
+        '拼缝',
+        () => setShowSeams((v) => !v),
+        needsSeams
+          ? '显示/隐藏底板拼缝（品红虚线标出换板的那一行/列）'
+          : '这张图一块底板放得下，没有拼缝',
+        !needsSeams,
+      )}
       {/*
         「区域标记」必须常驻这一排。
         早先它挂在刷子工具条里，退出刷子模式后按钮消失，而遮罩还在图上

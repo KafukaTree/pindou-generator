@@ -1,10 +1,10 @@
 'use client';
 
 import { useCallback, useMemo, type ReactNode } from 'react';
-import { AlignCenter, Maximize2, SlidersHorizontal } from 'lucide-react';
+import { AlignCenter, Grid2x2, Maximize2, SlidersHorizontal } from 'lucide-react';
 import { Slider } from '@/components/ui/slider';
 import { getBrandPalette, BRANDS, BRAND_META, type Brand } from '@/lib/color/palette';
-import type { GenerateOptions } from '@/lib/pattern/generate';
+import type { GenerateOptions, PatternResult } from '@/lib/pattern/generate';
 import {
   DETAIL_ALGORITHMS,
   DETAIL_META,
@@ -20,6 +20,15 @@ import {
   MARGIN_META,
   type MarginMode,
 } from '@/lib/pattern/margin';
+import {
+  BEAD_SIZES,
+  BEAD_SPECS,
+  DEFAULT_BEAD_SIZE,
+  boardSummary,
+  finishedSizeCm,
+  planBoards,
+  type BeadSize,
+} from '@/lib/pattern/board';
 import { cn } from '@/lib/utils';
 
 /**
@@ -45,8 +54,14 @@ export interface PatternSettingsProps {
   actualCols?: number;
   /** 当前图案实际行数 */
   actualRows?: number;
-  /** 引擎给出的成品尺寸（5mm 豆，cm）；不传则按行列数估算 */
+  /** 引擎给出的成品尺寸（按当前豆径，熨烫前，cm）；不传则按行列数与豆径估算 */
   sizeCm?: { w: number; h: number } | null;
+  /**
+   * 引擎写下的"短边对齐到整块板"痕迹。没对齐时不传。
+   *
+   * 必须由引擎提供而不是组件自算，原因见 alignedNote 里的注释。
+   */
+  patternAlign?: PatternResult['meta']['boardAlign'];
   /** 父组件正在重算（debounce 中 / 同步计算中），显示轻提示但不阻塞操作 */
   isWorking?: boolean;
   /**
@@ -105,17 +120,16 @@ const GRID_MAX = 320;
 const COLOR_MIN = 4;
 const COLOR_MAX = 48;
 
-/** 5mm 豆：1 格 = 0.5cm */
-const CM_PER_CELL = 0.5;
-
 function clamp(v: number, min: number, max: number) {
   return Math.min(max, Math.max(min, v));
 }
 
-/** 成品尺寸文案："约 14.4 × 14.4 cm" */
-function formatCm(cols: number, rows: number): string {
-  const w = (cols * CM_PER_CELL).toFixed(1);
-  const h = (rows * CM_PER_CELL).toFixed(1);
+/**
+ * 成品尺寸文案。**必须带豆径** —— 同样是 64 格，5mm 是 32cm、2.6mm 是
+ * 16.6cm，差将近一倍。旧版这里写死 0.5cm/格。
+ */
+function formatCm(cols: number, rows: number, beadSize: BeadSize): string {
+  const { w, h } = finishedSizeCm(cols, rows, beadSize);
   return `约 ${w} × ${h} cm`;
 }
 
@@ -169,6 +183,7 @@ export function PatternSettings({
   disabled = false,
   actualCols,
   actualRows,
+  patternAlign,
   sizeCm = null,
   isWorking = false,
   outline,
@@ -195,11 +210,52 @@ export function PatternSettings({
   const cols = actualCols ?? 0;
   const rows = actualRows ?? 0;
   const hasActual = cols > 0 && rows > 0;
+  const beadSize = value.beadSize ?? DEFAULT_BEAD_SIZE;
+  /*
+   * 短边对齐默认**开**（见 `GenerateOptions.boardAlign` 的注释）。
+   * `value.boardAlign` 是 undefined 时算开 —— 不能写 `?? true` 了事，
+   * 因为要给"用户显式关掉"留出 false 这个值，两者必须区分开。
+   */
+  const boardAlignOn = value.boardAlign !== false;
+  const plateValue = value.boardPlate ?? BEAD_SPECS[beadSize].commonPlate;
   const cmText = hasActual
     ? sizeCm
       ? `约 ${sizeCm.w.toFixed(1)} × ${sizeCm.h.toFixed(1)} cm`
-      : formatCm(cols, rows)
+      : formatCm(cols, rows, beadSize)
     : null;
+  /*
+   * 板子方案。只在有真实行列时算 —— 还没选图时 cols/rows 是 0，
+   * 算出来会是「1 块 14×14 板」这种毫无意义的结论。
+   *
+   * 用 useMemo 是因为它要打断板目录的排序，而这段在滑杆拖动时每帧都在
+   * 渲染（父组件每次 setState 都重算一次）。
+   */
+  const boardPlate = boardAlignOn ? value.boardPlate : undefined;
+  const boardPlan = useMemo(
+    () => (hasActual ? planBoards(cols, rows, beadSize, boardPlate) : null),
+    [hasActual, cols, rows, beadSize, boardPlate],
+  );
+  const boardText = boardPlan ? boardSummary(boardPlan) : null;
+  /*
+   * 对齐说明：只有"真的补了格"才写，且要说清补了几格、补在哪。
+   * 用户把 64×54 看成 64×58 时必须知道多出来的 4 行是空白格 ——
+   * 否则他会以为工具擅自改了他的图。
+   */
+  /*
+   * 对齐说明直接读引擎写进 `pattern.meta.boardAlign` 的 before/after。
+   *
+   * 曾经试过在组件里用 `value.aspect` 反推（因为 cols/rows 已经是补齐后
+   * 的值，反推不出来）—— 但 `options.aspect` 只是原图比例的缓存，引擎
+   * 实际用的是**裁掉背景之后**的比例，两者可能完全不同。实测就出过
+   * "短边按比例是 64 行，已补到 87 行"这种荒唐文案。引擎是唯一知道
+   * 补之前是多少的地方，就该让它写出来。
+   */
+  const alignedNote = (() => {
+    const align = patternAlign;
+    if (!hasActual || !boardAlignOn || !align) return null;
+    const axisName = align.axis === 'rows' ? '行' : '列';
+    return `短边按比例是 ${align.before} ${axisName}，已补到 ${align.after} ${axisName}对齐整块板（${align.grown} ${axisName}是空白格）`;
+  })();
 
   return (
     <div className={cn('space-y-3.5', disabled && 'opacity-[0.82]', className)}>
@@ -386,6 +442,120 @@ export function PatternSettings({
             );
           })}
         </div>
+      </Section>
+
+      <div className="px-rule" />
+
+      {/* ---------------- 豆径（决定成品多大、要几块板） ---------------- */}
+      <Section
+        label="豆径"
+        hint={BEAD_SPECS[beadSize].hint}
+        disabled={disabled}
+      >
+        <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="豆子直径">
+          {BEAD_SIZES.map((id) => {
+            const spec = BEAD_SPECS[id];
+            const active = beadSize === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                disabled={disabled}
+                aria-pressed={active}
+                onClick={() => patch({ beadSize: id })}
+                className={cn(
+                  'flex flex-col items-start gap-0.5 border-2 px-2 py-1.5 text-left transition-[background-color,box-shadow] duration-75',
+                  active
+                    ? 'border-[var(--clay-deep)] bg-[var(--clay)] text-[var(--on-clay)] shadow-[inset_0_2px_0_0_rgba(0,0,0,0.22)] hover:bg-[var(--clay-deep)]'
+                    : 'border-[var(--line-strong)] bg-[var(--paper-raised)] text-[var(--ink)] shadow-[0_2px_0_0_var(--line-strong)] hover:border-[var(--clay)] hover:bg-[var(--paper-hi)]',
+                  disabled && 'cursor-not-allowed',
+                )}
+              >
+                <span className="text-[12px] font-semibold leading-tight">{spec.label}</span>
+                <span
+                  className={cn(
+                    'text-[10.5px] leading-tight tabular-nums',
+                    active ? 'opacity-85' : 'text-[var(--ink-2)]',
+                  )}
+                >
+                  常见板 {spec.commonPlate}×{spec.commonPlate} 钉
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        {/*
+         * 板子方案 —— 这是用户 m11918 真正想要的那个数。
+         *
+         * 他的动作不是"我要 64 格"，而是"我这块板放不放得下、不够要买几块"。
+         * 上面滑杆只告诉他格数，这里告诉他换算成现实的结论。
+         */}
+        {boardText ? (
+          <div className="px-inset mt-1.5 flex items-start gap-1.5 p-2">
+            <Grid2x2 className="mt-[1px] h-3 w-3 shrink-0 text-[var(--clay)]" aria-hidden />
+            <div className="min-w-0 flex-1">
+              <p className="text-[11.5px] leading-snug text-[var(--ink)]">
+                <span className="text-[var(--ink-2)]">底板 </span>
+                <span className="font-semibold tabular-nums">{boardText}</span>
+              </p>
+              <p className="mt-0.5 text-[10.5px] leading-snug text-[var(--ink-2)]">
+                尺寸是熨烫前的；烫完会缩 5%–8%（小豆缩得更多）
+              </p>
+            </div>
+          </div>
+        ) : (
+          <p className="mt-1.5 text-[11px] leading-snug text-[var(--ink-2)]">
+            选好图片后这里会算出用几块底板
+          </p>
+        )}
+
+        {/*
+         * 短边对齐 + 板钉数自定义。
+         *
+         * 用户 m12282：「最好是整个格子整个格子的取，不然实在不好看，比如
+         * 64 就是整的，然后五十几就不整」；m12286：「也要支持用户自定义的，
+         * 不然没法调整」。所以默认开、能关、板钉数能填。
+         *
+         * 为什么钉数是**输入框**而不是下拉：真实世界的板不止 29/52 两种，
+         * 用户手上可能是 14×14 小板、78×78 大板、或者某些品牌的 50/57 钉
+         * （这几档互相还不能拼）。做成固定选项就必须替他想全，而一定会漏。
+         */}
+        <div className="mt-2 flex items-center gap-1.5">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[11.5px] text-[var(--ink)]">
+            <input
+              type="checkbox"
+              checked={boardAlignOn}
+              disabled={disabled}
+              onChange={(e) => patch({ boardAlign: e.target.checked })}
+              className="h-3 w-3 accent-[var(--clay)]"
+            />
+            短边对齐整块板
+          </label>
+          <span className="ml-auto flex items-center gap-1 text-[11px] text-[var(--ink-2)]">
+            <span>板</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={2}
+              max={200}
+              step={1}
+              disabled={disabled || !boardAlignOn}
+              value={plateValue}
+              aria-label="单块底板钉数"
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (!Number.isFinite(n)) return;
+                patch({ boardPlate: Math.max(2, Math.min(200, Math.round(n))) });
+              }}
+              className="w-[46px] border-2 border-[var(--line-strong)] bg-[var(--paper-hi)] px-1 py-0.5 text-center text-[11px] font-semibold tabular-nums text-[var(--ink)] outline-none focus:border-[var(--clay)] disabled:opacity-40"
+            />
+            <span>钉</span>
+          </span>
+        </div>
+        {boardAlignOn && hasActual && alignedNote ? (
+          <p className="mt-1 text-[10.5px] leading-snug text-[var(--ink-2)]">{alignedNote}</p>
+        ) : null}
       </Section>
 
       <div className="px-rule" />
