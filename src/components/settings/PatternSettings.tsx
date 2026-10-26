@@ -533,7 +533,7 @@ export function PatternSettings({
             短边对齐整块板
           </label>
           <span className="ml-auto flex items-center gap-1 text-[11px] text-[var(--ink-2)]">
-            <span>板</span>
+            <span>按</span>
             <input
               type="number"
               inputMode="numeric"
